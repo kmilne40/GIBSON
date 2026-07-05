@@ -148,9 +148,9 @@ The exact service set depends on startup options, vulnerable/secure mode, and wh
 |---:|---|---|
 | `80` | Welcome / orientation site | Start page and orientation content |
 | `2022` | OMVS / USS-style path | USS-style shell path where enabled |
-| `2023` | VTAM-style selector | Main terminal path for `L TSO`, `L CICS`, and `L DB2` |
-| `2111` | FTP training service | FTP lab service |
-| `3270` | TN3270 compatibility | 3270-style terminal compatibility where enabled |
+| `23` | VTAM-style selector | Main terminal path for `L TSO`, `L CICS`, and `L DB2` |
+| `21` | FTP training service | FTP lab service |
+| `175` | NJE training service | NJE lab service |
 | `8023` | Browser terminal | Optional Guacamole browser terminal |
 | `8080` | Main app/API service | CBSA, DVCA, Hack3270, REST/API training paths |
 | `8443` | Dashboard | Gibson monitoring and administration dashboard |
@@ -165,8 +165,8 @@ curl -i http://127.0.0.1/
 curl -k -i https://127.0.0.1:8443/
 curl -i http://127.0.0.1:8080/
 curl -i http://127.0.0.1:9080/
-ncat -vz 127.0.0.1 2023
-ncat -vz 127.0.0.1 2111
+ncat -vz 127.0.0.1 23
+ncat -vz 127.0.0.1 21
 ```
 
 ---
@@ -260,10 +260,10 @@ You can also start Gibson with a preselected IPL MFA PIN:
 
 ## Connect with `ncat`
 
-The main terminal selector listens on port `2023`.
+The main terminal selector listens on port `23`.
 
 ```bash
-ncat 127.0.0.1 2023
+ncat 127.0.0.1 23
 ```
 
 You should see a selector similar to:
@@ -295,13 +295,13 @@ sudo apt-get install -y c3270
 Connect to Gibson:
 
 ```bash
-c3270 127.0.0.1:2023
+c3270 127.0.0.1:23
 ```
 
 If you use a local host alias:
 
 ```bash
-c3270 mainframe:2023
+c3270 mainframe:23
 ```
 
 If your terminal profile requires a named LU or model, adjust the command for your local `c3270` configuration.
@@ -310,10 +310,10 @@ If your terminal profile requires a named LU or model, adjust the command for yo
 
 ## Log on to TSO
 
-Connect to port `2023`:
+Connect to port `23`:
 
 ```bash
-ncat 127.0.0.1 2023
+ncat 127.0.0.1 23
 ```
 
 Select TSO:
