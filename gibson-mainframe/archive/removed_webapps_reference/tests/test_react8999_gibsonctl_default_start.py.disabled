@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run_ctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "gibsonctl.sh", *args],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+        check=False,
+    )
+
+
+def test_gibsonctl_plain_start_dry_run_includes_react8999_by_default():
+    result = run_ctl("start", "--dry-run", "--no-master", "--no-web-terminal")
+    assert result.returncode == 0, result.stdout
+    assert "--with-react8999" in result.stdout
+    assert "--react8999-port 8999" in result.stdout
+
+
+def test_gibsonctl_no_react8999_removes_react8999_args():
+    result = run_ctl("start", "--dry-run", "--no-master", "--no-web-terminal", "--no-react8999")
+    assert result.returncode == 0, result.stdout
+    start_line = next(line for line in result.stdout.splitlines() if line.startswith("Starting Gibson services:"))
+    assert "--with-react8999" not in start_line
+    assert "--react8999-port" not in start_line
+
+
+def test_gibsonctl_preserves_react8999_after_start_arg_rebuild_options():
+    result = run_ctl("start", "--dry-run", "--no-master", "--no-web-terminal", "--no-ftp")
+    assert result.returncode == 0, result.stdout
+    assert "--with-react8999" in result.stdout
+    assert "--react8999-port 8999" in result.stdout
+
+
+def test_gibsonctl_custom_react8999_port_is_passed():
+    result = run_ctl("start", "--dry-run", "--no-master", "--no-web-terminal", "--react8999-port", "9000")
+    assert result.returncode == 0, result.stdout
+    assert "--with-react8999" in result.stdout
+    assert "--react8999-port 9000" in result.stdout

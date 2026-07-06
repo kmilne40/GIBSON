@@ -1,0 +1,15 @@
+PROGRAMS = {
+    "BNKMENU":"CBSA main menu and routing handler",
+    "INQCUST":"Customer enquiry",
+    "INQACC":"Account enquiry",
+    "INQACCCU":"List customer accounts",
+    "CRECUST":"Create customer",
+    "CREACC":"Create account",
+    "UPDCUST":"Update customer",
+    "UPDACC":"Update account",
+    "DELCUS":"Delete customer",
+    "DELACC":"Delete account",
+    "DBCRFUN":"Debit/credit account",
+    "XFRFUN":"Transfer funds",
+    "BANKDATA":"Seed data loader",
+}

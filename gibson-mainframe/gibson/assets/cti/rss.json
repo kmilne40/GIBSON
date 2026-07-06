@@ -1,0 +1,17 @@
+{
+  "feeds": [
+    { "name": "KrebsOnSecurity", "url": "https://krebsonsecurity.com/feed/" },
+    { "name": "Hacker News Front Page", "url": "https://hnrss.org/frontpage" },
+    { "name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/" },
+    { "name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews" },
+    { "name": "Dark Reading", "url": "https://www.darkreading.com/rss.xml" },
+    { "name": "Sophos News", "url": "https://news.sophos.com/en-us/feed/" },
+    { "name": "HackRead", "url": "https://hackread.com/feed/" },
+    { "name": "Cyble Blog", "url": "https://cyble.com/feed/" },
+    { "name": "IT Security Guru", "url": "https://www.itsecurityguru.org/feed/" },
+    { "name": "SearchSecurity (TechTarget)", "url": "https://www.techtarget.com/searchsecurity/rss" },
+    { "name": "CSO Online", "url": "https://www.csoonline.com/feed/" },
+    { "name": "GBHackers on Security", "url": "https://gbhackers.com/feed/" },
+    { "name": "Planet Mainframe", "url": "https://planetmainframe.com/feed/" }
+  ]
+}

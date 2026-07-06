@@ -1,0 +1,17 @@
+  
+  STATUS:  ENTER ONE OF THE FOLLOWING
+
+ Discard     
+ Inquire     
+ Perform     
+ Set         
+
+
+
+
+
+
+
+                                                      SYSID=CICS APPLID=CICS
+
+ PF 1 HELP       3 END       5 VAR                    9 MSG

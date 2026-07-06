@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+import logging
+import sys
+
+from gibson.apps.cics import CicsSimulator
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.services.dashboard import _DashboardHandler
+from gibson.services import db2_server
+
+
+class DummyHandler:
+    def __init__(self, state: GibsonState):
+        self.state = state
+        self.wfile = BytesIO()
+        self.responses = []
+        self.headers = {}
+
+    def _snapshot(self):
+        return _DashboardHandler._snapshot(self)  # type: ignore[misc]
+
+    def send_response(self, code: int) -> None:
+        self.responses.append(("code", code))
+
+    def send_header(self, name: str, value: str) -> None:
+        self.responses.append((name, value))
+
+    def end_headers(self) -> None:
+        self.responses.append(("end", None))
+
+
+def make_state(tmp_path: Path) -> GibsonState:
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path / 'f', commands_dir=tmp_path / 'f' / 'commands', gacf_path=tmp_path / 'GACF.DB')
+    cfg.ensure()
+    cfg.gacf_path.write_text('IBMUSER:SYS1:SPECIAL:OMVS\nGUEST:GUEST:NONE:OMVS\n', encoding='utf-8')
+    return GibsonState.create(cfg)
+
+
+def test_dashboard_recent_audit_filters_out_dashboard_http_entries(tmp_path):
+    st = make_state(tmp_path)
+    st.audit.record('IBMUSER', 'LISTC', 'ENTER', 'TSO')
+    st.audit.record('IBMUSER', 'CEMT I TASK', 'ENTER', 'CICS')
+    st.audit.record('IBMUSER', 'D A,L', 'ENTER', 'CONSOLE')
+    st.audit.record('DASH', 'GET /api/state', 'HTTP', 'DASH')
+    snap = _DashboardHandler._snapshot(SimpleNamespace(state=st))
+    components = [e['component'] for e in snap['recent_audit']]
+    assert components == ['TSO', 'CICS', 'CONSOLE']
+
+
+def test_dashboard_html_contains_closable_alert_button(tmp_path):
+    st = make_state(tmp_path)
+    st.raise_dashboard_alert('IRR421I MULTIPLE FAILED LOGON ATTEMPTS DETECTED', addr='10.0.0.9', port=2023, event_type='BRUTE_FORCE')
+    handler = DummyHandler(st)
+    _DashboardHandler._html(handler)  # type: ignore[arg-type]
+    page = handler.wfile.getvalue().decode('utf-8', errors='ignore')
+    assert 'alert-close' in page
+    assert 'dismissAlert' in page
+
+
+def test_gmvb_login_uses_gacf_db_and_supports_legacy_alias(tmp_path):
+    st = make_state(tmp_path)
+    cics = CicsSimulator(st, 'IBMUSER')
+    assert 'MENU - MAIN MENU' in cics.execute('GMVB LOGN IBMUSER SYS1')
+    cics2 = CicsSimulator(st, 'IBMUSER')
+    assert 'MENU - MAIN MENU' in cics2.execute('MCGM LOGN IBMUSER SYS1')
+
+
+def test_db2_websocket_service_uses_quiet_logger(tmp_path, monkeypatch):
+    st = make_state(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_serve(handler, host, port, logger=None, **kwargs):
+        captured['host'] = host
+        captured['port'] = port
+        captured['logger'] = logger
+        return object()
+
+    class StopEvent:
+        def wait(self):
+            raise SystemExit
+        def set(self):
+            return None
+
+    class FakeThread:
+        def __init__(self, target, daemon=None, name=None):
+            self.target = target
+        def start(self):
+            try:
+                self.target()
+            except SystemExit:
+                pass
+
+    class FakeServer:
+        def close(self):
+            return None
+        async def wait_closed(self):
+            return None
+
+    async def fake_serve(handler, host, port, logger=None, **kwargs):
+        captured['host'] = host
+        captured['port'] = port
+        captured['logger'] = logger
+        return FakeServer()
+
+    fake_ws = SimpleNamespace(serve=fake_serve)
+    monkeypatch.setitem(sys.modules, 'websockets', fake_ws)
+    monkeypatch.setattr(db2_server.threading, 'Thread', FakeThread)
+    monkeypatch.setattr(db2_server.asyncio, 'Event', StopEvent)
+
+    svc = db2_server.Db2WebSocketService(st)
+    svc.start()
+
+    logger = captured['logger']
+    assert isinstance(logger, logging.Logger)
+    assert logger.propagate is False
+    assert any(isinstance(h, logging.NullHandler) for h in logger.handlers)

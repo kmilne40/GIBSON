@@ -1,0 +1,138 @@
+"""
+Simulated z/OS DB2 REST Gateway.
+
+This Flask application exposes a minimal REST API that proxies SQL
+queries to the DB2 simulator defined in ``DB2.py``.  Clients should
+POST JSON containing ``user``, ``password`` and ``sql`` fields to the
+``/query`` endpoint.  The service authenticates the user using weak
+MD5 hashes stored in the DB2 user database and executes the SQL via
+``parse_fake_sql``.  Results are returned as JSON and errors use
+appropriate HTTP status codes.
+
+An informational index page is also provided at ``/``.  It describes
+the available endpoints and reminds operators that the WebSocket
+channel on ``PORT_WS`` from ``DB2.py`` is a simplified admin shell.
+
+Configuration:
+
+    BACKEND_PORT – port to bind on.  Default is 8082.  Override this
+                   environment variable to avoid port clashes when
+                   running multiple services.
+
+Usage example (via curl):
+
+    curl -X POST http://localhost:8082/query \
+         -H "Content-Type: application/json" \
+         -d '{"user":"MARIAN", "password":"secret", "sql":"SELECT * FROM SYSIBM.SYSUSERS"}'
+
+This module is meant for educational purposes and lacks proper
+security measures.  Do not expose it to untrusted networks.
+"""
+
+from flask import Flask, request, jsonify, render_template_string
+import os
+from passlib.hash import md5_crypt
+
+# Import functions from the DB2 simulator.  We import lazily at
+# runtime so that there is no circular import when DB2 invokes this
+# module indirectly during training exercises.
+from DB2 import load_users, USERS_DB, parse_fake_sql, PORT_WS
+
+# Create the Flask application
+app = Flask(__name__)
+
+# Read configuration from environment
+try:
+    BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8082"))
+except ValueError:
+    BACKEND_PORT = 8082
+
+
+@app.route("/", methods=["GET"])
+def index():
+    """Return a simple informational page about the API."""
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>z/OS DB2 REST Gateway</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 2rem; }}
+        </style>
+    </head>
+    <body>
+        <h1>z/OS DB2 REST Gateway</h1>
+        <p>This service accepts POST requests to <code>/query</code> with a JSON body
+        containing <code>user</code>, <code>password</code> and <code>sql</code> keys.  It authenticates
+        against the DB2 simulator and executes the SQL with a very
+        limited, fake parser.  Results are returned as JSON.</p>
+        <p>There is also a WebSocket admin shell exposed by DB2 on port
+        <strong>{PORT_WS}</strong>.  That channel offers commands such as <code>HELP</code>,
+        <code>SHOW DBS</code>, <code>RUN SQL &lt;query&gt;</code> and others.  It is a simplified
+        demonstration and should not be confused with the DRDA protocol.</p>
+        <p>Example usage:</p>
+        <pre>
+    POST /query HTTP/1.1
+    Host: localhost:{BACKEND_PORT}
+    Content-Type: application/json
+
+    {{
+        "user": "MARIAN",
+        "password": "secret",
+        "sql": "SELECT * FROM SYSIBM.SYSTABLES"
+    }}
+        </pre>
+        <p>JSON responses follow this structure:</p>
+        <ul>
+            <li>On success: a list of row objects or an empty list.</li>
+            <li>On error: an object with an <code>error</code> key and a descriptive message.</li>
+        </ul>
+    </body>
+    </html>
+    """
+    return html
+
+
+@app.route("/query", methods=["POST"])
+def query():
+    """Authenticate the user and run an SQL statement on the DB2 simulator."""
+    data = request.get_json(silent=True) or {}
+    user = data.get("user", "")
+    password = data.get("password", "")
+    sql = data.get("sql", "")
+
+    # Validate input
+    if not user or not password or not sql:
+        return jsonify({"error": "'user', 'password' and 'sql' fields are required"}), 400
+
+    # Reload user database before each call to pick up changes from GRANT/REVOKE
+    load_users()
+    if user not in USERS_DB:
+        return jsonify({"error": "unknown user"}), 403
+    # Verify password using md5_crypt as the hashes stored in DB2.GACF are MD5
+    try:
+        if not md5_crypt.verify(password, USERS_DB[user]["hash"]):
+            return jsonify({"error": "invalid password"}), 403
+    except Exception:
+        return jsonify({"error": "invalid password"}), 403
+    # Check that the user has an OMVS segment – this maps to TSO OMVS
+    if USERS_DB[user]["omvs"] == "NOOMVS":
+        return jsonify({"error": "OMVS segment missing"}), 403
+
+    # Execute the SQL using the fake parser
+    try:
+        rows = parse_fake_sql(sql)
+        return jsonify(rows), 200
+    except PermissionError as pe:
+        return jsonify({"error": str(pe)}), 403
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"internal error: {exc}"}), 500
+
+
+if __name__ == "__main__":
+    # Bind to all interfaces so that the front‑end (vuln_gateway.py) and
+    # other machines in a lab can connect.
+    app.run(host="0.0.0.0", port=BACKEND_PORT)

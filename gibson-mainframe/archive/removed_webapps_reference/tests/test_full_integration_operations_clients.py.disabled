@@ -1,0 +1,140 @@
+import socket
+import threading
+from pathlib import Path
+
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.apps.omvs import OmvsShellSession
+from gibson.apps.uss_ftp_client import FtpSubsession
+from gibson.apps.uss_telnet_client import TelnetSubsession, IAC, WILL
+from gibson.apps.cti_rss import fetch_all, FEEDS_DSN, CACHE_DSN, rss_command
+from gibson.services.react8999_api import handle_ui8999
+from gibson.apps.racf_admin import racf_admin_command, get_racf_store
+from gibson.apps.zsecure_engine import zsecure_command
+from gibson.apps.sysview_engine import sysview_command
+
+
+def make_state(tmp_path):
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path/'files', commands_dir=tmp_path/'files'/'commands', transfer_root=tmp_path/'transfers', gacf_path=tmp_path/'GACF.DB')
+    return GibsonState.create(cfg)
+
+
+class FakeFTP:
+    def __init__(self):
+        self.calls=[]; self.files={'remote.txt': b'HELLO\n'}; self.cwd_name='/'
+    def connect(self, host, port, timeout=10): self.calls.append(('connect',host,port,timeout)); return '220 FAKE FTP READY'
+    def set_pasv(self, val): self.calls.append(('set_pasv', val))
+    def login(self, user, passwd=''): self.calls.append(('login',user,passwd)); return '230 USER LOGGED IN'
+    def pwd(self): self.calls.append(('pwd',)); return self.cwd_name
+    def cwd(self, d): self.calls.append(('cwd',d)); self.cwd_name=d; return '250 DIRECTORY CHANGED'
+    def retrlines(self, cmd, cb):
+        self.calls.append(('retrlines',cmd))
+        if cmd.startswith('RETR'): cb(self.files.get(cmd.split(' ',1)[1], b'').decode().strip())
+        else: cb('-rw-r--r-- 1 IBMUSER SYS1 6 remote.txt')
+    def retrbinary(self, cmd, cb): self.calls.append(('retrbinary',cmd)); cb(self.files.get(cmd.split(' ',1)[1], b''))
+    def storbinary(self, cmd, fh): self.calls.append(('storbinary',cmd,fh.read()))
+    def nlst(self, *args): self.calls.append(('nlst',args)); return ['remote.txt']
+    def voidcmd(self, cmd): self.calls.append(('voidcmd',cmd)); return '200 OK'
+    def sendcmd(self, cmd): self.calls.append(('sendcmd',cmd)); return '200 ' + cmd
+    def delete(self, n): self.calls.append(('delete',n)); return '250 DELETED'
+    def mkd(self, n): self.calls.append(('mkd',n)); return n
+    def rmd(self, n): self.calls.append(('rmd',n)); return '250 RMD'
+    def rename(self, a,b): self.calls.append(('rename',a,b)); return '250 RENAMED'
+    def close(self): self.calls.append(('close',))
+    def quit(self): self.calls.append(('quit',)); return '221 BYE'
+
+
+def test_ftp_subsession_real_ftplib_methods_and_persistence(tmp_path):
+    st=make_state(tmp_path); sh=OmvsShellSession(st,'IBMUSER')
+    fake = FakeFTP()
+    sub = FtpSubsession(sh.env, lambda: sh.cwd, lambda p: setattr(sh,'cwd',sh.env.resolve(sh.cwd,p)), ftp_factory=lambda: fake)
+    assert 'Connected' in sub.handle('open ftp.example 21')
+    assert '230' in sub.handle('user IBMUSER SECRET')
+    assert '/' in sub.handle('pwd')
+    assert 'remote.txt' in sub.handle('ls')
+    out = sub.handle('get remote.txt /u/ibmuser/remote.txt')
+    assert 'Transfer complete' in out
+    assert (st.config.sim_root/'uss'/'u'/'ibmuser'/'remote.txt').exists()
+    local = st.config.sim_root/'uss'/'u'/'ibmuser'/'upload.txt'
+    local.parent.mkdir(parents=True, exist_ok=True); local.write_text('UPLOAD', encoding='utf-8')
+    assert 'Transfer complete' in sub.handle('put /u/ibmuser/upload.txt uploaded.txt')
+    sub.handle('binary'); sub.handle('ascii'); sub.handle('passive'); sub.handle('active')
+    assert any(c[0]=='storbinary' for c in fake.calls)
+    assert any(c[0]=='retrlines' and c[1].startswith('LIST') for c in fake.calls)
+    assert 'session ended' in sub.handle('quit').lower()
+
+
+def _start_echo_server(reply_prefix='ECHO:'):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(('127.0.0.1', 0)); srv.listen(1)
+    port=srv.getsockname()[1]
+    def run():
+        conn, _ = srv.accept()
+        with conn:
+            conn.sendall(bytes([IAC, WILL, 1]) + b'WELCOME\r\n')
+            while True:
+                data=conn.recv(4096)
+                if not data: break
+                conn.sendall(reply_prefix.encode()+data)
+        srv.close()
+    t=threading.Thread(target=run, daemon=True); t.start()
+    return port
+
+
+def test_telnet_connects_to_local_server_and_exchanges_lines():
+    port=_start_echo_server()
+    sub=TelnetSubsession(timeout=3)
+    out=sub.handle(f'open 127.0.0.1 {port}')
+    assert 'Connected' in out
+    out=sub.handle('send HELLO')
+    assert 'ECHO:' in out and 'HELLO' in out
+    assert 'CONNECTED' in sub.handle('status')
+    assert 'session ended' in sub.handle('quit').lower()
+
+
+def test_omvs_subsessions_persist_until_quit(tmp_path):
+    st=make_state(tmp_path); sh=OmvsShellSession(st,'IBMUSER')
+    # no network dependency: start client without host, then status is routed to ftp>
+    assert 'ftp>' in sh.execute('ftp')
+    assert 'IBM FTP CLIENT STATUS' in sh.execute('status')
+    assert 'session ended' in sh.execute('quit').lower()
+    assert 'telnet>' in sh.execute('telnet')
+    assert 'IBM TELNET CLIENT STATUS' in sh.execute('status')
+    assert 'session ended' in sh.execute('quit').lower()
+
+
+def test_rss_fetch_uses_uploaded_feeds_and_parses_mock_live_feed(tmp_path):
+    st=make_state(tmp_path)
+    out=rss_command(st,'IBMUSER','RSS LIST')
+    assert 'KREBSONSECURITY' in out and FEEDS_DSN in rss_command(st,'IBMUSER','RSS CONFIG')
+    sample=b'''<?xml version="1.0"?><rss><channel><title>X</title><item><title>Top Security Item</title><link>https://example.com/a</link><pubDate>Today</pubDate><description>Summary</description></item></channel></rss>'''
+    items, statuses = fetch_all(st,'IBMUSER',fetcher=lambda url: sample, live=True)
+    assert items and items[0].title == 'Top Security Item'
+    shown = rss_command(st,'IBMUSER','RSS SHOW KREBSONSECURITY')
+    assert 'FIBS CTI/RSS HEADLINES' in shown and 'Top Security Item' in shown
+    assert 'URL REJECTED' in rss_command(st,'IBMUSER','RSS ADD BAD file:///etc/passwd')
+    assert st.datasets.read('IBMUSER', CACHE_DSN)
+
+
+def test_react_sqli_renders_rows_not_metadata_only():
+    st=GibsonState.create(); sid='SQLI'
+    code,payload=handle_ui8999(st,'/api/v1/ui8999/api-menu/unsafe-query','POST',{'sid':sid,'input':"' OR '1'='1"},{})
+    assert code == 200
+    data=payload['data']
+    assert data['columns'] and data['rows'] and data['row_count'] >= 1
+    screen_text='\n'.join(r.get('text','') for r in data['screen']['rows'])
+    assert 'CUSTOMER_ID' in screen_text and 'ROWS RETURNED' not in screen_text
+    assert 'RESULT COUNT' in screen_text
+
+
+def test_racf_zsecure_sysview_share_state(tmp_path):
+    st=make_state(tmp_path)
+    assert 'ADDED' in racf_admin_command(st,'IBMUSER','RACFADMIN ADDUSER SECUSR NAME(Security User) DFLTGRP(STUDENT) SPECIAL')
+    assert 'SECUSR' in racf_admin_command(st,'IBMUSER','RACFADMIN LISTUSER SECUSR')
+    z=zsecure_command(st,'IBMUSER','ZSEC PRIVILEGE')
+    assert 'SECUSR' in z and 'SPECIAL' in z
+    racf_admin_command(st,'IBMUSER','RACFADMIN ALTUSER SECUSR NOSPECIAL')
+    z2=zsecure_command(st,'IBMUSER','ZSEC PRIVILEGE')
+    assert 'SECUSR' not in z2 or 'NOSPECIAL' in z2
+    sys=sysview_command(st,'IBMUSER','SYSVIEW STATUS')
+    assert 'SYSVIEW SYSTEM OVERVIEW' in sys

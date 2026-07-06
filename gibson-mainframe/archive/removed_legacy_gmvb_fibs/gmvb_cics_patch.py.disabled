@@ -1,0 +1,198 @@
+"""CICS renderer patch for the additive GMVB banking upgrade."""
+from __future__ import annotations
+from typing import Any
+from gibson.apps.gmvb_upgrade import COBOL_SOURCES
+
+
+def _pad(lines: list[str], width: int = 74) -> list[str]:
+    return [str(x)[:width] for x in lines]
+
+
+def install_cics_gmvb_upgrade(cls) -> None:
+    if getattr(cls, "_gmvb_cics_upgrade_installed", False):
+        return
+    orig_login = cls._bank_login
+    orig_login_pt = cls._bank_login_passticket
+    orig_render_bank = cls._render_bank
+    orig_handle_key = cls._bank_handle_key
+
+    def _bank_login(self, userid: str, password: str) -> str:
+        out = orig_login(self, userid, password)
+        if self.bank_authenticated:
+            sess = self.lab.ensure_session(self.lab_sid)
+            sess.user = self.bank_userid
+            sess.authenticated = True
+            sess.current_screen = "MENU"
+        return self._render_bank() if self.bank_authenticated else out
+
+    def _bank_login_passticket(self, userid: str, ticket: str, applid: str = "CICS") -> str:
+        out = orig_login_pt(self, userid, ticket, applid)
+        if self.bank_authenticated:
+            sess = self.lab.ensure_session(self.lab_sid)
+            sess.user = self.bank_userid
+            sess.authenticated = True
+            sess.current_screen = "MENU"
+        return self._render_bank() if self.bank_authenticated else out
+
+    def _render_rows(self, rows: list[dict[str, Any]], limit: int = 8) -> list[str]:
+        lines=[]
+        for row in rows[:limit]:
+            if 'LINE' in row:
+                lines.append(str(row['LINE']))
+            elif 'SPOOL' in row:
+                lines.append(str(row['SPOOL']))
+            elif 'RESULT' in row:
+                lines.append(str(row['RESULT']))
+            else:
+                parts=[f"{k}={v}" for k,v in list(row.items())[:5]]
+                lines.append("  ".join(parts)[:74])
+        return lines
+
+    def _render_bank(self, screen: str | None = None, message: str | None = None) -> str:
+        if screen:
+            self.bank_current = screen.upper()
+        if message is not None:
+            self.bank_status = message
+        sess = self.lab.ensure_session(self.lab_sid)
+        if self.bank_authenticated:
+            sess.authenticated = True
+            sess.user = self.bank_userid or self.userid
+        current = self.bank_current.upper()
+        if current == "LOGN":
+            return self._bank_screen("LOGN - CUSTOMER SIGNON / GMVB", [
+                "BANKMASTER/VS  GIBSON CICS  SYSID: PROD",
+                "NATIONAL CLEARING BANK PLC",
+                "",
+                "USERID . . . . . . .  ________",
+                "PASSWORD . . . . . .  ________",
+                "PASSTICKET . . . . .  ________",
+                "APPLID . . . . . . .  GMVB",
+                "",
+                "LIVE AUTH USES GIBSON GACF/RACF, PTKGEN/PASSTICKET AND MFA.",
+                "ENTER: userid password  OR  userid PTKT token [applid]",
+                "PF12=LOGOUT  ~=NEXT FIELD  ENTER=SUBMIT",
+            ], self.bank_status)
+        if current == "MENU":
+            return self._bank_screen("MENU - MAIN MENU / GMVB", [
+                f"SIGNED ON USER . . .  {self.bank_userid or self.userid}",
+                "",
+                "1  CUST - CUSTOMER MASTER MAINTENANCE",
+                "2  ACCT - ACCOUNT INQUIRY AND MAINTENANCE",
+                "3  TRAN - TRANSACTION POSTING",
+                "4  BULK - BULK PROCESSING CENTRE",
+                "5  LOGO - SIGN OFF",
+                "6  REST - REST API SECURITY TESTER",
+                "7  TN32 - TN3270 PACKET ANALYSER",
+                "8  MAN  - OPERATOR REFERENCE MANUAL",
+                "9  LAB  - SCENARIO VULNERABILITY LAB",
+                "0  SOL  - INSTRUCTOR SOLUTION VIEWER",
+                "CECI CEMT CEDA COBL BOF ARE TRAINING PANELS.",
+                "SELECTION . . . . .  ____",
+                "PF3=BACK  PF4=MENU  PF12=LOGOUT",
+            ], self.bank_status)
+        # For new GMVB screens, reuse BankingLabService line renderer + rows.
+        if current in {"CUST","TRAN","BULK","REST","TN32","MAN","LAB","SOL","COBL","BOF"}:
+            sess.current_screen = current
+            body = list(self.lab._screen_lines(sess))
+            rows = _render_rows(self, sess.last_rows, 10)
+            if rows:
+                body += [""] + rows
+            return self._bank_screen(f"{current} - GMVB BANKING", body + ["", "PF3=BACK PF4=MENU PF5=ACTION PF8=INQ PF12=COBOL"], self.bank_status or sess.status)
+        return orig_render_bank(self, screen, message)
+
+    def _bank_field_defs(self, screen: str | None = None) -> list[dict[str, object]]:
+        current = (screen or self.bank_current).upper()
+        if current == "MENU":
+            return [{"name":"SELECTION","row":18,"col":24,"width":6}]
+        if current == "CUST":
+            return [{"name":"CUSTOMER_ID","row":8,"col":24,"width":18},{"name":"SURNAME","row":9,"col":24,"width":30},{"name":"FORENAME","row":10,"col":24,"width":20}]
+        if current == "TRAN":
+            return [{"name":"ACCOUNT","row":8,"col":24,"width":10},{"name":"TRANTYPE","row":9,"col":24,"width":3},{"name":"AMOUNT","row":10,"col":24,"width":10},{"name":"TO_ACCOUNT","row":11,"col":24,"width":10},{"name":"DESC","row":12,"col":24,"width":30}]
+        if current == "BOF":
+            return [{"name":"OVERFLOW","row":8,"col":24,"width":60}]
+        return cls.__dict__.get('_bank_field_defs_original', lambda s, screen=None: [])(self, screen)
+
+    # Preserve original field defs for non-upgraded screens.
+    if '_bank_field_defs_original' not in cls.__dict__:
+        cls._bank_field_defs_original = cls._bank_field_defs
+
+    def _bank_submit_form(self) -> str:
+        current = self.bank_current.upper()
+        if current == "LOGN":
+            return _bank_login(self, self.bank_form_values.get("USERID", ""), self.bank_form_values.get("PASSWORD", ""))
+        if current == "MENU":
+            return self._bank_handle_value(self.bank_form_values.get("SELECTION", ""))
+        if current == "CUST":
+            snap = self.lab.gmvb_customer_lookup(self.lab_sid, self.bank_form_values.get("CUSTOMER_ID", ""))
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("CUST", self.bank_status)
+        if current == "TRAN":
+            snap = self.lab.gmvb_post_transaction(self.lab_sid, self.bank_form_values)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("TRAN", self.bank_status)
+        if current == "BOF":
+            snap = self.lab.gmvb_overflow_test(self.lab_sid, self.bank_form_values.get("OVERFLOW", ""))
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("BOF", self.bank_status)
+        return self._render_bank(current, self.bank_status)
+
+    def _bank_handle_value(self, value: str) -> str:
+        entered = (value or "").strip().upper()
+        current = self.bank_current.upper()
+        if current == "MENU":
+            mapping = {"1":"CUST","2":"ACCT","3":"TRAN","4":"BULK","5":"LOGN","6":"REST","7":"TN32","8":"MAN","9":"LAB","0":"SOL","CUST":"CUST","ACCT":"ACCT","TRAN":"TRAN","BULK":"BULK","LOGO":"LOGN","REST":"REST","TN32":"TN32","MAN":"MAN","HELP":"MAN","LAB":"LAB","SOL":"SOL","COBL":"COBL","BOF":"BOF","CECI":"CECI","CEMT":"CEMT","CEDA":"CEDA"}
+            dest = mapping.get(entered)
+            if dest:
+                self.bank_prev = self.bank_current
+                self.bank_current = dest
+                self.lab.menu_select(self.lab_sid, dest)
+                self.bank_status = f"{dest} READY"
+                return self._render_bank(dest)
+        if current == "CUST":
+            snap = self.lab.gmvb_customer_lookup(self.lab_sid, entered or self.bank_form_values.get("CUSTOMER_ID", "")); self.bank_status = snap.get('status', self.bank_status); return self._render_bank("CUST")
+        if current == "TRAN" and entered in {"POST","PF5"}:
+            snap = self.lab.gmvb_post_transaction(self.lab_sid, self.bank_form_values); self.bank_status = snap.get('status', self.bank_status); return self._render_bank("TRAN")
+        if current == "BULK":
+            snap = self.lab.gmvb_bulk_action(self.lab_sid, entered); self.bank_status = snap.get('status', self.bank_status); return self._render_bank("BULK")
+        if current == "LAB":
+            snap = self.lab.gmvb_activate_lab(self.lab_sid, entered); self.bank_status = snap.get('status', self.bank_status); return self._render_bank("LAB")
+        if current == "SOL":
+            snap = self.lab.terminal_submit(self.lab_sid, command=entered); self.bank_status=snap.get('status', self.bank_status); return self._render_bank("SOL")
+        if current == "COBL":
+            snap = self.lab.terminal_submit(self.lab_sid, command=entered); self.bank_status=snap.get('status', self.bank_status); return self._render_bank("COBL")
+        if current == "BOF":
+            snap = self.lab.gmvb_overflow_test(self.lab_sid, entered); self.bank_status=snap.get('status', self.bank_status); return self._render_bank("BOF")
+        return cls.__dict__.get('_bank_handle_value_original', lambda s,v: s._render_bank(s.bank_current, 'UNKNOWN GMVB COMMAND'))(self, value)
+
+    if '_bank_handle_value_original' not in cls.__dict__:
+        cls._bank_handle_value_original = cls._bank_handle_value
+
+    def _gmvb_execute(self, cmd: str) -> str:
+        parts = cmd.strip().split()
+        if len(parts) == 1:
+            return self._render_bank("LOGN", "ENTER USERID AND PASSWORD")
+        action = parts[1].upper()
+        if action == "LOGN":
+            if len(parts) >= 5 and parts[3].upper() in {"PTKT", "PASSTICKET"}:
+                return _bank_login_passticket(self, parts[2], parts[4], parts[5] if len(parts) >= 6 else "GMVB")
+            if len(parts) >= 4:
+                return _bank_login(self, parts[2], parts[3])
+            if len(parts) == 3 and "~" in parts[2]:
+                user, _, pw = parts[2].partition("~")
+                return _bank_login(self, user, pw)
+            return self._render_bank("LOGN", "ENTER FORMAT userid password OR userid PTKT ticket")
+        if action in {"MENU","CUST","ACCT","TRAN","BULK","REST","TN32","MAN","LAB","SOL","CECI","CEMT","CEDA","COBL","BOF","CARG","ORDE","ORDR","HACK","ADMN","XFER","APRV","PTKT","STMT"}:
+            self.bank_current = action
+            if len(parts) >= 3:
+                return _bank_handle_value(self, " ".join(parts[2:]))
+            return self._render_bank(action, f"{action} READY")
+        return self._render_bank(self.bank_current, "UNKNOWN GMVB SUBCOMMAND")
+
+    cls._bank_login = _bank_login
+    cls._bank_login_passticket = _bank_login_passticket
+    cls._render_bank = _render_bank
+    cls._bank_field_defs = _bank_field_defs
+    cls._bank_submit_form = _bank_submit_form
+    cls._bank_handle_value = _bank_handle_value
+    cls._gmvb_execute = _gmvb_execute
+    cls._gmvb_cics_upgrade_installed = True

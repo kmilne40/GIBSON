@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+
+
+def _session(state, sid="UTDB"):
+    st, payload = handle_ui8999(state, "/api/v1/ui8999/terminal/start", "POST", {"sid": sid, "userid": "GUEST"})
+    assert st == 200 and payload["ok"]
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "CESN",
+        "command": "",
+        "fields": {"userid": "GUEST", "password": "GUEST"},
+    })
+    assert st == 200 and payload["data"]["screen"]["name"] == "FIBS"
+    return sid
+
+
+def _field(payload, field_id):
+    return next(f for f in payload["data"]["screen"]["fields"] if f["id"] == field_id)
+
+
+def test_cust_reads_real_gmvb_customer_and_does_not_return_to_menu():
+    state = GibsonState.create()
+    sid = _session(state)
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "GMVB",
+        "command": "CUST",
+        "fields": {},
+    })
+    assert st == 200 and payload["data"]["screen"]["name"] == "CUST"
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "CUST",
+        "command": "10000002",
+        "fields": {},
+    })
+    assert st == 200
+    assert payload["data"]["screen"]["name"] == "CUST"
+    assert _field(payload, "surname")["value"] == "THATCHER"
+    assert _field(payload, "forename")["value"] == "MARGARET"
+
+
+def test_cust_field_enter_adds_and_deletes_customer_in_gmvb_state():
+    state = GibsonState.create()
+    sid = _session(state, "UTCUSTADD")
+    add_fields = {
+        "customer_id": "19999999",
+        "cust_action": "ADD",
+        "surname": "TESTER",
+        "forename": "DATA",
+        "address": "99 TEST ROAD LONDON EC1",
+        "dob": "01/01/60",
+        "sortcode": "204514",
+        "ni": "ZZ999999Z",
+    }
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "CUST",
+        "command": "",
+        "fields": add_fields,
+    })
+    assert st == 200
+    assert _field(payload, "surname")["value"] == "TESTER"
+    assert "ADDED" in payload["data"]["messages"][0]
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "CUST",
+        "command": "",
+        "fields": {"customer_id": "19999999", "cust_action": "DEL"},
+    })
+    assert st == 200
+    assert "DELETED" in payload["data"]["messages"][0]
+
+
+def test_acct_reads_real_gmvb_account_and_supports_add_delete():
+    state = GibsonState.create()
+    sid = _session(state, "UTACCT")
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "ACCT",
+        "command": "1000000201",
+        "fields": {},
+    })
+    assert st == 200
+    assert payload["data"]["screen"]["name"] == "ACCT"
+    assert _field(payload, "balance")["value"] == "8742.10"
+    add_fields = {
+        "account": "1999999901",
+        "acct_action": "ADD",
+        "acct_customer": "10000002",
+        "acct_type": "CUR",
+        "balance": "1234.56",
+        "limit": "100.00",
+    }
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "ACCT",
+        "command": "",
+        "fields": add_fields,
+    })
+    assert st == 200
+    assert _field(payload, "balance")["value"] == "1234.56"
+    assert "ADDED" in payload["data"]["messages"][0]
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "ACCT",
+        "command": "",
+        "fields": {"account": "1999999901", "acct_action": "DEL"},
+    })
+    assert st == 200
+    assert "DELETED" in payload["data"]["messages"][0]
+
+
+def test_sqli_api_and_hack3270_paths_still_work():
+    state = GibsonState.create()
+    sid = _session(state, "UTSQLI")
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {
+        "sid": sid,
+        "current_screen": "CUST",
+        "command": "' OR '1'='1",
+        "fields": {},
+    })
+    assert st == 200
+    assert payload["data"]["screen"]["name"] == "CUST"
+    assert "SQL injection" in " ".join(payload["data"]["messages"])
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/hack3270/session/{sid}/toggle", "POST", {
+        "sid": sid,
+        "action": "on",
+    })
+    assert st == 200 and payload["data"]["hack3270"]["enabled"] is True
+    st, payload = handle_ui8999(state, f"/api/v1/ui8999/hack3270/session/{sid}/batch-pin-bruteforce", "POST", {
+        "sid": sid,
+        "pins": ["0000", "1111", "1337"],
+    })
+    assert st == 200 and payload["data"]["found"] == "1337"
+    assert payload["data"]["screen"]["name"] == "BATCH"
+    st, payload = handle_ui8999(state, "/api/v1/ui8999/api-menu/unsafe-query", "POST", {
+        "sid": sid,
+        "input": "' OR '1'='1",
+    })
+    assert st == 200 and payload["data"]["vulnerable"] is True
+    assert len(payload["data"]["rows"]) > 1

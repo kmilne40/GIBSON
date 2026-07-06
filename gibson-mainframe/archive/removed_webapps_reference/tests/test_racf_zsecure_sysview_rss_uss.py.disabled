@@ -1,0 +1,76 @@
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.apps.omvs import OmvsShellSession
+from gibson.apps.tso import TsoCommandProcessor
+from gibson.core import v26_features
+from gibson.apps.cti_rss import FEEDS_DSN, CACHE_DSN
+
+
+def state(tmp_path):
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path/'files', commands_dir=tmp_path/'files'/'commands', transfer_root=tmp_path/'transfers', gacf_path=tmp_path/'GACF.DB')
+    return GibsonState.create(cfg)
+
+
+def test_uss_ftp_telnet_help_status_and_no_auto_connect(tmp_path):
+    st = state(tmp_path); sh = OmvsShellSession(st, 'IBMUSER')
+    assert 'FTP' in sh.execute('ftp help').upper()
+    assert 'TELNET' in sh.execute('telnet help').upper()
+    assert 'FTP STATUS' in sh.execute('ftp')
+    assert 'TELNET STATUS' in sh.execute('telnet')
+    assert 'Unable to connect' in sh.execute('ftp 192.0.2.1 65000') or 'EZA1735I' in sh.execute('ftp 192.0.2.1 65000')
+    assert 'unable to connect' in sh.execute('telnet 192.0.2.1 65000').lower() or 'simulated' in sh.execute('telnet 192.0.2.1 65000').lower()
+
+
+def test_rss_dataset_seed_add_delete_show_export_and_reject_file_scheme(tmp_path):
+    st = state(tmp_path); sh = OmvsShellSession(st, 'IBMUSER')
+    out = sh.execute('rss list')
+    assert 'KREBSONSECURITY' in out
+    assert FEEDS_DSN in sh.execute('rss config')
+    assert 'URL REJECTED' in sh.execute('rss add BAD file:///etc/passwd')
+    assert 'ADDED' in sh.execute('rss add TEST https://example.invalid/feed.xml')
+    assert 'TEST' in sh.execute('rss list')
+    assert 'DELETED' in sh.execute('rss delete TEST')
+    assert 'REFRESH COMPLETE' in sh.execute('rss fetch')
+    assert 'FIBS CTI/RSS HEADLINES' in sh.execute('rss show')
+    assert 'EXPORTED' in sh.execute('rss export FIBS.CTI.RSS.REPORT')
+    assert st.datasets.read('IBMUSER', CACHE_DSN)
+
+
+def test_sysview_commands_are_simulated_and_no_real_process_control(tmp_path):
+    st = state(tmp_path); p = TsoCommandProcessor(st, 'IBMUSER')
+    assert 'SYSVIEW' in p.run('SYSVIEW HELP')
+    assert 'SYSTEM OVERVIEW' in p.run('SYSVIEW STATUS')
+    assert 'CICS REGION' in p.run('SYSVIEW CICS')
+    assert 'DB2 SUBSYSTEM' in p.run('SYSVIEW DB2')
+    assert 'TCP/IP SERVICE' in p.run('SYSVIEW TCPIP')
+    assert 'FIBS APPLICATION' in p.run('SYSVIEW FIBS')
+    assert 'NO REAL HOST PROCESS CONTROL' in p.run('SYSVIEW STOP CICSFIBS')
+
+
+def test_zsecure_menu_report_driven_and_exports_dataset(tmp_path):
+    st = state(tmp_path); p = TsoCommandProcessor(st, 'IBMUSER')
+    menu = p.run('ZSEC')
+    assert 'zSecure' in menu or 'ZSECURE' in menu
+    assert 'Privileged users' in menu or 'PRIVILEGE' in menu
+    assert 'RACF OVERVIEW' in p.run('ZSEC RACF')
+    assert 'MFA' in p.run('ZSEC MFA')
+    assert 'CICS SECURITY' in p.run('ZSEC CICS')
+    assert 'AUDIT REPORT' in p.run('ZSEC REPORTS') or 'NO REPORT DATA' in p.run('ZSEC REPORTS')
+    v26_features.ensure_operations_datasets(st, 'IBMUSER')
+    assert 'FINDING_ID' in st.datasets.read('IBMUSER', 'FIBS.ZSEC.FINDINGS')
+
+
+def test_racf_menu_under_r_backing_commands_still_work(tmp_path):
+    st = state(tmp_path); p = TsoCommandProcessor(st, 'IBMUSER')
+    assert 'IBMUSER' in p.run('LISTUSER IBMUSER')
+    assert 'SETROPTS' in p.run('SETROPTS LIST')
+    out = p.run('ADDUSER RACFTST PASSWORD(PASS123) DFLTGRP(STUDENT)')
+    assert 'RACFTST' in out or 'ADDED' in out or 'CREATED' in out
+    assert 'RACFTST' in p.run('LISTUSER RACFTST')
+
+
+def test_existing_fibs_and_security_regression_paths(tmp_path):
+    st = state(tmp_path); p = TsoCommandProcessor(st, 'IBMUSER')
+    assert 'FIBS.CUSTOMER' in p.run("RUN SQL SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES WHERE CREATOR='FIBS'") or 'CUSTOMER' in p.run("RUN SQL SELECT * FROM FIBS.CUSTOMER")
+    assert '1234' not in p.run('MFA STATUS') or 'MFA' in p.run('MFA STATUS')
+    assert 'PASSTICKET' in p.run('ZSEC PASSTICKET') or 'PTKTDATA' in p.run('ZSEC PASSTICKET')

@@ -1,0 +1,83 @@
+from gibson.core.state import GibsonState
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.db2_sim import Db2Simulator as TsoDb2
+from gibson.apps.ispf import Db2Simulator as IspfDb2
+from gibson.apps.fibs_service import get_fibs_service
+from gibson.services.react8999_api import handle_ui8999
+
+
+def make_state():
+    return GibsonState.create()
+
+
+def test_cics_fibs_transaction_and_menu_options_are_stateful():
+    st = make_state(); cics = CicsSimulator(st, "IBMUSER")
+    assert "FIBS - GIBSON BANKING APPLICATION" in cics.execute("FIBS")
+    assert "FIBS CUSTOMER INQUIRY" in cics.execute("1")
+    assert "MARGARET THATCHER" in cics.execute("10000002")
+    assert "FIBS - GIBSON BANKING APPLICATION" in cics.execute("OMEN")
+    out = cics.execute("2")
+    assert "DFHCE3551" not in out
+    assert "FIBS ACCOUNT INQUIRY" in out
+    assert "8742.10" in cics.execute("1000000201")
+
+
+def test_cics_gmvb_alias_routes_to_fibs_not_old_menu():
+    st = make_state(); cics = CicsSimulator(st, "IBMUSER")
+    out = cics.execute("GMVB")
+    assert "FIBS - GIBSON BANKING APPLICATION" in out
+    assert "OMEN" not in out.splitlines()[1:5]
+
+
+def test_react8999_default_and_option_flow_use_fibs():
+    st = make_state(); sid = "RFIBS"
+    code, payload = handle_ui8999(st, "/api/v1/ui8999/terminal/start", "POST", {"sid": sid}, {})
+    assert code == 200
+    assert payload["data"]["screen"]["name"] == "FIBS"
+    assert "FIBS" in payload["data"]["screen"]["title"]
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "1", "current_screen": "FIBS", "fields": {}}, {})
+    assert code == 200 and payload["data"]["screen"]["name"] == "CUST"
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "10000002", "current_screen": "CUST", "fields": {}}, {})
+    texts = "\n".join(r["text"] for r in payload["data"]["screen"]["rows"])
+    field_text = "\n".join(str(f.get("value", "")) for f in payload["data"]["screen"].get("fields", []))
+    assert "THATCHER" in (texts + "\n" + field_text)
+
+
+def test_fibs_api_and_gmvb_wrapper_share_state():
+    st = make_state(); svc = get_fibs_service(st)
+    row = svc.create_customer({"FORENAME": "FIBS", "SURNAME": "TEST"}, "TESTER")
+    cid = row["CUSTOMER_ID"]
+    code, payload = handle_ui8999(st, f"/api/v1/fibs/customers/{cid}", "GET", {}, {})
+    assert code == 200 and payload["data"]["SURNAME"] == "TEST"
+    code, payload = handle_ui8999(st, f"/api/v1/gmvb/customers/{cid}", "GET", {}, {})
+    assert code == 200 and payload["data"]["SURNAME"] == "TEST"
+
+
+def test_fibs_tables_visible_to_tso_db2_and_ispf_spufi():
+    st = make_state()
+    for sim in (TsoDb2(st), IspfDb2(st)):
+        assert sim.run_sql("SELECT * FROM FIBS.CUSTOMER WHERE CUSTOMER_ID='10000002'")[0]["SURNAME"] == "THATCHER"
+        assert sim.run_sql("SELECT * FROM FIBS.ACCOUNT WHERE ACCOUNT_NUMBER='1000000201'")[0]["ACCOUNT_NUMBER"] == "1000000201"
+        assert sim.run_sql("SELECT * FROM FIBS.SWIFT_MESSAGE")[0]["MESSAGE_ID"].startswith("SWF")
+        names = {r["NAME"] for r in sim.run_sql("SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES WHERE CREATOR='FIBS'")}
+        assert {"CUSTOMER", "ACCOUNT", "PROCTRAN", "BATCH_TRANSFER", "SWIFT_MESSAGE"}.issubset(names)
+
+
+def test_cobl_source_scroll_pf8_pf7_find_top_bottom():
+    st = make_state(); sid = "COBLTEST"
+    handle_ui8999(st, "/api/v1/ui8999/terminal/start", "POST", {"sid": sid}, {})
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "COBL", "current_screen": "FIBS", "fields": {}}, {})
+    assert "LINE 0001" in "\n".join(r["text"] for r in payload["data"]["screen"]["rows"])
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/aid", "POST", {"sid": sid, "aid": "PF8"}, {})
+    assert "LINE 0011" in "\n".join(r["text"] for r in payload["data"]["screen"]["rows"])
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/aid", "POST", {"sid": sid, "aid": "PF7"}, {})
+    assert "LINE 0001" in "\n".join(r["text"] for r in payload["data"]["screen"]["rows"])
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "FIND NUMVAL", "current_screen": "COBL", "fields": {}}, {})
+    assert "FOUND NUMVAL" in "\n".join(r["text"] for r in payload["data"]["screen"]["rows"])
+
+
+def test_no_cbsa_user_facing_names_in_fibs_config():
+    st = make_state()
+    code, payload = handle_ui8999(st, "/api/v1/ui8999/terminal/config", "GET", {}, {})
+    assert code == 200
+    assert "CBSA" not in str(payload["data"].get("application", ""))

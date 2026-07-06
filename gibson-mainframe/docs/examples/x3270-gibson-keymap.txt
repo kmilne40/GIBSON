@@ -1,0 +1,13 @@
+# Optional Gibson x3270 keymap fallback
+# Add as an X resource or start with x3270 -xrm using these mappings adapted to
+# your environment. The server-side v23 patch recognises real AID/PF frames,
+# ANSI escape sequences, and typed aliases; this file is only a fallback.
+
+x3270.keymap.gibson: #override \
+  <Key>F1: String("PF1\n") \n\
+  <Key>F3: String("PF3\n") \n\
+  <Key>F7: String("PF7\n") \n\
+  <Key>F8: String("PF8\n") \n\
+  <Key>F10: String("PF10\n") \n\
+  <Key>F11: String("PF11\n") \n\
+  <Key>F12: String("PF12\n")

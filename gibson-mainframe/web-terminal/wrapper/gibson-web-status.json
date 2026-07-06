@@ -1,0 +1,16 @@
+{
+  "web_terminal": "configured",
+  "web_port": 8023,
+  "mode": "guacamole-common-js-direct-client",
+  "backend_host": "host.docker.internal",
+  "backend_port": 2023,
+  "host_arch": "arm64",
+  "normalized_arch": "arm64",
+  "guacamole_image": "guacamole/guacamole:1.6.0",
+  "guacd_image": "guacamole/guacd:1.6.0",
+  "guacamole_url": "http://127.0.0.1:8023/guacamole/",
+  "wrapper_url": "http://127.0.0.1:8023/",
+  "container_runtime": "unknown",
+  "runtime_status": "unknown",
+  "last_error": null
+}

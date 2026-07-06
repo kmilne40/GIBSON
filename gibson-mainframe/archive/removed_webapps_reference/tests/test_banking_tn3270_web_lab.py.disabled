@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import http.client
+import json
+import socket
+import threading
+import time
+from pathlib import Path
+
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.services.rest_gateway import serve_rest
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def make_state(tmp_path: Path, *, rest_port: int | None = None) -> GibsonState:
+    sim_root = tmp_path / "mfsim"
+    cfg = GibsonConfig(
+        host="127.0.0.1",
+        port=_free_port(),
+        uss_port=_free_port(),
+        ftp_port=_free_port(),
+        rest_port=rest_port or _free_port(),
+        db2_tcp_port=_free_port(),
+        db2_ws_port=_free_port(),
+        dashboard_port=_free_port(),
+        sim_root=sim_root,
+        files_root=sim_root / "f",
+        commands_dir=sim_root / "f" / "commands",
+        gacf_path=sim_root / "GACF.DB",
+    )
+    cfg.ensure()
+    cfg.gacf_path.write_text(
+        "IBMUSER:SYS1:SPECIAL:OMVS\nGUEST:GUEST:NONE:OMVS\nALICE:ALICE:NONE:OMVS\n",
+        encoding="utf-8",
+    )
+    return GibsonState.create(cfg)
+
+
+def _wait_for_rest(st: GibsonState) -> None:
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=0.5)
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            return
+        except Exception:
+            time.sleep(0.1)
+    raise AssertionError("REST gateway did not start")
+
+
+def test_web_banking_portal_has_tn3270_and_hack3270(tmp_path):
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    _wait_for_rest(st)
+
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="ignore")
+    conn.close()
+
+    assert resp.status == 410
+    assert '"status": "disabled"' in body
+    assert "Web UI disabled" in body
+    assert "L TSO" in body and "L CICS" in body and "L DB2" in body
+    assert "<html" not in body.lower()
+
+
+
+def test_web_banking_portal_server_renders_terminal_text_and_script_is_valid(tmp_path):
+    import re
+    import shutil
+    import subprocess
+
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    _wait_for_rest(st)
+
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("GET", "/")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="ignore")
+    conn.close()
+
+    assert resp.status == 410
+    assert "Web UI disabled" in body
+    assert "<pre id='terminal-screen'" not in body
+    assert "<script>" not in body
+    assert "<html" not in body.lower()
+
+def test_hack3270_toggle_reveals_hidden_fields_and_updates_session(tmp_path):
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    _wait_for_rest(st)
+
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("GET", "/bank/session?sid=lab1")
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    conn.close()
+    assert data["current_screen"] == "LOGN"
+    assert any(f["name"] == "PASSWORD" and f["hidden"] for f in data["fields"])
+
+    payload = json.dumps({
+        "sid": "lab1",
+        "hack_enabled": True,
+        "reveal_hidden": True,
+        "remove_protection": True,
+        "remove_numeric": True,
+        "show_metadata": True,
+        "show_mdt": True,
+        "show_positions": True,
+        "show_standard": True,
+        "tutorial_mode": "guided",
+        "show_solutions": True,
+    })
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/hack3270", body=payload, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    conn.close()
+
+    assert data["hack"]["hack_enabled"] is True
+    assert data["hack"]["reveal_hidden"] is True
+    assert data["tutorial_mode"] == "guided"
+    assert data["show_solutions"] is True
+
+
+def test_statement_and_account_labs_keep_sqli_and_idor_branches(tmp_path):
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    _wait_for_rest(st)
+
+    # Login as GUEST.
+    payload = json.dumps({"sid": "lab2", "fields": {"USERID": "GUEST", "PASSWORD": "GUEST"}})
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/terminal", body=payload, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    conn.close()
+    assert data["current_screen"] == "MENU"
+
+    # IDOR through ACCT.
+    payload = json.dumps({"sid": "lab2", "command": "ACCT", "fields": {"SELECTION": "ACCT"}})
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/terminal", body=payload, headers={"Content-Type": "application/json"})
+    conn.getresponse().read()
+    conn.close()
+    payload = json.dumps({"sid": "lab2", "fields": {"ACCTNO": "10001"}})
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/terminal", body=payload, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    conn.close()
+    assert any("IDOR training branch triggered" in note for note in data["notes"])
+    assert data["rows"][0]["ACCTNO"] == "10001"
+
+    # SQL injection through STMT.
+    payload = json.dumps({"sid": "lab2", "command": "STMT", "fields": {"SELECTION": "STMT"}})
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/terminal", body=payload, headers={"Content-Type": "application/json"})
+    conn.getresponse().read()
+    conn.close()
+    payload = json.dumps({"sid": "lab2", "fields": {"ACCTNO": "10001' OR '1'='1", "PERIOD": "2026-04"}})
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=1)
+    conn.request("POST", "/bank/terminal", body=payload, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    conn.close()
+    assert any("SQL injection branch" in note for note in data["notes"])
+    assert len(data["rows"]) >= 3
+
+
+def test_cics_gmvb_legacy_flows_and_new_banking_routes_survive(tmp_path):
+    st = make_state(tmp_path)
+    cics = CicsSimulator(st, "IBMUSER")
+
+    login = cics.execute("GMVB LOGN IBMUSER SYS1")
+    assert "MENU - MAIN MENU" in login
+    legacy = cics.execute("GMVB CARG 00001")
+    assert "STEEL FASTENER CRATE" in legacy
+    acct = cics.execute("GMVB ACCT 10001")
+    assert "ACCT - ACCOUNT INQUIRY" in acct
+    xfer = cics.execute("GMVB XFER 10001 10002 50.00 DEMO")
+    assert "XFER - FUNDS TRANSFER" in xfer
+
+    rows = Db2Simulator(st).run_sql("SELECT ACCTNO, OWNER, STATUS FROM GIBSON.STATEMENTS WHERE ACCTNO = '10001';", "IBMUSER")
+    assert rows and rows[0]["ACCTNO"] == "10001"

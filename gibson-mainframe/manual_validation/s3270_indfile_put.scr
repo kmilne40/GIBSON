@@ -1,0 +1,6 @@
+# s3270 command-mode IND$FILE PUT validation for Gibson
+Connect(127.0.0.1:2023)
+String("IND$FILE PUT LOCAL(test-in.txt) DSN(IBMUSER.TEST.TEXT) MODE(ASCII) EXIST(REPLACE)")
+Enter
+Wait(Output)
+Disconnect

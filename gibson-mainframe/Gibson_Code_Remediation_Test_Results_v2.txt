@@ -1,0 +1,70 @@
+Gibson Code Remediation Test Results v2
+=======================================
+
+1) New remediation regression tests
+-----------------------------------
+Command:
+  pytest -q tests/test_remediation_v2.py
+
+Result:
+  8 passed in 1.14s
+
+2) Core targeted regression set
+-------------------------------
+Command:
+  pytest -q tests/test_ispf_coordinate_editor_fix_v1.py tests/test_ispf_stability_fix_v1.py tests/test_v5_pin_autotick_dvcapin_welcome.py tests/test_gibby_masterconsole_cti_manual_dvca.py tests/test_smf7_data_lost_records.py tests/test_zsecure_smf_views.py tests/test_remediation_v2.py
+
+Result:
+  29 passed, 24 warnings in 17.60s
+
+3) VTAM/logon/rasframe keyword run
+----------------------------------
+Command:
+  pytest -q -k 'vtam or logon or rasframe'
+
+Result:
+  26 passed, 1 failed, 590 deselected, 31 warnings in 8.71s
+
+Remaining failure:
+  tests/test_tn3270_and_editor_additions.py::test_tn3270_listener_supports_vtam_to_tso_and_cics
+  Assertion: expected 'GIBSON PRODUCTION LPAR' in first screen, but decoded frame was empty.
+  Note: negotiated TN3270 tests pass. This appears to be a separate no-negotiation listener compatibility issue.
+
+4) DVCA/DVCAPIN/PIN keyword run
+-------------------------------
+Command:
+  pytest -q -k 'dvca or dvcapin or pin or bruteforce'
+
+Result:
+  76 passed, 3 failed, 538 deselected, 257 warnings in 20.58s
+
+Remaining failures observed:
+  - tests/test_tooling_console_fix_v1.py::test_nmap_tso_enum_and_port_mapping
+    Exact OMVS nmap compatibility text expectation unrelated to DVCA PIN changes.
+  - tests/test_v3_corrective_regression.py::test_r06_ipl_prompt_and_d_display_reveals_training_pin
+    Environment/persisted MFA state affected test flow before R05/R06.
+  - tests/test_v3_corrective_regression.py::test_master_console_full_layout_survives_r05_r06_and_d_dvcapin
+    Same R05/R06 flow issue under persisted MFA state.
+
+5) zSecure/SMF keyword run
+--------------------------
+Command:
+  pytest -q -k 'smf7 or zsec or zsecure'
+
+Result:
+  19 passed, 5 failed, 593 deselected, 25 warnings in 4.35s
+
+Remaining failures observed:
+  - Broad zSecure report-routing/string expectation tests for CICS, DB2, SMF30, menu text, and D SECURITY port scan output.
+  - The requested ZSEC SMF7 regression test passes.
+
+6) Python compile check
+-----------------------
+Command:
+  python -m py_compile gibson/apps/editor.py gibson/screens/vtam_model.py gibson/render/block_letters.py gibson/core/dvcapin.py gibson/apps/pin_bruteforce.py gibson/apps/dvca/programs.py gibson/apps/zsecure_engine.py tests/test_remediation_v2.py tests/test_canonical_vtam_renderer.py tests/test_vtam_front_screen.py tests/test_r05_osint_cti_board_v1.py
+
+Result:
+  passed
+
+Full test suite:
+  Not completed in this sandbox due to time limits. Targeted tests were run and limitations are documented above.

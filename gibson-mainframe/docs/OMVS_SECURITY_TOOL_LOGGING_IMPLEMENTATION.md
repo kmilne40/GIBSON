@@ -1,0 +1,1 @@
+OMVS tools now emit SMF80/OMVS_TOOL, OPERLOG, audit.log and dashboard activity records through gibson.tools.security_events.emit_omvs_tool_event. Printed correlation IDs are persisted. Secrets, PINs, API keys and URL tokens are redacted.

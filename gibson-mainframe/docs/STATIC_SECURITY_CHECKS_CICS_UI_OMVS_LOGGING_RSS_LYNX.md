@@ -1,0 +1,1 @@
+Static checks: no IronTerm, no port 8023, no shell=True, no host command execution, no TFTP/TTP routes, OMVS nmap remains, ISPF M nmap restored out, active tools retain HOSTS.TXT scoping, Lynx/RSS use Python-native HTTP clients, secrets redacted, correlation IDs persisted.

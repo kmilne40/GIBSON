@@ -1,0 +1,16 @@
+<user-mapping>
+  <authorize username="${GIBSON_GUAC_USER}" password="${GIBSON_GUAC_PASSWORD}" encoding="plain">
+    <connection name="Gibson VTAM Console">
+      <protocol>telnet</protocol>
+      <param name="hostname">${GIBSON_GUAC_BACKEND_HOST}</param>
+      <param name="port">${GIBSON_TELNET_PORT}</param>
+      <param name="terminal-type">${GIBSON_GUAC_TERMINAL_TYPE}</param>
+      <param name="color-scheme">green-black</param>
+      <param name="font-name">monospace</param>
+      <param name="font-size">12</param>
+      <param name="width">80</param>
+      <param name="height">24</param>
+      <param name="enable-sftp">false</param>
+    </connection>
+  </authorize>
+</user-mapping>

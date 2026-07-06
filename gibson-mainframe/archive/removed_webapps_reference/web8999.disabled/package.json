@@ -1,0 +1,1 @@
+{"name":"gibson-react8999","version":"1.0.0","private":true,"type":"module","scripts":{"build":"node build.mjs","test":"node build.mjs --check"},"description":"Gibson CICS Banking Training Console for port 8999. Build is dependency-free for offline simulator packaging."}

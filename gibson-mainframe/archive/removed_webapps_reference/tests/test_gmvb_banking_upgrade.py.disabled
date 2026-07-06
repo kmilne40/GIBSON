@@ -1,0 +1,59 @@
+from gibson.core.state import GibsonState
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.apps.gmvb_upgrade import COBOL_SOURCES, gmvb_json_api
+
+
+def test_gmvb_shared_state_cics_rest_db2():
+    state = GibsonState.create()
+    lab = get_banking_lab(state)
+    sid = lab.new_sid()
+    before = lab.gmvb_accounts['1000000101']['BALANCE']
+    snap = lab.gmvb_post_transaction(sid, {'ACCOUNT':'1000000101','TRANTYPE':'CR','AMOUNT':'5.00','DESC':'UNIT'})
+    assert 'POSTED' in snap['status']
+    assert lab.gmvb_accounts['1000000101']['BALANCE'] != before
+    status, payload = gmvb_json_api(lab, '/api/v1/gmvb/accounts/1000000101')
+    assert status == 200
+    assert payload['BALANCE'] == lab.gmvb_accounts['1000000101']['BALANCE']
+    out = Db2Simulator(state).format_spufi("SELECT * FROM GMVB.ACCOUNT WHERE ACCOUNT_NUMBER='1000000101'")
+    assert '1000000101' in out and payload['BALANCE'] in out
+
+
+def test_gmvb_customer_sqli_and_buffer_overflow_are_safe_simulations():
+    state = GibsonState.create()
+    lab = get_banking_lab(state)
+    sid = lab.new_sid()
+    snap = lab.gmvb_customer_lookup(sid, "' OR '1'='1")
+    assert 'DFHSQ0001' in snap['status']
+    assert len(snap['rows']) >= 10
+    snap = lab.gmvb_overflow_test(sid, 'A'*40)
+    assert 'ASRA ABEND' in snap['status']
+    assert any('HOST MEMORY NOT MODIFIED' in str(r) for r in snap['rows'])
+
+
+def test_cics_gmvb_transaction_and_cobol_source_visible():
+    state = GibsonState.create()
+    cics = CicsSimulator(state, 'IBMUSER')
+    out = cics._gmvb_execute('GMVB LOGN IBMUSER SYS1')
+    assert 'MENU - MAIN MENU' in out
+    out = cics._gmvb_execute('GMVB CUST 10000001')
+    assert 'CUST' in out
+    lab = get_banking_lab(state)
+    sid = lab.new_sid()
+    lab.menu_select(sid, 'COBL')
+    snap = lab.terminal_submit(sid, command='CUSTUPD')
+    assert 'COBOL CUSTUPD DISPLAYED' in snap['status']
+    assert 'CUSTUPD' in COBOL_SOURCES
+
+
+def test_rest_api_auth_and_lab_routes_do_not_require_new_2323_listener():
+    state = GibsonState.create()
+    lab = get_banking_lab(state)
+    st, health = gmvb_json_api(lab, '/api/v1/gmvb/health')
+    assert st == 200 and health['cics_transaction'] == 'GMVB'
+    st, login = gmvb_json_api(lab, '/api/v1/gmvb/auth/login', 'POST', {'userid':'IBMUSER','password':'SYS1','applid':'GMVB'})
+    assert st in (200, 401)  # depends on local GACF defaults, but route must be safe
+    st, payload = gmvb_json_api(lab, '/api/v1/gmvb/labs/1/activate', 'POST')
+    assert st == 200
+    assert payload['status'].startswith('SCENARIO 1')

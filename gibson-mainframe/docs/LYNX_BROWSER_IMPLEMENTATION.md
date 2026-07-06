@@ -1,0 +1,1 @@
+Gibson Lynx is a Python-native HTTP/HTTPS text browser. It follows redirects, validates schemes, enforces timeout/max response controls, renders HTML to text with numbered links, and does not execute JavaScript. External internet access is enabled by default for browsing.

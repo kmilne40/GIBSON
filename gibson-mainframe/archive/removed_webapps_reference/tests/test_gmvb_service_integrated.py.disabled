@@ -1,0 +1,109 @@
+from gibson.core.state import GibsonState
+from gibson.apps.gmvb_service import get_gmvb_service
+from gibson.apps.db2_sim import Db2Simulator as TsoDb2
+from gibson.apps.db2 import Db2Simulator as IspfDb2
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.gmvb_upgrade import gmvb_json_api
+from gibson.apps.cics import CicsSimulator
+from gibson.services.react8999_api import handle_ui8999
+
+
+def make_state():
+    return GibsonState.create()
+
+
+def test_gmvb_service_customer_create_update_delete():
+    st = make_state(); svc = get_gmvb_service(st)
+    row = svc.create_customer({"forename":"Data", "surname":"Entry", "address":"1 Clerk Lane"}, "CLERK1")
+    cid = row["CUSTOMER_ID"]
+    assert svc.get_customer(cid)["SURNAME"] == "ENTRY"
+    upd = svc.update_customer(cid, {"address":"2 Updated Road", "status":"A"}, "CLERK1")
+    assert upd["ADDRESS_LINE_1"] == "2 Updated Road"
+    deleted = svc.delete_customer(cid, "CLERK1")
+    assert deleted["CUSTOMER_ID"] == cid
+    assert svc.get_customer(cid) is None
+    assert any(a["ACTION"] == "DELETE" for a in svc.audit)
+
+
+def test_gmvb_service_account_crud_credit_debit_transfer_proctran():
+    st = make_state(); svc = get_gmvb_service(st)
+    acct = svc.create_account({"customer_id":"10000002", "balance":"100.00"}, "CLERK1")
+    aid = acct["ACCOUNT_NUMBER"]
+    svc.credit_account(aid, "50.00", "TEST CREDIT", "CLERK1")
+    assert svc.get_account(aid)["ACTUAL_BALANCE"] == "150.00"
+    svc.debit_account(aid, "25.00", "TEST DEBIT", "CLERK1")
+    assert svc.get_account(aid)["ACTUAL_BALANCE"] == "125.00"
+    svc.transfer_funds(aid, "1000000201", "10.00", "TEST XFER", "CLERK1")
+    assert svc.get_account(aid)["ACTUAL_BALANCE"] == "115.00"
+    assert any(t["ACCOUNT_NUMBER"] == aid for t in svc.transactions)
+    svc.delete_account(aid, "CLERK1")
+
+
+def test_gmvb_batch_release_requires_pin_0032_and_writes_audit():
+    st = make_state(); svc = get_gmvb_service(st)
+    bad = svc.release_batch("B2026A17", "SUPR01", "9999", "CLERK1")
+    assert bad["released"] is False
+    ok = svc.release_batch("B2026A17", "SUPR01", "0032", "CLERK1", injected=True)
+    assert ok["released"] is True
+    assert ok["batch"]["STATUS"] == "RELEASED"
+    assert any(a["EVENT_TYPE"] == "BATCH" and a["RESULT"] == "OK" for a in svc.audit)
+    assert any(t["TRANSACTION_TYPE"] == "BAT" for t in svc.transactions)
+
+
+def test_gmvb_swift_create_approve_release_repair():
+    st = make_state(); svc = get_gmvb_service(st)
+    msg = svc.create_swift_message({"amount":"10.00", "beneficiary":"Example Ltd"}, "PAYOPS")
+    mid = msg["MESSAGE_ID"]
+    assert svc.approve_swift_message(mid, "SUPR01")["STATUS"] == "APPROVED"
+    assert svc.release_swift_message(mid, "SUPR01")["STATUS"] == "RELEASED"
+    rep = svc.repair_swift_message("SWF000002", {"beneficiary":"ALTERED TEST"}, "PAYOPS")
+    assert rep["REPAIR_STATUS"] == "REPAIRED"
+    assert any(a["EVENT_TYPE"] == "SWIFT" for a in svc.audit)
+
+
+def test_tso_db2_and_ispf_spufi_share_gmvb_table_registry():
+    st = make_state()
+    for sim in (TsoDb2(st), IspfDb2(st)):
+        assert sim.run_sql("SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID='10000002'")[0]["SURNAME"] == "THATCHER"
+        assert sim.run_sql("SELECT * FROM GMVB.ACCOUNT WHERE ACCOUNT_NUMBER='1000000201'")[0]["ACCOUNT_NUMBER"] == "1000000201"
+        assert sim.run_sql("SELECT * FROM GMVB.BATCH_TRANSFER")[0]["BATCH_ID"].startswith("B")
+        assert sim.run_sql("SELECT * FROM GMVB.SWIFT_MESSAGE")[0]["MESSAGE_ID"].startswith("SWF")
+        tables = sim.run_sql("SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES WHERE CREATOR='GMVB'")
+        names = {r["NAME"] for r in tables}
+        assert {"CUSTOMER", "ACCOUNT", "CONTROL", "PROCTRAN", "BATCH_TRANSFER", "SWIFT_MESSAGE"}.issubset(names)
+
+
+def test_gmvb_json_api_customer_account_batch_swift_routes():
+    st = make_state(); lab = get_banking_lab(st)
+    code, payload = gmvb_json_api(lab, "/api/v1/gmvb/customers/10000002", "GET")
+    assert code == 200 and payload["data"]["SURNAME"] == "THATCHER"
+    code, payload = gmvb_json_api(lab, "/api/v1/gmvb/accounts/1000000201", "GET")
+    assert code == 200 and payload["data"]["ACCOUNT_NUMBER"] == "1000000201"
+    code, payload = gmvb_json_api(lab, "/api/v1/gmvb/batch/B2026A17/release", "POST", data={"pin":"0032", "operator":"SUPR01"})
+    assert code == 200 and payload["data"]["released"] is True
+    code, payload = gmvb_json_api(lab, "/api/v1/gmvb/swift/SWF000001/release", "POST", data={"operator":"SUPR01"})
+    assert code == 200 and payload["data"]["STATUS"] == "RELEASED"
+
+
+def test_react8999_gmvb_api_routes_available():
+    st = make_state()
+    code, payload = handle_ui8999(st, "/api/v1/gmvb/tables", "GET")
+    assert code == 200 and "GMVB.CUSTOMER" in payload["data"]
+    code, payload = handle_ui8999(st, "/api/v1/gmvb/customers/10000002", "GET")
+    assert code == 200 and payload["data"]["FORENAME"] == "MARGARET"
+
+
+def test_cics_gmvb_service_aliases():
+    st = make_state(); cics = CicsSimulator(st, "IBMUSER")
+    assert "FIBS - GIBSON BANKING APPLICATION" in cics.execute("OMEN")
+    assert "THATCHER" in cics.execute("CUST 10000002")
+    assert "1000000201" in cics.execute("ACCT 1000000201")
+    assert "BATCH READY" in cics.execute("BATCH")
+    assert "SWIFT READY" in cics.execute("SWFT")
+
+
+def test_no_cbsa_user_facing_names_in_api_config():
+    st = make_state()
+    code, payload = handle_ui8999(st, "/api/v1/gmvb/health", "GET")
+    assert code == 200
+    assert "CBSA" not in str(payload)

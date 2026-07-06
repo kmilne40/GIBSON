@@ -1,3 +1,7 @@
-gibson-mainframe/
+#gibson-mainframe/
+gibson-mainframe/web-terminal/generated/
+gibson-mainframe/logs/
+gibson-mainframe/.pytest_cache/
+gibson-mainframe/.gibson-pids/
 *.zip
 *.tar.gz

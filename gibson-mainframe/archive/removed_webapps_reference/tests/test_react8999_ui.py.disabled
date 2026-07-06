@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+from gibson.services.react8999 import create_react8999_server
+
+
+def test_ui8999_config_and_capabilities():
+    state = GibsonState.create()
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/config")
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["data"]["port"] == 8999
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/capabilities")
+    assert status == 200
+    assert "GMVB" in payload["data"]["cics_transactions"]
+    assert "GMVB" in payload["data"]["db2_schemas"]
+
+
+def test_ui8999_cics_db2_and_gmvb_routes():
+    state = GibsonState.create()
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/cics/transactions")
+    assert status == 200 and any(r["name"] == "CEMT" for r in payload["data"])
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/cics/command", "POST", {"command": "CEMT I TRAN"})
+    assert status == 200 and "TRAN" in payload["data"]["output"]
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/db2/schema")
+    assert status == 200 and any(t["name"] == "GMVB.CUSTOMER" for t in payload["data"]["tables"])
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/db2/query", "POST", {"sql": "SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES"})
+    assert status == 200 and payload["data"]["rows"]
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/gmvb/customers")
+    assert status == 200 and payload["data"]
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/gmvb/accounts")
+    assert status == 200 and payload["data"]
+
+
+def test_ui8999_hack3270_training_routes_and_progress():
+    state = GibsonState.create()
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/hack3270/reveal-fields", "POST", {"sid": "UT"})
+    assert status == 200 and payload["ok"]
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/hack3270/bruteforce-pin", "POST", {"sid": "UT", "pins": ["0000", "1337"]})
+    assert status == 200 and payload["data"]["found"] == "1337"
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/hack3270/aid-scan", "POST", {"sid": "UT"})
+    assert status == 200 and payload["data"]["rows"]
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/training/labs/cics-logon/complete", "POST", {})
+    assert status == 200 and "cics-logon" in payload["data"]["completed_labs"]
+
+
+def test_react8999_server_can_be_constructed_without_starting_listener():
+    state = GibsonState.create()
+    state.config.host = "127.0.0.1"
+    srv = create_react8999_server(state, host="127.0.0.1", port=0)
+    try:
+        assert srv.server_address[1] > 0
+    finally:
+        srv.server_close()

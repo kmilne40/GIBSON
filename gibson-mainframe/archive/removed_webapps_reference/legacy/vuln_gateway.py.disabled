@@ -1,0 +1,202 @@
+"""
+A deliberately vulnerable web front‑end for the z/OS DB2 REST gateway.
+
+This Flask application serves a simple HTML form where users can enter
+credentials and an arbitrary SQL statement.  On submission, the form
+sends a JSON payload to a backend REST service (the simulated DB2
+gateway) and displays the result.  The goal of this script is to
+illustrate how input injection, weak transport security and missing
+input validation can lead to exploitation of backend APIs.
+
+Configuration can be adjusted via environment variables:
+
+    BACKEND_URL  – the full URL of the REST endpoint to call.  Defaults
+                   to "http://localhost:8082/query".  Note that the
+                   vulnerable gateway should not point at itself; it
+                   should talk to an actual backend service.
+
+    GATEWAY_PORT – the port on which this HTTP server listens.  The
+                   default is 8081.
+
+Despite being intentionally insecure, the HTML form is styled for
+readability and uses a password input for the password field.  Results
+returned from the backend are displayed either as a pretty‑printed
+JSON value or as a table when the result is a list of records.  The
+page also offers a dropdown of sample queries and displays the exact
+HTTP request and response for instructional purposes.
+"""
+
+from flask import Flask, request, render_template_string
+import os
+import json
+import requests
+
+# Create the Flask application
+app = Flask(__name__)
+
+# Read configuration from environment
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8082/query")
+try:
+    GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8081"))
+except ValueError:
+    GATEWAY_PORT = 8081
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    """Render the main page and process submitted SQL queries."""
+    results = None
+    error = None
+    submitted_sql = ""
+    request_json = None
+    response_status = None
+    response_text = None
+
+    if request.method == "POST":
+        # Extract credentials and query from the form
+        user = request.form.get("user", "").strip()
+        password = request.form.get("password", "")
+        submitted_sql = request.form.get("sql", "").strip()
+
+        # Compose payload for the backend.  No client‑side validation is
+        # performed here by design.
+        payload = {"user": user, "password": password, "sql": submitted_sql}
+
+        try:
+            # Record the JSON payload for display
+            request_json = json.dumps(payload, indent=4)
+            resp = requests.post(BACKEND_URL, json=payload, timeout=5)
+            response_status = resp.status_code
+            response_text = resp.text
+            # On success, attempt to parse JSON.  Fall back to plain text
+            # if the response is not JSON or if parsing fails.
+            if resp.status_code == 200:
+                try:
+                    results = resp.json()
+                except Exception:
+                    results = resp.text
+            else:
+                error = f"Backend returned status {resp.status_code}: {resp.text}"
+        except Exception as exc:
+            error = f"Error contacting backend: {exc}"
+
+    # Provide a handful of sample queries to choose from.  These queries are
+    # intentionally simple and map to objects in the DB2 simulator.  The
+    # user can either type their own SQL or pick one from this list.
+    sample_queries = [
+        "SELECT * FROM SYSIBM.SYSTABLES",
+        "SELECT * FROM SYSIBM.SYSUSERS",
+        "SELECT NAME, TYPE FROM SYSIBM.SYSTABLES WHERE NAME = 'EMPLOYEES'",
+    ]
+
+    # HTML template.  We render this on every request so that results and
+    # errors can be displayed inline.  Jinja's autoescape protects
+    # against reflected XSS in this example, though in a real
+    # application you would want to sanitise outputs and avoid
+    # reflecting arbitrary SQL.
+    html_template = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>z/OS DB2 API Gateway</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2rem; }
+        label { display: block; margin-top: 1rem; }
+        textarea { width: 100%; height: 8rem; font-family: monospace; }
+        pre { background: #f9f9f9; padding: 1rem; border: 1px solid #ddd; }
+        table { border-collapse: collapse; margin-top: 1rem; }
+        th, td { border: 1px solid #ccc; padding: 0.4rem; text-align: left; }
+        .error { color: #b00; margin-top: 1rem; }
+    </style>
+    <script>
+    // When the page loads, attach a change handler to the sample query
+    // dropdown so that the textarea is updated when a sample is chosen.
+    document.addEventListener('DOMContentLoaded', function() {
+        var select = document.getElementById('sampleSelect');
+        var area = document.getElementById('sqlarea');
+        if (select) {
+            select.addEventListener('change', function() {
+                if (this.value) {
+                    area.value = this.value;
+                }
+            });
+        }
+    });
+    </script>
+</head>
+<body>
+    <h1>DB2 REST Front‑End</h1>
+    <form method="post">
+        <label>User: <input name="user" value="{{ request.form.get('user','') }}" required></label>
+        <label>Password: <input type="password" name="password" required></label>
+        <label>SQL:</label>
+        <textarea name="sql" id="sqlarea" required>{{ submitted_sql }}</textarea>
+        <label>Sample queries:</label>
+        <select id="sampleSelect">
+            <option value="">-- choose a sample --</option>
+            {% for q in sample_queries %}
+                <option value="{{ q }}">{{ q }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit">Execute</button>
+    </form>
+
+    {% if error %}
+        <div class="error"><strong>Error:</strong> {{ error }}</div>
+    {% endif %}
+
+    {% if results %}
+        <h2>Result</h2>
+        {# When results is a dict or non‑list, print as JSON #}
+        {% if results is mapping %}
+            <pre>{{ results }}</pre>
+        {% elif results is sequence %}
+            <table>
+                <tr>
+                {% for key in results[0].keys() %}
+                    <th>{{ key }}</th>
+                {% endfor %}
+                </tr>
+                {% for row in results %}
+                    <tr>
+                    {% for val in row.values() %}
+                        <td>{{ val }}</td>
+                    {% endfor %}
+                    </tr>
+                {% endfor %}
+            </table>
+        {% else %}
+            <pre>{{ results }}</pre>
+        {% endif %}
+    {% endif %}
+
+    {% if request_json %}
+        <h2>HTTP Request</h2>
+        <pre>{{ request_json }}</pre>
+    {% endif %}
+    {% if response_status is not none %}
+        <h2>HTTP Response</h2>
+        <p>Status code: {{ response_status }}</p>
+        <pre>{{ response_text }}</pre>
+    {% endif %}
+</body>
+</html>
+"""
+    return render_template_string(
+        html_template,
+        results=results,
+        error=error,
+        submitted_sql=submitted_sql,
+        request_json=request_json,
+        response_status=response_status,
+        response_text=response_text,
+        sample_queries=sample_queries
+    )
+
+
+if __name__ == "__main__":
+    # The gateway intentionally binds to all interfaces so that trainees
+    # can access it from other machines or containers.  In a real
+    # deployment you would likely restrict this and add TLS.
+    app.run(host="0.0.0.0", port=GATEWAY_PORT)

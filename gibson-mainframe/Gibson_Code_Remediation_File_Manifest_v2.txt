@@ -1,0 +1,44 @@
+Gibson Code Remediation File Manifest v2
+========================================
+
+Output package:
+  gibson-mainframe-fixed-v2.zip
+
+Package type:
+  Full patched Gibson source tree.
+
+Changed source files:
+  gibson/apps/editor.py
+  gibson/screens/vtam_model.py
+  gibson/render/block_letters.py
+  gibson/screens/vtam.txt
+  gibson/assets/vtam.txt
+  gibson/core/dvcapin.py
+  gibson/apps/pin_bruteforce.py
+  gibson/apps/dvca/programs.py
+  gibson/apps/zsecure_engine.py
+
+Changed or added tests:
+  tests/test_remediation_v2.py
+  tests/test_canonical_vtam_renderer.py
+  tests/test_vtam_front_screen.py
+  tests/test_r05_osint_cti_board_v1.py
+
+Report files included in package:
+  Gibson_Code_Remediation_Report_v2.md
+  Gibson_Code_Remediation_Test_Results_v2.txt
+  Gibson_Code_Remediation_File_Manifest_v2.txt
+
+Generated assets:
+  gibson/screens/vtam.txt
+  gibson/assets/vtam.txt
+
+Key verification:
+  Core targeted regression set: 29 passed.
+  New remediation regression set: 8 passed.
+  Full pytest: not completed due sandbox time limits.
+
+Known remaining unrelated issues:
+  No-negotiation TN3270 listener first-screen test still fails.
+  Broad zSecure output routing/string legacy expectation tests still fail outside requested SMF7 scope.
+  One OMVS/nmap exact compatibility-string test still fails outside requested scope.

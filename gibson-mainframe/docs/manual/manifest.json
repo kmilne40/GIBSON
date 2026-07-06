@@ -1,0 +1,107 @@
+[
+  {
+    "title": "Front Matter",
+    "slug": "front-matter",
+    "snippet": " Front Matter This manual documents the Gibson Mainframe Simulator package gibson-mainframe-final1805.zip. It is a practical training manual for mainframe security, penetration testing, blue-team monitoring, and instructor-led labs. The manual is source-backed: the package code, command handlers, runtime state objects, route definitions, seeded users, datasets, ports, and Phase 1 inventories are treated as authoritat"
+  },
+  {
+    "title": "Quick Start Guide",
+    "slug": "quick-start-guide",
+    "snippet": " Quick Start Guide In this section we\u2019ll get Gibson installed, started, and reachable from the tools you are likely to use during a mainframe security lab. The goal is not to teach every subsystem yet. The goal is to get you to a working console, prove the ports are listening, and understand what each window is showing you before you move into the deeper labs. IMPORTANT: source-backed quick start This section was bui"
+  },
+  {
+    "title": "Chapter 1. Mainframe and",
+    "slug": "chapter-1-mainframe-and",
+    "snippet": " Chapter 1. Mainframe and Gibson Foundations This section gives the conceptual foundation required to use Gibson without mistaking it for a production mainframe. It explains z/OS-like concepts, training boundaries, safe use, and the simulator model. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Oper"
+  },
+  {
+    "title": "Chapter 2. Installation, Startup,",
+    "slug": "chapter-2-installation-startup",
+    "snippet": " Chapter 2. Installation, Startup, IPL, and Operations This section explains package operation from a code-derived perspective: entry points, configuration, startup flags, default ports, optional services, state creation and reset behaviour. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Operational "
+  },
+  {
+    "title": "Chapter 3. Application",
+    "slug": "chapter-3-application",
+    "snippet": " Chapter 3. Application Architecture Deep Dive This section maps Gibson internals: CLI, configuration, runtime state, command dispatch, RACF stores, dataset access, REST services, dashboard and security features. Implementation evidence Area Source evidence CLI / startup gibson/cli.py Configuration gibson/core/config.py <!-- page 50 -- Gibson Mainframe Simulator Technical Manual - final1805 Source-backed manual gener"
+  },
+  {
+    "title": "Chapter 4. Access, Logon, MFA,",
+    "slug": "chapter-4-access-logon-mfa",
+    "snippet": " Chapter 4. Access, Logon, MFA, and VTAM This section documents access paths, logon flow, PIN + HHMM MFA behaviour, optional services and authentication-related alerts. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv <!-- page 53 -- Gibson Mainframe Simulator Technical Manual - final1805 Source-backed"
+  },
+  {
+    "title": "Chapter 5. TSO READY",
+    "slug": "chapter-5-tso-ready",
+    "snippet": " Chapter 5. TSO READY Reference This section covers READY prompt behaviour and all TSO-facing commands, including command syntax, expected outputs and security relevance. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Operational model The READY prompt is the command processor context for many RACF, "
+  },
+  {
+    "title": "Chapter 6. RACF Administration",
+    "slug": "chapter-6-racf-administration",
+    "snippet": " Chapter 6. RACF Administration and Security Model This section covers users, groups, dynamic profiles, dataset profiles, resource profiles, SETROPTS- like settings, password policy, UADS, MFA segments and auditing attributes. Implementation evidence Area Source evidence RACF repository gibson/core/racf.py Dynamic RACF gibson/core/racf_dynamic.py TSO integration gibson/apps/tso.py Operational model This chapter works"
+  },
+  {
+    "title": "Expanded RACF Security Labs",
+    "slug": "expanded-racf-security-labs",
+    "snippet": " Expanded RACF Security Labs This RACF lab sequence comes before ACF2 because RACF is the clearest place to learn users, groups, resource classes, profiles, UACC, access lists and policy posture. The later ACF2 labs deliberately compare a different security-manager model against this RACF baseline. Lab RACF-1: Inspect your RACF identity with LISTUSER Command context Run from TSO READY or ISPF option 6. Do not run LIS"
+  },
+  {
+    "title": "ACF2 Security Model and Gibson",
+    "slug": "acf2-security-model-and-gibson",
+    "snippet": " ACF2 Security Model and Gibson ACF2 Commands Why ACF2 matters in Gibson ACF2 is one of the major external security managers used on mainframes. Gibson implements ACF2 command equivalents so students can compare RACF-style profiles with ACF2-style logonids, UID strings, data set rules and resource rules. From a tester's point of view, this matters because two sites can protect similar resources through very different"
+  },
+  {
+    "title": "Chapter 7. ISPF and Editor",
+    "slug": "chapter-7-ispf-and-editor",
+    "snippet": " Chapter 7. ISPF and Editor Workflows This section covers ISPF launcher behaviour, dataset listing/editing, member concepts and guided editor-style workflows. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Operational model ISPF is not a general shell; it is a panel and editor environment with its ow"
+  },
+  {
+    "title": "Code Interpreters",
+    "slug": "code-interpreters",
+    "snippet": " Code Interpreters Why code matters on the mainframe In this section we\u2019ll move from using Gibson to interrogate a system into using Gibson to write, submit and interpret code. That matters because real mainframes are not only login screens and command prompts. They are programmable operating environments where JCL starts work, REXX automates TSO and dataset activity, COBOL carries business logic, and assembler sits "
+  },
+  {
+    "title": "Chapter 8. SDSF, JES, JCL, and",
+    "slug": "chapter-8-sdsf-jes-jcl-and",
+    "snippet": " Chapter 8. SDSF, JES, JCL, and NJE This section covers job panels, JES queues, JES2 commands, NJE node/line controls and JCL-related training flows. Implementation evidence Area Source evidence SDSF gibson/apps/sdsf.py JES gibson/core/jes.py NJE gibson/core/nje.py Operational model This chapter connects submitted work to JES queues and SDSF-style output. The operational path is job text to job ID to spool files to r"
+  },
+  {
+    "title": "Chapter 9. Master Console and",
+    "slug": "chapter-9-master-console-and",
+    "snippet": " Chapter 9. Master Console and OPERLOG This section covers WTOR replies, IPL replies, service control, security displays, console metrics and alert/OPERLOG workflows. Implementation evidence Area Source evidence Master Console gibson/apps/master_console.py Console events gibson/apps/master_console_events.py Operational model The Master Console chapter is about operator evidence: WTORs, display commands, service state"
+  },
+  {
+    "title": "Chapter 10. CICS and Banking",
+    "slug": "chapter-10-cics-and-banking",
+    "snippet": " Chapter 10. CICS and Banking Lab This section covers CICS transaction handling, CEMT/CEDA/CECI utility transactions, CICSPWN/PWNPROBE and GMVB/MCGM banking lab screens. <!-- page 126 -- Gibson Mainframe Simulator Technical Manual - final1805 Source-backed manual generated from code inventories - Phase 2 Implementation evidence Area Source evidence CICS app gibson/apps/cics.py Region model gibson/core/cics_region.py "
+  },
+  {
+    "title": "Chapter 11. Db2 and SQL",
+    "slug": "chapter-11-db2-and-sql",
+    "snippet": " Chapter 11. Db2 and SQL Simulation This section covers DSN, SPUFI, RUN SQL, Db2 status commands, job submission from Db2 shell and SQL training commands. Implementation evidence Area Source evidence Db2 app gibson/apps/db2.py Db2 simulator gibson/apps/db2_sim.py Db2 service gibson/services/db2_server.py Operational model This Db2 chapter treats SQL and catalog visibility as a data-access workflow. Queries, REST path"
+  },
+  {
+    "title": "Chapter 12. OMVS/USS and",
+    "slug": "chapter-12-omvs-uss-and",
+    "snippet": " Chapter 12. OMVS/USS and Transfer Bridges This section covers the USS shell command set, MVS/USS transfer commands, OGET, OPUT, OCOPY and IND$FILE. Implementation evidence Area Source evidence OMVS shell gibson/apps/omvs.py USS service gibson/services/uss_server.py Operational model This USS chapter follows data as it moves between UNIX paths, MVS datasets and TSO command bridges. The operational model is context-se"
+  },
+  {
+    "title": "Chapter 13. FTP, TCP/IP and",
+    "slug": "chapter-13-ftp-tcp-ip-and",
+    "snippet": " Chapter 13. FTP, TCP/IP and Network Enumeration This section covers NETSTAT, PING, TRACERTE, FTP client behaviour and service discovery boundaries. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv <!-- page 147 -- Gibson Mainframe Simulator Technical Manual - final1805 Source-backed manual generated f"
+  },
+  {
+    "title": "Chapter 14. REST API,",
+    "slug": "chapter-14-rest-api",
+    "snippet": " Chapter 14. REST API, Dashboard, and Web Interfaces This section covers REST gateway routes, banking routes, dashboard state endpoints and optional browser/web terminal considerations. Implementation evidence Area Source evidence REST gateway gibson/services/rest_gateway.py Dashboard gibson/services/dashboard.py Operational model This API chapter maps browser and curl activity to routes, state and training workflows"
+  },
+  {
+    "title": "Chapter 15. Security Training",
+    "slug": "chapter-15-security-training",
+    "snippet": " Chapter 15. Security Training Playbooks This section combines attacker and defender workflows into coherent learning paths: enumeration, privilege analysis, dataset exposure, CICS/Db2/FTP abuse, alert review and reporting. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Operational model This playboo"
+  },
+  {
+    "title": "Chapter 16. Instructor Guide",
+    "slug": "chapter-16-instructor-guide",
+    "snippet": " Chapter 16. Instructor Guide and Assessment This section provides course flow, timing, reset points, demo sequencing, capstone tasks and answer-key guidance. Implementation evidence Area Source evidence Primary evidence Phase 1 code inventory Command evidence command_matrix.csv Runtime evidence safe_command_validation.csv Operational model This instructor chapter turns Gibson features into teachable sequences. The o"
+  }
+]

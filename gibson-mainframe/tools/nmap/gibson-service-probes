@@ -1,0 +1,16 @@
+# Optional Gibson-specific Nmap service-probes supplement.
+# Use only when stock Nmap does not classify a simulator service as desired:
+#   nmap -sV --versiondb tools/nmap/gibson-service-probes -p 2023,2111,8082,8443 127.0.0.1
+
+Probe TCP GetRequest q|GET / HTTP/1.0\r\n\r\n|
+ports 8082,8443
+match http m|^HTTP/1\.[01] \d+ .*\r\nServer: IBM_HTTP_Server| p/Gibson zOS Simulator HTTP service/ i/IBM_HTTP_Server-compatible lab header/
+
+Probe TCP FTPHelp q|HELP\r\n|
+ports 2111,21
+match ftp m|^220-FTPD1 IBM FTP CS V\dR\d| p/IBM zOS FTP/ i/Gibson simulator/
+match ftp m|^214-The following commands are recognized:| p/IBM zOS FTP/ i/Gibson simulator help response/
+
+Probe TCP Telnet3270 q||
+ports 2023,3270,23
+match tn3270 m|^\xff[\xfb\xfd]\x00.*\xff\xfd\x28|s p/IBM Telnet TN3270E-compatible service/ i/Gibson simulator/

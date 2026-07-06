@@ -1,0 +1,1895 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Iterable, Optional
+from collections import deque
+import os
+import re
+from gibson.core.state import GibsonState
+from gibson.core.passticket import get_passticket_service
+from gibson.render import colors
+from gibson.render.input import SocketInputDriver
+from gibson.render.screen3270 import ScreenBuffer
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.gmvb_service import get_gmvb_service
+from gibson.core.cics_region import get_cics_region, parse_define
+@dataclass
+class CicsResource:
+    name: str
+    status: str = "ENABLED"
+    attrs: Dict[str, str] | None = None
+    # Compatibility attributes used by the shared CICS region model.
+    # Older CicsSimulator seed records are deliberately still accepted so
+    # CEDA INSTALL/CEMT INQUIRE cannot crash when a legacy record is present.
+    group: str = "GIBSON"
+    rtype: str = "RESOURCE"
+    installed: bool = True
+    open_state: str = "OPEN"
+    def attr(self, key: str, default: str = "") -> str:
+        return (self.attrs or {}).get(key, default)
+class CicsSimulator:
+    """CICS/GICS terminal simulator.
+    The original Gibson CICS module was a separate socket routine.  This class
+    keeps that transaction style and the uploaded screen assets, but routes it
+    through the shared Gibson state and input driver so ``L CICS`` at the VTAM
+    logon screen behaves like the old flow again.
+    """
+    def __init__(self, state: GibsonState, userid: str = "DEFAULT"):
+        self.state = state
+        self.userid = (userid or "DEFAULT").upper()
+        self.signed_on = not state.config.realistic_cics_auth
+        self.start_time = datetime.now()
+        self.log_path = state.config.sim_root / "cics-simulator.log"
+        self.programs: Dict[str, CicsResource] = {
+            "DFHWBADX": CicsResource("DFHWBADX", "ENABLED", {"LENGTH": "000184", "USECOUNT": "000000", "RESCOUNT": "000000"}),
+            "DFH0XCMN": CicsResource("DFH0XCMN", "ENABLED", {"LENGTH": "004096", "USECOUNT": "000003", "RESCOUNT": "000001"}),
+            "MYPROG": CicsResource("MYPROG", "ENABLED", {"LENGTH": "000123", "USECOUNT": "000001", "RESCOUNT": "000000"}),
+            "DEMO001": CicsResource("DEMO001", "DISABLED", {"LENGTH": "000456", "USECOUNT": "000000", "RESCOUNT": "000000"}),
+        }
+        self.files: Dict[str, CicsResource] = {
+            "FILEA": CicsResource("FILEA", "OPEN ENABLED", {"DSN": "DATA.FILEA", "TYPE": "KSDS", "READ": "YES", "UPDATE": "YES"}),
+            "FILEB": CicsResource("FILEB", "CLOSED ENABLED", {"DSN": "DATA.FILEB", "TYPE": "ESDS", "READ": "YES", "UPDATE": "NO"}),
+            "GACFDB": CicsResource("GACFDB", "OPEN ENABLED", {"DSN": "SYS1.RACFDS", "TYPE": "KSDS", "READ": "YES", "UPDATE": "NO"}),
+        }
+        self.transactions: Dict[str, CicsResource] = {
+            "CESN": CicsResource("CESN", "ENABLED", {"PROGRAM": "DFHSNP", "TASKDATALOC": "ANY"}),
+            "CESF": CicsResource("CESF", "ENABLED", {"PROGRAM": "DFHSFP", "TASKDATALOC": "ANY"}),
+            "CEMT": CicsResource("CEMT", "ENABLED", {"PROGRAM": "DFHEMTP", "TASKDATALOC": "ANY"}),
+            "CEDA": CicsResource("CEDA", "ENABLED", {"PROGRAM": "DFHEDAP", "TASKDATALOC": "ANY"}),
+            "CECI": CicsResource("CECI", "ENABLED", {"PROGRAM": "DFHECIP", "TASKDATALOC": "ANY"}),
+            "CEBR": CicsResource("CEBR", "ENABLED", {"PROGRAM": "DFHBRP", "TASKDATALOC": "BELOW"}),
+            "CEDF": CicsResource("CEDF", "ENABLED", {"PROGRAM": "DFHEDF", "TASKDATALOC": "ANY"}),
+            "GMVB": CicsResource("GMVB", "ENABLED", {"PROGRAM": "GMVB0001", "TASKDATALOC": "ANY"}),
+        }
+        self.terminal_resources: Dict[str, CicsResource] = {
+            "LU320": CicsResource("LU320", "INSERVICE ACQUIRED", {"NETNAME": "LU320", "USERID": self.userid}),
+            "T0001": CicsResource("T0001", "INSERVICE RELEASED", {"NETNAME": "TCP0001", "USERID": ""}),
+        }
+        self.connections: Dict[str, CicsResource] = {
+            "DB2A": CicsResource("DB2A", "INSERVICE", {"NETNAME": "DB2A", "ACCESSMETHOD": "IRC"}),
+            "TCPIP": CicsResource("TCPIP", "INSERVICE", {"NETNAME": "TCPIP", "ACCESSMETHOD": "TCPIP"}),
+        }
+        # Shared CICS region model.  This is additive: existing CicsSimulator
+        # attributes remain available, but resource state now persists across
+        # simulator instances using the shared Gibson state object.
+        self.region = get_cics_region(state)
+        self.programs = self.region.programs
+        self.files = self.region.files
+        self.transactions = self.region.transactions
+        self.terminal_resources = self.region.terminals
+        self.bank_demo_admin = os.getenv("GIBSON_CICS_BANK_DEMO_ADMIN", "0") in ("1", "true", "TRUE")
+        self.lab = get_banking_lab(state)
+        self.lab_sid = f"CICS-{self.userid}"
+        self.lab.ensure_session(self.lab_sid)
+        self.bank_authenticated = False
+        self.bank_userid = ""
+        self.bank_current = "LOGN"
+        self.bank_prev = "LOGN"
+        self.bank_status = "ENTER USERID AND PASSWORD"
+        self.bank_last_item = ""
+        for _tx, _pgm in {
+            "OMEN":"GMVBMENU", "CUSA":"CUSTADD", "CUSU":"CUSTUPD", "CUSD":"CUSTDEL",
+            "ACCA":"ACCTADD", "ACCU":"ACCTUPD", "ACCD":"ACCTDEL", "XFER":"TRANXFER",
+            "DBCR":"TRANDBCR", "BATCH":"BATCHREL", "SWFT":"SWFTMSG", "APIM":"APIMENU",
+            "HACK3270":"HACK327", "COBL":"COBLSRC"
+        }.items():
+            self.transactions.setdefault(_tx, CicsResource(_tx, "ENABLED", {"PROGRAM": _pgm, "TASKDATALOC": "ANY"}))
+
+        self.bank_items: Dict[str, dict[str, str]] = {
+            "00001": {"item_number": "00001", "item_name": "STEEL FASTENER CRATE", "price": "129.99", "shipping_cost": "18.00", "purchasable": "Y", "order_supply": "Y", "comments": "STANDARD INDUSTRIAL STOCK"},
+            "00002": {"item_number": "00002", "item_name": "LAB SENSOR ARRAY", "price": "899.00", "shipping_cost": "42.50", "purchasable": "Y", "order_supply": "N", "comments": "EXPORT REVIEW REQUIRED"},
+            "04242": {"item_number": "04242", "item_name": "ARCHIVE TRANSIT CASE", "price": "59.95", "shipping_cost": "12.00", "purchasable": "N", "order_supply": "Y", "comments": "INTERNAL USE ONLY"},
+        }
+        self.bank_orders: list[dict[str, str]] = [
+            {"index": "00001", "date": "04/18/26", "name": "STEEL FASTENER CRATE", "price": "129.99", "shipping": "18.00", "item_number": "00001"},
+            {"index": "00002", "date": "04/19/26", "name": "LAB SENSOR ARRAY", "price": "899.00", "shipping": "42.50", "item_number": "00002"},
+        ]
+        self.bank_form_values: dict[str, str] = {}
+        self.bank_focus: int = 0
+    # ------------------------------------------------------------------
+    # Asset / panel helpers
+    # ------------------------------------------------------------------
+    def _asset(self, name: str, fallback: str = "") -> str:
+        text = self.state.templates.render(name, self.userid, "SPECIAL" if self._is_special() else "NONE")
+        return text if text is not None else fallback
+    def _panel(self, title: str, body: Iterable[str], status: str = "") -> str:
+        lines = [colors.CLEAR]
+        if status:
+            lines.append(f"{status[:79]:<79}\n")
+        else:
+            lines.append(f"{'':79}\n")
+        lines.append(f"{title[:79]:<79}\n")
+        lines.append(" " * 79 + "\n")
+        for line in body:
+            lines.append(f"{line[:79]:<79}\n")
+        while len(lines) < 22:
+            lines.append(" " * 79 + "\n")
+        lines.append("PF 1 HELP       3 END       5 VAR       6 CRSR       9 MSG       12 CNCL\n")
+        return "".join(lines)
+    def _is_special(self) -> bool:
+        user = self.state.racf.get(self.userid)
+        return bool(user and user.special)
+    def _log(self, message: str) -> None:
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().isoformat()} {self.userid} {message}\n")
+        except Exception:
+            pass
+    # ------------------------------------------------------------------
+    # Non-interactive compatibility API used by TSO and tests
+    # ------------------------------------------------------------------
+    def execute(self, command: str) -> str:
+        cmd = (command or "").strip()
+        uc = cmd.upper()
+        self._log(uc)
+        if not uc:
+            return ""
+        if uc in ("HELP", "?"):
+            return self.help_screen()
+        if uc in ("CICS DISPLAY SECURITY", "CICS DISPLAY SIT", "D CICS,SECURITY", "D CICS,SIT"):
+            return "\n".join(self.region.security_status_lines())
+        if uc.startswith("CICS SET SIT"):
+            return self._cics_set_sit(cmd)
+        if uc == "CICS SECURITY REFRESH":
+            self._audit_stage("CICS SECURITY REFRESH", "SECURITY CACHE REFRESHED", transid="CEMT", cls="OPERCMDS")
+            return "DFHXS1201 CICS SECURITY REFRESH COMPLETE"
+        if uc.startswith("CESN"):
+            m_pt = re.search(r"USER\(([^)]+)\).*PTKT\(([^)]+)\)(?:.*APPL\(([^)]+)\))?", cmd, re.I)
+            if m_pt:
+                user = m_pt.group(1).strip().upper()
+                ticket = m_pt.group(2).strip().upper()
+                appl = (m_pt.group(3) or "CICS").strip().upper()
+                result = get_passticket_service(self.state).validate(user, appl, ticket, consumer="CICS-CESN")
+                if result.get("ok"):
+                    self.userid = user
+                    self.signed_on = True
+                    self.region.signon(user)
+                    return f"DFHCE3548 USERID {user} SIGNED ON SUCCESSFULLY WITH PASSTICKET FOR {appl}."
+                self.state.record_security_event(user, "SIGNON", str(result.get('message', 'PASSTICKET REJECTED')), result="FAILURE", service="CICS")
+                return f"DFHCE3520 SIGN-ON FAILED: {result.get('message', 'PASSTICKET REJECTED')}"
+            self.signed_on = True
+            self.region.signon(self.userid)
+            return f"DFHCE3548 USERID {self.userid} SIGNED ON SUCCESSFULLY."
+        if self.state.config.realistic_cics_auth and not self.signed_on:
+            return "DFHCE3549 SIGN-ON REQUIRED. ENTER CESN."
+        if uc in ("CESF", "CESF LOGOFF", "LOGOFF", "SIGNOFF", "EXIT"):
+            self.signed_on = False
+            self.region.signoff(self.userid)
+            return self._asset("CESF.txt", "DFHCE3590 Sign-off is complete.")
+        if uc == "CEMT":
+            ok, msg = self._tx_allowed("CEMT", corrid=self._cics_corrid("CEM"))
+            return self._asset("CEMT.txt", self.cemt_menu()) if ok else msg
+        if uc == "CEDA":
+            ok, msg = self._tx_allowed("CEDA", corrid=self._cics_corrid("CED"))
+            return self._asset("CEDA.txt", self.ceda_menu()) if ok else msg
+        if uc == "CECI":
+            ok, msg = self._tx_allowed("CECI", corrid=self._cics_corrid("CEC"))
+            return self._asset("CECI.txt", self.ceci_menu()) if ok else msg
+        if uc.startswith("CEMT"):
+            ok, msg = self._tx_allowed("CEMT", corrid=self._cics_corrid("CEM"))
+            return self._cemt(cmd) if ok else msg
+        if uc.startswith("CEDA"):
+            ok, msg = self._tx_allowed("CEDA", corrid=self._cics_corrid("CED"))
+            return self._ceda(cmd) if ok else msg
+        if uc.startswith("CECI"):
+            ok, msg = self._tx_allowed("CECI", corrid=self._cics_corrid("CEC"))
+            return self._ceci(cmd) if ok else msg
+        if uc.startswith("CEBR"):
+            return self.cebr()
+        if uc.startswith("CEDF"):
+            return "DFHEDP DEBUG FACILITY ENABLED FOR THIS TERMINAL."
+        if uc.startswith("CESL") or uc.startswith("CMSG"):
+            return self.cesl()
+        if uc.startswith("CICSPWN") or uc.startswith("PWNPROBE"):
+            return self.cicspwn_report()
+        if uc in {"GMVB", "MCGM"} or uc.startswith("GMVB ") or uc.startswith("MCGM "):
+            return self._gmvb_execute(cmd)
+        if uc == "CBSA" or uc == "OMEN" or uc.startswith("OMEN "):
+            return self._gmvb_service_execute("GMVB")
+        if uc.split()[0] in {"CUST","ACCT","CUSA","CUSU","CUSD","ACCA","ACCU","ACCD","XFER","DBCR","BATCH","SWFT","APIM"}:
+            return self._gmvb_service_execute(cmd)
+        if uc in self.transactions:
+            return f"DFHAC2206 {uc} TRANSACTION STARTED.  NORMAL COMPLETION."
+        return "DFHCE3551 COMMAND NOT RECOGNIZED."
+    # ------------------------------------------------------------------
+    # Main terminal session for L CICS
+    # ------------------------------------------------------------------
+    def run_terminal(self, input_driver: SocketInputDriver, send: Callable[[str], None]) -> None:
+        banner = self._asset("cics-screen.txt", self._asset("cics-screen.ttx.txt", "WELCOME TO GICS\n"))
+        send(colors.CLEAR + colors.BLUE + banner + colors.RESET + "\n")
+        # This reproduces the old behaviour: banner first, ENTER to arrive at CICS command line.
+        res = input_driver.read_line()
+        if res.key == "EOF":
+            return
+        while True:
+            res = input_driver.read_line("===> ")
+            key = res.key or ""
+            cmd = res.text.strip()
+            uc = (key or cmd).upper()
+            if uc in ("F3", "PF3", "EXIT", "LOGOFF", "SIGNOFF", "CESF"):
+                send(colors.CLEAR + colors.BLUE + self.execute("CESF") + colors.RESET + "\n")
+                return
+            if uc in ("F1", "PF1", "HELP", "?"):
+                send(colors.CLEAR + colors.BLUE + self.help_screen() + colors.RESET + "\n")
+                continue
+            if cmd.strip().upper() in {"GMVB", "MCGM"}:
+                self.run_mcgm_terminal(input_driver, send)
+                send(colors.CLEAR + colors.BLUE + self._panel("CICS COMMAND LEVEL", ["ENTER NEXT TRANSACTION ID OR COMMAND", "  EXAMPLE: CEMT I FILE", "  TYPE GMVB TO RE-ENTER SIGHBERBANK LAB"], "READY") + colors.RESET + "\n")
+                continue
+            try:
+                self.state.audit.record(self.userid, cmd, "ENTER", "CICS")
+            except Exception:
+                pass
+            output = self.execute(cmd)
+            send(colors.CLEAR + colors.BLUE + output + colors.RESET + "\n")
+    # ------------------------------------------------------------------
+    # CICS supplied transaction style panels/actions
+    # ------------------------------------------------------------------
+    def _cics_corrid(self, prefix: str = "CIC") -> str:
+        return self.region.corrid(prefix) if hasattr(self, "region") else f"{prefix}-LOCAL"
+
+    def _tx_allowed(self, transid: str, *, access: str = "READ", corrid: str = "") -> tuple[bool, str]:
+        if not hasattr(self, "region"):
+            return True, ""
+        return self.region.check_transaction(self.userid, transid, access=access, corrid=corrid)
+
+    def _file_allowed(self, file_name: str, *, access: str = "READ", transid: str = "", corrid: str = "") -> tuple[bool, str]:
+        if not hasattr(self, "region"):
+            return True, ""
+        return self.region.check_file(self.userid, file_name, access=access, transid=transid, corrid=corrid)
+
+    def _audit_stage(self, event: str, detail: str, *, result: str = "SUCCESS", transid: str = "", resource: str = "", cls: str = "CICS", corrid: str = "") -> None:
+        if hasattr(self, "region"):
+            self.region.record_security(self.userid, event, detail, result=result, transid=transid, resource=resource, cls=cls, profile=resource or transid or self.region.applid, corrid=corrid)
+
+    def _gmvb_service_execute(self, command: str) -> str:
+        svc = get_gmvb_service(self.state)
+        parts = (command or "").strip().split()
+        op = (parts[0].upper() if parts else "GMVB")
+        try:
+            if op in {"GMVB", "OMEN", "CBSA"}:
+                return self._panel("GMVB - GIBSON MUTUAL VIRTUAL BANK", [
+                    "1  DISPLAY CUSTOMER INFORMATION          CUST",
+                    "2  DISPLAY ACCOUNT INFORMATION           ACCT",
+                    "A  DISPLAY ALL ACCOUNTS FOR CUSTOMER     CUSTA",
+                    "3  CREATE NEW CUSTOMER                   CUSA",
+                    "4  CREATE NEW ACCOUNT                    ACCA",
+                    "5  UPDATE ACCOUNT INFORMATION            ACCU",
+                    "6  CREDIT / DEBIT ACCOUNT                DBCR",
+                    "7  TRANSFER FUNDS BETWEEN ACCOUNTS       XFER",
+                    "B  BATCH PROCESSING                      BATCH",
+                    "S  SWIFT MESSAGE PROCESSING              SWFT",
+                    "H  HACK3270 FIELD INSPECTOR              HACK3270",
+                    "C  COBOL / BMS SOURCE                    COBL",
+                    "X  SIGN OFF                              CESF",
+                ], "GMVB READY")
+            if op == "CUST":
+                cid = parts[1] if len(parts) > 1 else "10000002"
+                row = svc.get_customer(cid)
+                if not row: return f"DFHCU0044 CUSTOMER {cid} NOT FOUND"
+                return self._panel("GMVB CUSTOMER INFORMATION", [f"CUSTOMER ID . . {row['CUSTOMER_ID']}", f"NAME . . . . . . {row['FULL_NAME']}", f"ADDRESS . . . . {row['ADDRESS_LINE_1']}", f"TOWN . . . . . . {row['TOWN']}", f"STATUS . . . . . {row['STATUS']} KYC {row['KYC_STATUS']}"], "INQUIRY COMPLETE")
+            if op == "ACCT":
+                acct = parts[1] if len(parts) > 1 else "1000000201"
+                row = svc.get_account(acct)
+                if not row: return f"DFHAC0044 ACCOUNT {acct} NOT FOUND"
+                return self._panel("GMVB ACCOUNT INFORMATION", [f"ACCOUNT . . . . {row['ACCOUNT_NUMBER']}", f"CUSTOMER . . . . {row['CUSTOMER_ID']}", f"TYPE . . . . . . {row['ACCOUNT_TYPE']}", f"BALANCE . . . . {row['ACTUAL_BALANCE']}", f"AVAILABLE . . . {row['AVAILABLE_BALANCE']}", f"STATUS . . . . . {row['STATUS']}"], "INQUIRY COMPLETE")
+            if op == "CUSA":
+                row = svc.create_customer({"FORENAME":"CICS","SURNAME":"TRAINING"}, self.userid)
+                return f"DFHCU0001 CUSTOMER {row['CUSTOMER_ID']} CREATED"
+            if op == "ACCA":
+                row = svc.create_account({"CUSTOMER_ID": parts[1] if len(parts)>1 else "10000002", "balance":"0.00"}, self.userid)
+                return f"DFHAC0001 ACCOUNT {row['ACCOUNT_NUMBER']} CREATED"
+            if op == "DBCR":
+                acct = parts[1] if len(parts)>1 else "1000000201"; amount = parts[2] if len(parts)>2 else "10.00"
+                res = svc.credit_account(acct, amount, "CICS CREDIT", self.userid)
+                return f"DFHTR0001 CREDIT POSTED ACCOUNT {acct} BALANCE {res['account']['ACTUAL_BALANCE']}"
+            if op == "XFER":
+                fr = parts[1] if len(parts)>1 else "1000000101"; to = parts[2] if len(parts)>2 else "1000000201"; amt = parts[3] if len(parts)>3 else "10.00"
+                svc.transfer_funds(fr, to, amt, "CICS XFER", self.userid)
+                return f"DFHTR0002 TRANSFER POSTED FROM {fr} TO {to} AMOUNT {amt}"
+            if op == "BATCH":
+                return self._panel("GMVB BATCH PROCESSING", ["B2026A17 HELD-PIN-REQ GBP 245000.00", "RELEASE REQUIRES SUPERVISOR PIN 0032", "HACK3270 TRAINING CAN INJECT PIN 0032"], "BATCH READY")
+            if op == "SWFT":
+                return self._panel("GMVB SWIFT MESSAGE PROCESSING", [f"{r['MESSAGE_ID']} {r['MESSAGE_TYPE']} {r['CURRENCY']} {r['AMOUNT']} {r['STATUS']}" for r in svc.list_swift_messages()[:12]], "SWIFT READY")
+            if op == "APIM":
+                return self._panel("GMVB API TESTER", ["/api/v1/gmvb/customers/<id>", "/api/v1/gmvb/accounts/<id>", "/api/v1/gmvb/transactions/transfer", "/api/v1/gmvb/batch/<id>/release", "/api/v1/gmvb/swift/<id>/release"], "API READY")
+        except Exception as exc:
+            return f"DFHGM0008 GMVB SERVICE ERROR: {type(exc).__name__}: {exc}"
+        return f"DFHGM0004 GMVB COMMAND {op} ACCEPTED"
+
+    def help_screen(self) -> str:
+        return self._panel(
+            "DFHCE3590 HELP - AVAILABLE GIBSON/CICS TRANSACTIONS",
+            [
+                "  CESN  - SIGNON TO CICS",
+                "  CESF  - SIGNOFF",
+                "  CEMT  - MASTER TERMINAL INQUIRE/SET/PERFORM/DISCARD",
+                "  CEDA  - RESOURCE DEFINITION ONLINE",
+                "  CECI  - COMMAND LEVEL INTERPRETER",
+                "  CEBR  - TEMPORARY STORAGE BROWSE",
+                "  CEDF  - EXECUTION DIAGNOSTIC FACILITY",
+                "  CESL  - GIBSON CICS LOG DISPLAY",
+                "",
+                "  EXAMPLES:",
+                "    CEMT I FILE",
+                "    CEMT I PROG",
+                "    CEMT SET PROGRAM(MYPROG) ENABLED",
+                "    CEDA DISPLAY PROGRAM",
+                "    CECI SEND TEXT('HELLO')",
+            ],
+        )
+    def cemt_menu(self) -> str:
+        return self._panel("STATUS:  ENTER ONE OF THE FOLLOWING", ["  Discard", "  Inquire", "  Perform", "  Set"], "")
+    def ceda_menu(self) -> str:
+        return self._panel("ENTER ONE OF THE FOLLOWING", [" ADd", " ALter", " APpend", " CHeck", " COpy", " DEFine", " DELete", " DIsplay", " Expand", " Install", " Lock", " Move", " REMove", " REName", " UNlock", " USerdefine", " View"], "")
+    def ceci_menu(self) -> str:
+        return self._asset("CECI.txt", "STATUS: ENTER ONE OF THE FOLLOWING\n SEND RECEIVE READ WRITEQ LINK XCTL RETURN")
+    def _resource_table(self, heading: str, rows: list[str]) -> str:
+        body = [f" {heading}", " " + "-" * 76]
+        body.extend(rows)
+        return self._panel("CICS MASTER TERMINAL", body)
+
+    def _cics_set_sit(self, cmd: str) -> str:
+        m = re.search(r"(SEC|XTRAN|XCMD|XPCT|XFCT|XTST|XDCT|XPPT|DFLTUSER)\(([^)]+)\)", cmd, re.I)
+        if not m:
+            return "DFHXS0003 SYNTAX: CICS SET SIT SEC(YES) XTRAN(YES) XCMD(YES) XPCT(YES) XFCT(YES) XTST(YES) XDCT(YES) XPPT(YES) DFLTUSER(CICSUSER)"
+        outs = []
+        for m in re.finditer(r"(SEC|XTRAN|XCMD|XPCT|XFCT|XTST|XDCT|XPPT|DFLTUSER)\(([^)]+)\)", cmd, re.I):
+            outs.append(self.region.set_sit_option(self.userid, m.group(1), m.group(2)))
+        return "\n".join(outs)
+    def _cemt(self, cmd: str) -> str:
+        uc = cmd.upper()
+        # INQUIRE aliases
+        if any(x in uc for x in (" INQUIRE ", " I ")):
+            return self._cemt_inquire(uc)
+        if " SET " in f" {uc} ":
+            return self._cemt_set(uc)
+        if " PERFORM " in f" {uc} ":
+            return self._cemt_perform(uc)
+        if " DISCARD " in f" {uc} ":
+            return self._cemt_discard(uc)
+        return self._asset("CEMT.txt", self.cemt_menu())
+    def _cemt_inquire(self, uc: str) -> str:
+        if "SEC" in uc or "SECURITY" in uc:
+            return self._resource_table("INQUIRE SECURITY", self.region.security_status_lines())
+        if "FILE" in uc:
+            rows = [f"  File({r.name:<8}) {r.attr('TYPE','VSAM'):<4} {getattr(r, 'open_state', 'OPEN')[:3].title():<3} {r.status[:3].title():<3} Rea({r.attr('READ','YES'):<3}) Upd({r.attr('UPDATE','NO'):<3}) Dsn({r.attr('DSN')})" for r in self.files.values()]
+            return self._resource_table("INQUIRE FILE", rows)
+        if "PROG" in uc or "PROGRAM" in uc:
+            rows = [f"  Prog({r.name:<8}) Leng({r.attr('LENGTH','000000')}) Resc({r.attr('RESCOUNT','000000')}) Use({r.attr('USECOUNT','000000')}) {r.status.title()}" for r in self.programs.values()]
+            return self._resource_table("INQUIRE PROGRAM", rows)
+        if "TASK" in uc:
+            now = datetime.now().strftime("%H:%M:%S")
+            rows = [f"  Tas(000001) Tra(CEMT) Fac(LU320) Sus TasPri(001) Use({self.userid:<8}) Tim({now})"]
+            for idx, session in enumerate(self.state.sessions.sessions.values(), start=2):
+                rows.append(f"  Tas({idx:06d}) Tra(TSO ) Fac(TCP{idx:03d}) Run TasPri(001) Use({session.userid:<8})")
+            return self._resource_table("INQUIRE TASK", rows)
+        if "TRAN" in uc or "TRANS" in uc:
+            rows = [f"  Tra({r.name:<4}) Pri({r.attr('PRIORITY','001')}) Pro({r.attr('PROGRAM','DFH????'):<8}) {r.status.title()} Ins({'Yes' if getattr(r, 'installed', True) else 'No '}) Tda({r.attr('TASKDATALOC','ANY')})" for r in self.transactions.values()]
+            return self._resource_table("INQUIRE TRANSACTION", rows)
+        if "TERM" in uc or "TERMINAL" in uc:
+            rows = [f"  Ter({r.name:<4}) Net({r.attr('NETNAME',''):<8}) {r.status.title()} Use({r.attr('USERID',''):<8})" for r in self.terminal_resources.values()]
+            return self._resource_table("INQUIRE TERMINAL", rows)
+        if "CONNECTION" in uc or "CONNECT" in uc:
+            rows = [f"  Con({r.name:<4}) Net({r.attr('NETNAME',''):<8}) {r.status.title()} Acc({r.attr('ACCESSMETHOD','')})" for r in self.connections.values()]
+            return self._resource_table("INQUIRE CONNECTION", rows)
+        if "SYSTEM" in uc or "SYS" in uc:
+            uptime = datetime.now() - self.start_time
+            rows = [
+                "  Sysid(CICS) Applid(CICS) Mvsimg(GIB1) Jobname(GICS    )",
+                "  Cicsts(05.06.00) Aos(0001) MaxTask(00050) CurTask(00001)",
+                f"  Start({self.start_time:%Y/%m/%d %H:%M:%S}) Uptime({str(uptime).split('.')[0]})",
+            ]
+            return self._resource_table("INQUIRE SYSTEM", rows)
+        if "TSQUEUE" in uc or "TSQ" in uc:
+            return self._resource_table("INQUIRE TSQUEUE", [f"  Tsq({r.name:<8}) Numitems({r.attr('ITEMS','00000000')}) Length({r.attr('LENGTH','00000080')}) {r.attr('LOCATION','MAIN').title()}" for r in self.region.tsqueues.values()])
+        if "TDQUEUE" in uc or "TDQ" in uc:
+            return self._resource_table("INQUIRE TDQUEUE", [f"  Tdq({r.name:<4}) Type({r.attr('TYPE','EXTRA').title():<8}) Ena Intrdr({r.attr('INTRDR','NO')})" for r in self.region.tdqueues.values()])
+        return "DFHCE3552 INVALID INQUIRE OPTION."
+    def _name_in_parens(self, text: str, keyword: str) -> Optional[str]:
+        import re
+        m = re.search(keyword + r"\(([^)]+)\)", text, re.I)
+        return m.group(1).strip().upper() if m else None
+    def _cemt_set(self, uc: str) -> str:
+        if "SEC" in uc or "SECURITY" in uc:
+            val = "YES" if any(x in uc for x in (" ON", " YES", "SEC(YES)")) else "NO" if any(x in uc for x in (" OFF", " NO", "SEC(NO)")) else "YES"
+            return self.region.set_sit_option(self.userid, "SEC", val)
+        if "PROGRAM" in uc or "PROG" in uc:
+            name = self._name_in_parens(uc, "PROGRAM") or self._name_in_parens(uc, "PROG")
+            if name and name in self.programs:
+                if "DIS" in uc:
+                    self.programs[name].status = "DISABLED"
+                if "ENA" in uc:
+                    self.programs[name].status = "ENABLED"
+                if "NEWCOPY" in uc or "PHASEIN" in uc:
+                    self.programs[name].attrs = {**(self.programs[name].attrs or {}), "USECOUNT": "000000"}
+                self._audit_stage("CICS RESOURCE SET", f"CEMT SET PROGRAM({name}) {self.programs[name].status}", transid="CEMT", resource=name, cls="CICSPROG")
+                return f"DFHCE3553 PROGRAM {name} SET {self.programs[name].status}."
+            return "DFHCE3554 PROGRAM NOT FOUND."
+        if "FILE" in uc:
+            name = self._name_in_parens(uc, "FILE")
+            if name and name in self.files:
+                status = self.files[name].status
+                if "CLOSED" in uc or "CLO" in uc:
+                    status = status.replace("OPEN", "CLOSED") if "OPEN" in status else "CLOSED ENABLED"
+                if "OPEN" in uc or "OPE" in uc:
+                    status = status.replace("CLOSED", "OPEN") if "CLOSED" in status else "OPEN ENABLED"
+                if "DIS" in uc:
+                    status = status.replace("ENABLED", "DISABLED") if "ENABLED" in status else status + " DISABLED"
+                if "ENA" in uc:
+                    status = status.replace("DISABLED", "ENABLED") if "DISABLED" in status else status + " ENABLED"
+                self.files[name].status = status
+                if "CLOSED" in status:
+                    self.files[name].open_state = "CLOSED"
+                if "OPEN" in status:
+                    self.files[name].open_state = "OPEN"
+                self._audit_stage("CICS RESOURCE SET", f"CEMT SET FILE({name}) {status}", transid="CEMT", resource=name, cls="FCICSFCT")
+                return f"DFHCE3553 FILE {name} SET {status}."
+            return "DFHCE3554 FILE NOT FOUND."
+        if "TRAN" in uc:
+            name = self._name_in_parens(uc, "TRANSACTION") or self._name_in_parens(uc, "TRAN")
+            if name and name in self.transactions:
+                self.transactions[name].status = "DISABLED" if "DIS" in uc else "ENABLED"
+                self._audit_stage("CICS RESOURCE SET", f"CEMT SET TRANSACTION({name}) {self.transactions[name].status}", transid="CEMT", resource=name, cls="TCICSTRN")
+                return f"DFHCE3553 TRANSACTION {name} SET {self.transactions[name].status}."
+            return "DFHCE3554 TRANSACTION NOT FOUND."
+        return "DFHCE3552 INVALID SET OPTION."
+    def _cemt_perform(self, uc: str) -> str:
+        if "SHUT" in uc:
+            return "DFHCE3579 PERFORM SHUTDOWN ACCEPTED - SHUTDOWN NOT EXECUTED IN SIMULATOR."
+        if "STAT" in uc:
+            return self.generate_stats()
+        if "DUMP" in uc:
+            return "DFHDU0201 SYSTEM DUMP CODE GIBS WRITTEN TO SIMULATED DUMP DATA SET."
+        return "DFHCE3578 PERFORM COMMAND COMPLETED."
+    def _cemt_discard(self, uc: str) -> str:
+        name = self._name_in_parens(uc, "PROGRAM") or self._name_in_parens(uc, "PROG")
+        if name and name in self.programs:
+            del self.programs[name]
+            return f"DFHCE3581 PROGRAM {name} DISCARDED."
+        return "DFHCE3582 RESOURCE NOT FOUND OR NOT DISCARDABLE."
+    def _ceda(self, cmd: str) -> str:
+        uc = cmd.upper()
+        if uc.strip() == "CEDA":
+            return self._asset("CEDA.txt", self.ceda_menu())
+        if any(x in uc for x in (" DISPLAY", " VIEW", " EXPAND")):
+            if "PROG" in uc or "PROGRAM" in uc:
+                rows = [f"  PROGRAM   {r.name:<8} GROUP(GIBSON) STATUS({r.status}) LANGUAGE(COBOL)" for r in self.programs.values()]
+                return self._resource_table("CEDA DISPLAY PROGRAM", rows)
+            if "FILE" in uc:
+                rows = [f"  FILE      {r.name:<8} GROUP(GIBSON) DSNAME({r.attr('DSN')}) STATUS({r.status})" for r in self.files.values()]
+                return self._resource_table("CEDA DISPLAY FILE", rows)
+            if "TRAN" in uc:
+                rows = [f"  TRANSACTION {r.name:<8} GROUP(GIBSON) PROGRAM({r.attr('PROGRAM')}) STATUS({r.status})" for r in self.transactions.values()]
+                return self._resource_table("CEDA DISPLAY TRANSACTION", rows)
+        if any(x in uc for x in (" DEFINE", " ADD")):
+            kind, name, attrs = parse_define(uc)
+            group = attrs.get("GROUP", "GIBSON")
+            corrid = self._cics_corrid("CED")
+            if kind in {"PROGRAM", "PROG"} and name:
+                self.region.define_program(name, group=group, language=attrs.get("LANGUAGE", "COBOL"), corrid=corrid, userid=self.userid)
+                return f"DFHCE3561 PROGRAM {name} DEFINED SUCCESSFULLY IN GROUP {group}. INSTALL REQUIRED."
+            if kind in {"TRANSACTION", "TRAN"} and name:
+                self.region.define_transaction(name, program=attrs.get("PROGRAM", "MYPROG"), group=group, corrid=corrid, userid=self.userid)
+                return f"DFHCE3561 TRANSACTION {name} DEFINED SUCCESSFULLY IN GROUP {group}. INSTALL REQUIRED."
+            return "DFHCE3560 CEDA DEFINE - ENTER TYPE AND NAME, E.G. CEDA DEFINE PROGRAM(MYPROG)."
+        if " INSTALL" in uc:
+            group = self._name_in_parens(uc, "GROUP") or "GIBSON"
+            installed = self.region.install_group(group, corrid=self._cics_corrid("INS"), userid=self.userid)
+            return "DFHCE3562 INSTALL SUCCESSFUL. INSTALLED: " + (", ".join(installed) if installed else "NO ELIGIBLE RESOURCES")
+        if " CHECK" in uc:
+            return "DFHCE3563 CHECK SUCCESSFUL. NO ERRORS DETECTED."
+        if " DELETE" in uc:
+            return "DFHCE3564 DELETE SUCCESSFUL."
+        return "DFHCE3569 CEDA COMMAND COMPLETE."
+    def _ceci(self, cmd: str) -> str:
+        uc = cmd.upper()
+        verbs = [
+            "SEND", "RECEIVE", "READ", "READNEXT", "WRITE", "WRITEQ", "READQ", "LINK", "XCTL", "RETURN",
+            "START", "SYNCPOINT", "SIGNON", "SIGNOFF", "ASSIGN", "ASKTIME", "FORMATTIME", "ENQ", "DEQ",
+            "LOAD", "GETMAIN", "FREEMAIN", "ADDRESS", "HANDLE", "IGNORE", "PUSH", "POP", "WEB", "CONVERSE",
+        ]
+        verb = ""
+        for v in verbs:
+            if f" {v}" in f" {uc}":
+                verb = v
+                break
+        if not verb:
+            return self._asset("CECI.txt", self.ceci_menu())
+        corrid = self._cics_corrid("CEC")
+        if verb in {"READ", "READNEXT", "WRITE"}:
+            fname = self._name_in_parens(uc, "FILE") or self._name_in_parens(uc, "DATASET") or "FILEA"
+            access = "UPDATE" if verb == "WRITE" else "READ"
+            ok, msg = self._file_allowed(fname, access=access, transid="CECI", corrid=corrid)
+            if not ok:
+                return self._panel("CECI - COMMAND LEVEL INTERPRETER", [
+                    f" COMMAND ===> EXEC CICS {cmd[5:].strip() if uc.startswith('CECI') else cmd}", "",
+                    " RESPONSE: NOTAUTH", " EIBRESP=70 EIBRESP2=0", f" {msg}", f" CORRID={corrid}"
+                ])
+        if verb in {"WRITEQ", "READQ"}:
+            qname = self._name_in_parens(uc, "TSQUEUE") or self._name_in_parens(uc, "QUEUE") or "PWNLOG"
+            self._audit_stage("CICS QUEUE ACCESS", f"CECI {verb} QUEUE({qname})", transid="CECI", resource=qname, cls="TSQUEUE", corrid=corrid)
+        self._audit_stage("CICS COMMAND EXECUTION", f"CECI EXEC CICS {verb}", transid="CECI", resource=verb, cls="TCICSTRN", corrid=corrid)
+        return self._panel(
+            "CECI - COMMAND LEVEL INTERPRETER",
+            [
+                f" COMMAND ===> EXEC CICS {cmd[5:].strip() if uc.startswith('CECI') else cmd}",
+                "",
+                f" RESPONSE: NORMAL",
+                f" EIBRESP=0 EIBRESP2=0 EIBFN={verb:<8}",
+                f" DFHCE3570 SIMULATED EXECUTION OF {verb} COMPLETED SUCCESSFULLY.",
+                f" CORRID={corrid}",
+            ],
+        )
+    def cebr(self) -> str:
+        return self._panel(
+            "CEBR - TEMPORARY STORAGE BROWSE",
+            [
+                " Queue name  ===> GIBSON",
+                " Item number ===> 00000001",
+                "",
+                " 000001  GIBSON CICS TEMPORARY STORAGE QUEUE ITEM",
+                " 000002  THIS IS A SIMULATED CEBR BROWSE DISPLAY",
+            ],
+        )
+    def cesl(self) -> str:
+        try:
+            lines = deque(self.log_path.read_text(encoding="utf-8", errors="ignore").splitlines(), maxlen=18)
+        except FileNotFoundError:
+            lines = deque(["*** NO LOGS FOUND ***"], maxlen=18)
+        return self._panel("CESL - SYSTEM LOGS", list(lines))
+    def generate_stats(self) -> str:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        uptime = datetime.now() - self.start_time
+        return self._panel(
+            "DFHCE3600 CICS STATISTICS",
+            [
+                f" STATISTICS AT {now}",
+                f" UPTIME: {str(uptime).split('.')[0]}",
+                " CPU%             5.3",
+                " Transactions/Sec 0.45",
+                " Current Tasks    1",
+                " Max Tasks        50",
+                " TS Queue Length  0",
+            ],
+        )
+    def cicspwn_report(self) -> str:
+        probe = self.region.cicspwn_probe(self.userid)
+        tx_lines = [f"  {x['name']:<4} {x['state']:<12} program={x.get('program','')} status={x.get('status','')}" for x in probe['transactions']]
+        file_lines = [f"  {x['name']:<8} {x['state']:<10} {x['open']:<6} dsn={x['dsn']}" for x in probe['files']]
+        queue_lines = [f"  {x['type']:<8} {x['name']:<8} state={x['state']}" for x in probe['queues']]
+        lines = [
+            f"APPLID={probe['applid']} REGION={probe['region']} SYSID={probe['sysid']} CORRID={probe['corrid']}",
+            f"SECURITY={probe['security']} OUTCOME={probe['outcome']}",
+            "",
+            "TRANSACTION DISCOVERY",
+            *tx_lines,
+            "",
+            "FILE DISCOVERY",
+            *file_lines,
+            "",
+            "QUEUE DISCOVERY",
+            *queue_lines,
+            "",
+            "NOTE: CICSPWN IS SIMULATED. NO HOST CODE IS EXECUTED.",
+        ]
+        return self._panel("CICSPWN STAGED DISCOVERY SUMMARY", lines, "FORENSIC EVIDENCE WRITTEN TO SMF80/OPERLOG")
+
+    # ------------------------------------------------------------------
+    # Safe training CICS banking lab (GMVB)
+    # ------------------------------------------------------------------
+    def _bank_screen(self, title: str, lines: list[str], status: str = "") -> str:
+        header = ["SIGHBERBANK CICS BANKING LAB", "TRANSACTION PROCESSING REGION CICSGIB1 / TRANSID GMVB", ""]
+        return self._panel(title, header + lines, status or self.bank_status)
+    def _bank_login(self, userid: str, password: str) -> str:
+        userid_u = (userid or "").upper()
+        password_t = (password or "").strip()
+        self.state.racf.load()
+        if self.state.racf.verify_password(userid_u, password_t):
+            self.bank_authenticated = True
+            self.bank_userid = userid_u
+            self.bank_current = "MENU"
+            self.bank_prev = "LOGN"
+            self.bank_status = f"SIGN-ON SUCCESSFUL FOR {userid_u}"
+            self.lab.login(self.lab_sid, userid_u, password_t)
+            return self._render_bank()
+        self.bank_authenticated = False
+        self.bank_status = "INVALID USERID OR PASSWORD"
+        return self._render_bank("LOGN")
+    def _bank_login_passticket(self, userid: str, ticket: str, applid: str = "CICS") -> str:
+        userid_u = (userid or "").upper()
+        ticket_u = (ticket or "").upper().strip()
+        appl_u = (applid or "CICS").upper().strip() or "CICS"
+        result = get_passticket_service(self.state).validate(userid_u, appl_u, ticket_u, consumer="CICS-GMVB")
+        if result.get("ok"):
+            self.bank_authenticated = True
+            self.bank_userid = userid_u
+            self.bank_current = "MENU"
+            self.bank_prev = "LOGN"
+            self.bank_status = f"PASSTICKET ACCEPTED FOR {userid_u} / {appl_u}"
+            self.lab.login(self.lab_sid, userid_u, "", passticket=ticket_u, applid=appl_u)
+            return self._render_bank()
+        self.bank_authenticated = False
+        self.bank_status = str(result.get("message", "PASSTICKET REJECTED"))
+        self.lab.login(self.lab_sid, userid_u, "", passticket=ticket_u, applid=appl_u)
+        return self._render_bank("LOGN")
+    def _render_bank(self, screen: str | None = None, message: str | None = None) -> str:
+        if screen:
+            self.bank_current = screen
+        if message is not None:
+            self.bank_status = message
+        current = self.bank_current
+        if current == "LOGN":
+            return self._bank_screen("LOGN - CUSTOMER SIGNON", [
+                "USERID . . . . . . .  ________",
+                "PASSWORD . . . . . .  ________",
+                "PASSTICKET . . . . .  ________",
+                "APPLID . . . . . . .  ________",
+                "ENTER FORMAT: userid password OR userid PTKT ticket [applid]",
+                "GACF.DB CREDENTIALS APPLY. USE ~ TO MOVE BETWEEN FIELDS.",
+                "PF12=LOGOUT  ~=NEXT FIELD  ENTER=SUBMIT",
+            ])
+        if current == "MENU":
+            return self._bank_screen("MENU - MAIN MENU", [
+                f"SIGNED ON USER . . .  {self.bank_userid or self.userid}",
+                "",
+                "1  CARG - CARGO / ITEM LOOKUP",
+                "2  ORDE - PLACE ORDER",
+                "3  ORDR - ORDER HISTORY",
+                "4  ACCT - ACCOUNT INQUIRY",
+                "5  STMT - STATEMENT SEARCH",
+                "6  XFER - FUNDS TRANSFER",
+                "7  APRV - APPROVAL QUEUE",
+                "8  HACK - HACK3270 FIELD LAB",
+                "9  LOGN - RETURN TO SIGNON",
+                "",
+                "SELECTION . . . . .  ____",
+                "TYPE TRANSACTION ID OR MENU NUMBER.",
+                "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD",
+            ])
+        if current == "CARG":
+            item = self.bank_items.get(self.bank_last_item) if self.bank_last_item else None
+            details = []
+            if item:
+                details = [
+                    f"ITEM NUMBER . . . .  {item['item_number']}",
+                    f"ITEM NAME . . . . .  {item['item_name']}",
+                    f"PRICE . . . . . . .  {item['price']}",
+                    f"SHIPPING COST . . .  {item['shipping_cost']}",
+                    f"PURCHASABLE . . . .  {item['purchasable']}",
+                    f"ORDER SUPPLY . . . . {item['order_supply']}",
+                    f"COMMENTS . . . . . . {item['comments']}",
+                ]
+            else:
+                details = ["ITEM NUMBER . . . .  _____", "", "ENTER A 5-DIGIT ITEM NUMBER."]
+            return self._bank_screen("CARG - ITEM LOOKUP", details + ["", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+        if current == "ORDE":
+            item = self.bank_items.get(self.bank_last_item) if self.bank_last_item else None
+            lines = ["ENTER ITEM NUMBER TO PLACE AN ORDER."]
+            if item:
+                lines.extend([
+                    f"DEFAULT ITEM . . . . {item['item_number']} {item['item_name']}",
+                    f"PRICE/SHIP . . . . . {item['price']} / {item['shipping_cost']}",
+                ])
+            lines.extend(["", "ITEM NUMBER . . . .  _____", "ENTER ITEM NUMBER OR PRESS ENTER TO USE DEFAULT ITEM.", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+            return self._bank_screen("ORDE - PLACE ORDER", lines)
+        if current == "ORDR":
+            rows = [f"{o['index']}  {o['date']}  {o['item_number']}  {o['name'][:28]:<28}  {o['price']:>7}" for o in self.bank_orders[-8:]]
+            return self._bank_screen("ORDR - ORDER HISTORY", ["INDEX  DATE      ITEM   NAME                          PRICE", "-----  --------  -----  ----------------------------  -------"] + rows + ["", "COMMAND . . . . . . ____", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+        if current == "ACCT":
+            snap = self.lab.snapshot(self.lab_sid)
+            lines = ["ACCOUNT . . . . . .  _________________", ""]
+            if snap.get("rows"):
+                row = snap["rows"][0]
+                lines.extend([
+                    f"ACCTNO . . . . . .  {row.get('ACCTNO','')}",
+                    f"OWNER  . . . . . .  {row.get('OWNER','')}",
+                    f"TYPE   . . . . . .  {row.get('TYPE','')}",
+                    f"BALANCE. . . . . .  {row.get('BALANCE','')}",
+                    f"STATUS . . . . . .  {row.get('STATUS','')}",
+                    f"ROUTING. . . . . .  {row.get('ROUTING','')}",
+                ])
+            else:
+                lines.append("ENTER AN ACCOUNT NUMBER OR TRY 10001' OR '1'='1")
+            lines.extend(["", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+            return self._bank_screen("ACCT - ACCOUNT INQUIRY", lines, self.bank_status)
+        if current == "STMT":
+            snap = self.lab.snapshot(self.lab_sid)
+            lines = ["ACCOUNT . . . . . .  _________________", "PERIOD . . . . . . .  ________", ""]
+            rows = snap.get("rows") or []
+            if rows:
+                lines.append("STMTID     ACCTNO  PERIOD   AMOUNT      DESCRIPTION")
+                lines.append("--------   ------  -------  ----------  ------------------------")
+                for row in rows[:6]:
+                    lines.append(f"{row.get('STMTID',''):<10} {row.get('ACCTNO',''):<6}  {row.get('PERIOD',''):<7}  {row.get('AMOUNT',''):<10}  {row.get('DESCRIPTION','')[:24]}")
+            else:
+                lines.append("SEARCH STATEMENTS OR TRY SQL-LIKE INPUT")
+            lines.extend(["", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+            return self._bank_screen("STMT - STATEMENT SEARCH", lines, self.bank_status)
+        if current == "XFER":
+            snap = self.lab.snapshot(self.lab_sid)
+            lines = [
+                "SOURCE ACCOUNT . . .  _________________",
+                "DEST ACCOUNT . . . .  _________________",
+                "AMOUNT . . . . . . .  _________________",
+                "PIN . . . . . . . .   ____",
+                "MEMO . . . . . . . .  ________________________",
+                "",
+            ]
+            rows = snap.get("rows") or []
+            if rows:
+                row = rows[0]
+                lines.extend([
+                    f"TXID . . . . . . .  {row.get('TXID','')}",
+                    f"STATUS . . . . . .  {row.get('STATUS','')}",
+                    f"REQUESTOR . . . . .  {row.get('REQUESTOR','')}",
+                ])
+            else:
+                lines.append("SUBMIT A TRANSFER. HIDDEN FLAGS CAN BE TOGGLED IN HACK MODE.")
+            lines.extend(["", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+            return self._bank_screen("XFER - FUNDS TRANSFER", lines, self.bank_status)
+        if current == "APRV":
+            snap = self.lab.snapshot(self.lab_sid)
+            lines = ["TRANSFER ID . . . .   __________", ""]
+            rows = snap.get("rows") or []
+            if rows:
+                row = rows[0]
+                lines.extend([
+                    f"TXID . . . . . . .  {row.get('TXID','')}",
+                    f"SOURCE . . . . . .  {row.get('SOURCE','')}",
+                    f"DEST . . . . . . .  {row.get('DESTINATION','')}",
+                    f"AMOUNT . . . . . .  {row.get('AMOUNT','')}",
+                    f"STATUS . . . . . .  {row.get('STATUS','')}",
+                ])
+            else:
+                lines.append("APPROVE A PENDING TRANSFER OR TEST DIRECT WORKFLOW ACCESS")
+            lines.extend(["", "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD"])
+            return self._bank_screen("APRV - APPROVAL QUEUE", lines, self.bank_status)
+        if current == "HACK":
+            snap = self.lab.snapshot(self.lab_sid)
+            hack = snap.get("hack", {})
+            return self._bank_screen("HACK - FIELD MANIPULATION", [
+                f"HACK FIELDS . . . .  {'ON' if hack.get('hack_enabled') else 'OFF'}",
+                f"REVEAL HIDDEN . . .  {'Y' if hack.get('reveal_hidden') else 'N'}",
+                f"REMOVE PROTECTION .  {'Y' if hack.get('remove_protection') else 'N'}",
+                f"REMOVE NUMERIC  . .  {'Y' if hack.get('remove_numeric') else 'N'}",
+                f"SHOW METADATA . . .  {'Y' if hack.get('show_metadata') else 'N'}",
+                "",
+                "USE THE WEB PORTAL ON PORT 8082 FOR THE FULL HACK3270-STYLE PANEL.",
+                "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD",
+            ], self.bank_status)
+        if current == "ADMN":
+            return self._bank_screen("ADMN - HIDDEN ADMIN FUNCTIONS", [
+                "DIRECT ORDER FILE ACCESS ACTIVE",
+                "PRICE OVERRIDE PANEL AVAILABLE",
+                "ORDER FILE AUTHORIZATION CHECKS: BYPASSED IN TRAINING DEMO",
+                "",
+                "COMMAND . . . . . . ____",
+                "THIS SCREEN IS ONLY REACHED IN INSTRUCTOR-CONTROLLED DEMO MODE.",
+                "PF3=BACK  PF4=MENU  PF12=LOGOUT  ~=NEXT FIELD",
+            ], self.bank_status)
+        return self._bank_screen("GMVB", ["UNKNOWN SCREEN STATE"], self.bank_status)
+    def _bank_field_defs(self, screen: str | None = None) -> list[dict[str, object]]:
+        current = (screen or self.bank_current).upper()
+        if current == "LOGN":
+            return [
+                {"name": "USERID", "row": 7, "col": 24, "width": 8, "hidden": False},
+                {"name": "PASSWORD", "row": 8, "col": 24, "width": 8, "hidden": True},
+            ]
+        if current == "MENU":
+            return [{"name": "SELECTION", "row": 14, "col": 24, "width": 4, "hidden": False}]
+        if current == "CARG":
+            return [{"name": "ITEM", "row": 10, "col": 24, "width": 5, "hidden": False}]
+        if current == "ORDE":
+            return [{"name": "ITEM", "row": 11, "col": 24, "width": 5, "hidden": False}]
+        if current == "ORDR":
+            return [{"name": "COMMAND", "row": 18, "col": 24, "width": 4, "hidden": False}]
+        if current == "ACCT":
+            return [{"name": "ACCTNO", "row": 8, "col": 24, "width": 18, "hidden": False}, {"name": "AUTHFLAG", "row": 18, "col": 24, "width": 1, "hidden": True}]
+        if current == "STMT":
+            return [{"name": "ACCTNO", "row": 8, "col": 24, "width": 18, "hidden": False}, {"name": "PERIOD", "row": 9, "col": 24, "width": 8, "hidden": False}]
+        if current == "XFER":
+            return [{"name": "SRCACCT", "row": 8, "col": 24, "width": 18, "hidden": False}, {"name": "DSTACCT", "row": 9, "col": 24, "width": 18, "hidden": False}, {"name": "AMOUNT", "row": 10, "col": 24, "width": 18, "hidden": False}, {"name": "PIN", "row": 11, "col": 24, "width": 4, "hidden": True}, {"name": "MEMO", "row": 12, "col": 24, "width": 24, "hidden": False}, {"name": "AUTHFLAG", "row": 17, "col": 24, "width": 1, "hidden": True}, {"name": "ADMINFLAG", "row": 18, "col": 24, "width": 1, "hidden": True}, {"name": "DEBUGFLAG", "row": 19, "col": 24, "width": 1, "hidden": True}]
+        if current == "APRV":
+            return [{"name": "TXID", "row": 8, "col": 24, "width": 10, "hidden": False}, {"name": "ADMINFLAG", "row": 18, "col": 24, "width": 1, "hidden": True}]
+        if current == "ADMN":
+            return [{"name": "COMMAND", "row": 11, "col": 24, "width": 4, "hidden": False}]
+        return []
+    def _bank_default_for_field(self, screen: str, name: str) -> str:
+        current = screen.upper()
+        if current in {"CARG", "ORDE"} and name == "ITEM":
+            return self.bank_last_item or ""
+        if current == "ACCT" and name == "ACCTNO":
+            return "10001"
+        if current == "STMT":
+            if name == "ACCTNO":
+                return "10001"
+            if name == "PERIOD":
+                return "2026-04"
+        if current == "XFER":
+            defaults = {"SRCACCT": "10001", "DSTACCT": "10002", "AMOUNT": "50.00", "MEMO": "LAB TRANSFER", "PIN": "", "AUTHFLAG": "N", "ADMINFLAG": "N", "DEBUGFLAG": "N"}
+            return defaults.get(name, "")
+        return ""
+    def _bank_prepare_form(self, screen: str | None = None) -> None:
+        current = (screen or self.bank_current).upper()
+        defs = self._bank_field_defs(current)
+        previous = dict(self.bank_form_values)
+        self.bank_form_values = {}
+        for field in defs:
+            name = str(field["name"])
+            self.bank_form_values[name] = previous.get(name, self._bank_default_for_field(current, name))
+        self.bank_focus = 0
+    @staticmethod
+    def _overlay(line: str, col: int, value: str) -> str:
+        base = line.ljust(79)
+        pos = max(0, col - 1)
+        return (base[:pos] + value + base[pos + len(value):])[:79]
+    def _render_bank_form(self) -> tuple[str, tuple[int, int]]:
+        self._bank_prepare_form(self.bank_current) if not self.bank_form_values and self._bank_field_defs(self.bank_current) else None
+        lines = self._render_bank().splitlines()
+        screen = ScreenBuffer()
+        for row, line in enumerate(lines[:24], start=1):
+            screen.put(row, 1, line[:79])
+        defs = self._bank_field_defs(self.bank_current)
+        cursor = (22, 1)
+        for idx, field in enumerate(defs):
+            name = str(field["name"])
+            row = int(field["row"])
+            col = int(field["col"])
+            width = int(field["width"])
+            raw_value = self.bank_form_values.get(name, "")[:width]
+            screen.add_field(row, col, width, raw_value, name=name, hidden=bool(field.get("hidden", False)), protected=False)
+            if idx == self.bank_focus:
+                cursor = (row, col + min(len(raw_value), width - 1 if width else 0))
+        screen.set_cursor(*cursor)
+        return screen.render_plain(), cursor
+    def _bank_submit_form(self) -> str:
+        current = self.bank_current
+        if current == "LOGN":
+            return self._bank_login(self.bank_form_values.get("USERID", ""), self.bank_form_values.get("PASSWORD", ""))
+        if current == "MENU":
+            return self._bank_handle_value(self.bank_form_values.get("SELECTION", ""))
+        if current in {"CARG", "ORDE", "ORDR", "ADMN"}:
+            value = self.bank_form_values.get("ITEM", self.bank_form_values.get("COMMAND", ""))
+            return self._bank_handle_value(value)
+        if current == "ACCT":
+            snap = self.lab.account_lookup(self.lab_sid, self.bank_form_values.get("ACCTNO", ""))
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("ACCT", self.bank_status)
+        if current == "STMT":
+            snap = self.lab.statement_lookup(self.lab_sid, self.bank_form_values.get("ACCTNO", ""), self.bank_form_values.get("PERIOD", ""))
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("STMT", self.bank_status)
+        if current == "XFER":
+            snap = self.lab.transfer(self.lab_sid, self.bank_form_values)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("XFER", self.bank_status)
+        if current == "APRV":
+            snap = self.lab.approve(self.lab_sid, self.bank_form_values.get("TXID", ""))
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("APRV", self.bank_status)
+        if current == "HACK":
+            return self._render_bank("HACK", "USE WEB HACK3270 PANEL")
+        return self._render_bank(current, self.bank_status)
+    def _bank_overflow(self, value: str) -> tuple[str, bool]:
+        data = (value or "").strip().upper()
+        if len(data) <= 5:
+            return data, False
+        self.bank_status = "SIMULATED OVERFLOW CONDITION DETECTED"
+        if "ADMN" in data and self.bank_demo_admin:
+            self.bank_current = "ADMN"
+            self.bank_prev = "CARG"
+            self.bank_status = "TRAINING DEMO CONTROL-FLOW REDIRECT ACTIVE"
+            return data[:5], True
+        return data[:5], False
+    def _bank_handle_value(self, value: str) -> str:
+        entered = (value or "").strip()
+        current = self.bank_current
+        if current == "LOGN":
+            if not entered:
+                return self._render_bank("LOGN", "ENTER USERID AND PASSWORD OR PASSTICKET")
+            parts = entered.split()
+            if len(parts) >= 3 and parts[1].upper() in {"PTKT", "PASSTICKET"}:
+                appl = parts[3] if len(parts) >= 4 else "CICS"
+                return self._bank_login_passticket(parts[0], parts[2], appl)
+            if "~" in entered and " " not in entered and "/" not in entered:
+                user, _, pw = entered.partition("~")
+            elif "/PTKT/" in entered.upper() and " " not in entered:
+                parts2 = entered.split("/")
+                user = parts2[0]
+                ticket = parts2[2] if len(parts2) > 2 else ""
+                appl = parts2[3] if len(parts2) > 3 else "CICS"
+                return self._bank_login_passticket(user, ticket, appl)
+            elif "/" in entered and " " not in entered:
+                user, _, pw = entered.partition("/")
+            else:
+                if len(parts) < 2:
+                    return self._render_bank("LOGN", "ENTER FORMAT userid password OR userid PTKT ticket [applid]")
+                user, pw = parts[0], parts[1]
+            return self._bank_login(user, pw)
+        if current == "MENU":
+            target = entered.upper()
+            mapping = {"1": "CARG", "2": "ORDE", "3": "ORDR", "4": "ACCT", "5": "STMT", "6": "XFER", "7": "APRV", "8": "HACK", "9": "LOGN", "LOGN": "LOGN", "MENU": "MENU", "CARG": "CARG", "ORDE": "ORDE", "ORDR": "ORDR", "ACCT": "ACCT", "STMT": "STMT", "XFER": "XFER", "APRV": "APRV", "HACK": "HACK", "ADMN": "ADMN"}
+            dest = mapping.get(target, "")
+            if dest == "ADMN" and not (self.bank_demo_admin or self._is_special()):
+                return self._render_bank("MENU", "TRANSACTION ADMN NOT AUTHORIZED")
+            if dest:
+                self.bank_prev = self.bank_current
+                return self._render_bank(dest, f"{dest} READY")
+            return self._render_bank("MENU", "ENTER VALID MENU OPTION")
+        if current == "CARG":
+            item_no, redirected = self._bank_overflow(entered)
+            if redirected:
+                return self._render_bank("ADMN", self.bank_status)
+            if item_no in self.bank_items:
+                self.bank_last_item = item_no
+                return self._render_bank("CARG", f"ITEM {item_no} FOUND")
+            return self._render_bank("CARG", f"ITEM {item_no or 'BLANK'} NOT FOUND")
+        if current == "ORDE":
+            item_no = (entered or self.bank_last_item or "").strip().upper()
+            if not item_no:
+                return self._render_bank("ORDE", "ENTER ITEM NUMBER")
+            item = self.bank_items.get(item_no)
+            if not item:
+                return self._render_bank("ORDE", f"ITEM {item_no} NOT FOUND")
+            idx = f"{len(self.bank_orders)+1:05d}"
+            self.bank_orders.append({"index": idx, "date": datetime.now().strftime("%m/%d/%y"), "name": item['item_name'], "price": item['price'], "shipping": item['shipping_cost'], "item_number": item_no})
+            self.bank_last_item = item_no
+            self.bank_prev = "ORDE"
+            return self._render_bank("ORDR", f"ORDER {idx} CREATED FOR ITEM {item_no}")
+        if current == "ORDR":
+            return self._render_bank("ORDR", "ORDER HISTORY REFRESHED")
+        if current == "ACCT":
+            snap = self.lab.account_lookup(self.lab_sid, entered)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("ACCT", self.bank_status)
+        if current == "STMT":
+            parts = entered.split()
+            acct = parts[0] if parts else self.bank_form_values.get("ACCTNO", "")
+            period = parts[1] if len(parts) > 1 else self.bank_form_values.get("PERIOD", "2026-04")
+            snap = self.lab.statement_lookup(self.lab_sid, acct, period)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("STMT", self.bank_status)
+        if current == "XFER":
+            parts = entered.split()
+            payload = dict(self.bank_form_values)
+            if len(parts) >= 3:
+                payload.update({"SRCACCT": parts[0], "DSTACCT": parts[1], "AMOUNT": parts[2], "MEMO": " ".join(parts[3:]) if len(parts) > 3 else payload.get("MEMO", "LAB TRANSFER")})
+            snap = self.lab.transfer(self.lab_sid, payload)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("XFER", self.bank_status)
+        if current == "APRV":
+            txid = entered or self.bank_form_values.get("TXID", "")
+            snap = self.lab.approve(self.lab_sid, txid)
+            self.bank_status = snap.get("status", self.bank_status)
+            return self._render_bank("APRV", self.bank_status)
+        if current == "HACK":
+            return self._render_bank("HACK", "USE WEB HACK3270 PANEL")
+        if current == "ADMN":
+            return self._render_bank("ADMN", "ADMIN PANEL READY")
+        return self._render_bank("MENU", self.bank_status)
+    def _bank_handle_key(self, key: str) -> str | None:
+        key_u = (key or "").upper()
+        if key_u in {"PF12", "F12"}:
+            self.bank_authenticated = False
+            self.bank_userid = ""
+            self.bank_prev = "LOGN"
+            return self._render_bank("LOGN", "SIGNED OFF FROM SIGHBERBANK")
+        if key_u in {"PF4", "F4"}:
+            if self.bank_authenticated:
+                self.bank_prev = self.bank_current
+                return self._render_bank("MENU", "MENU REQUESTED")
+        if key_u in {"PF3", "F3"}:
+            if self.bank_current == "MENU":
+                return self._render_bank("LOGN", "BACK TO SIGNON")
+            target = self.bank_prev or "MENU"
+            self.bank_prev = "MENU"
+            return self._render_bank(target, f"RETURNED TO {target}")
+        return None
+    def _gmvb_execute(self, cmd: str) -> str:
+        parts = cmd.strip().split()
+        if len(parts) == 1:
+            return self._render_bank("LOGN", "ENTER USERID AND PASSWORD")
+        action = parts[1].upper()
+        if action == "LOGN":
+            if len(parts) >= 5 and parts[3].upper() in {"PTKT", "PASSTICKET"}:
+                return self._bank_login_passticket(parts[2], parts[4], parts[5] if len(parts) >= 6 else "CICS")
+            if len(parts) >= 4:
+                return self._bank_login(parts[2], parts[3])
+            if len(parts) == 3 and "~" in parts[2]:
+                user, _, pw = parts[2].partition("~")
+                return self._bank_login(user, pw)
+            return self._render_bank("LOGN", "ENTER FORMAT userid password OR userid PTKT ticket")
+        if action in {"MENU", "CARG", "ORDE", "ORDR", "ACCT", "STMT", "XFER", "APRV", "HACK", "ADMN"}:
+            self.bank_current = action
+            if action == "ADMN" and not (self.bank_demo_admin or self._is_special()):
+                return self._render_bank("MENU", "TRANSACTION ADMN NOT AUTHORIZED")
+            if len(parts) >= 3:
+                return self._bank_handle_value(" ".join(parts[2:]))
+            return self._render_bank(action, f"{action} READY")
+        return self._render_bank(self.bank_current, "UNKNOWN GMVB SUBCOMMAND")
+    def run_mcgm_terminal(self, input_driver: SocketInputDriver, send: Callable[[str], None]) -> None:
+        self.bank_current = "LOGN"
+        self.bank_prev = "LOGN"
+        self.bank_status = "ENTER USERID AND PASSWORD"
+        self.bank_authenticated = False
+        self.bank_userid = ""
+        self._bank_prepare_form("LOGN")
+        while True:
+            screen, cursor = self._render_bank_form()
+            send(colors.CLEAR + colors.GREEN + screen + colors.RESET + f"\x1b[{cursor[0]};{cursor[1]}H")
+            res = input_driver.read_key()
+            if res.key == "EOF":
+                return
+            key = (res.key or "").upper()
+            if key in {"PF12", "F12", "PF4", "F4", "PF3", "F3"}:
+                before = self.bank_current
+                key_out = self._bank_handle_key(key)
+                if key_out is not None:
+                    if key in {"PF12", "F12"} and before == "LOGN" and not self.bank_authenticated:
+                        send(colors.CLEAR + colors.GREEN + key_out + colors.RESET + "\n")
+                        return
+                    self._bank_prepare_form(self.bank_current)
+                continue
+            defs = self._bank_field_defs(self.bank_current)
+            if not defs:
+                if key in {"ENTER", "TAB", "UP", "DOWN"} or res.text == "~":
+                    self._bank_prepare_form(self.bank_current)
+                continue
+            current_field = defs[self.bank_focus]
+            name = str(current_field["name"])
+            width = int(current_field["width"])
+            value = self.bank_form_values.get(name, "")
+            if key in {"TAB", "DOWN", "RIGHT"} or (res.text or "").startswith("~"):
+                self.bank_focus = (self.bank_focus + 1) % len(defs)
+                continue
+            if key == "UP":
+                self.bank_focus = (self.bank_focus - 1) % len(defs)
+                continue
+            if key == "BACKSPACE":
+                self.bank_form_values[name] = value[:-1]
+                continue
+            if key == "ENTER":
+                self._bank_submit_form()
+                self._bank_prepare_form(self.bank_current)
+                continue
+            if res.text and not (res.text or "").startswith("~") and len(value) < width:
+                self.bank_form_values[name] = value + res.text.upper()
+
+
+from gibson.apps.gmvb_cics_patch import install_cics_gmvb_upgrade
+install_cics_gmvb_upgrade(CicsSimulator)
+
+
+# ---------------------------------------------------------------------------
+# FIBS stateful banking patch
+# ---------------------------------------------------------------------------
+# The integrated GMVB service originally exposed a menu but did not keep a
+# pseudo-conversational application state for numeric menu choices in L CICS.
+# This patch makes FIBS the visible application and keeps GMVB/OMEN/CBSA as
+# aliases that route to the same FIBS service/session state.
+_FIBS_ORIGINAL_EXECUTE = CicsSimulator.execute
+
+
+def _fibs_panel(self: CicsSimulator, title: str, body: list[str], status: str = "FIBS READY") -> str:
+    return self._panel(title, body, status)
+
+
+def _fibs_menu(self: CicsSimulator, status: str = "FIBS READY") -> str:
+    self.bank_current = "FIBS_MENU"
+    return _fibs_panel(self, "FIBS - GIBSON BANKING APPLICATION", [
+        "1  DISPLAY CUSTOMER INFORMATION          CUST",
+        "2  DISPLAY ACCOUNT INFORMATION           ACCT",
+        "A  DISPLAY ALL ACCOUNTS FOR CUSTOMER     CUSTA",
+        "3  CREATE NEW CUSTOMER                   CUSA",
+        "4  CREATE NEW ACCOUNT                    ACCA",
+        "5  UPDATE ACCOUNT INFORMATION            ACCU",
+        "6  CREDIT / DEBIT ACCOUNT                DBCR",
+        "7  TRANSFER FUNDS BETWEEN ACCOUNTS       XFER",
+        "B  BATCH PROCESSING                      BATCH",
+        "S  SWIFT MESSAGE PROCESSING              SWFT",
+        "K  CHAPS HIGH VALUE PAYMENT              CHAP",
+        "H  HACK3270 FIELD INSPECTOR              HACK3270",
+        "C  COBOL / BMS SOURCE                    COBL",
+        "X  SIGN OFF                              CESF",
+        "",
+        "COMMAND ===>",
+    ], status)
+
+
+def _fibs_service_execute(self: CicsSimulator, command: str) -> str:
+    from gibson.apps.fibs_service import get_fibs_service
+    svc = get_fibs_service(self.state)
+    parts = (command or "").strip().split()
+    raw_op = (parts[0].upper() if parts else "FIBS")
+    menu_map = {
+        "FIBS": "FIBS", "GMVB": "FIBS", "OMEN": "FIBS", "CBSA": "FIBS",
+        "1": "CUST", "2": "ACCT", "A": "CUSTA", "3": "CUSA", "4": "ACCA",
+        "5": "ACCU", "6": "DBCR", "7": "XFER", "B": "BATCH", "S": "SWFT",
+        "P": "PAYM", "K": "CHAP", "H": "HACK3270", "C": "COBL", "X": "CESF",
+    }
+    op = menu_map.get(raw_op, raw_op)
+    try:
+        if op == "FIBS":
+            return _fibs_menu(self)
+        if op == "CUST":
+            cid = parts[1] if len(parts) > 1 else ""
+            self.bank_current = "FIBS_CUST"
+            if not cid:
+                return _fibs_panel(self, "FIBS CUSTOMER INQUIRY", ["CUSTOMER ID . . . ________", "", "ENTER CUSTOMER NUMBER, EXAMPLE 10000002"], "CUST READY")
+            row = svc.get_customer(cid)
+            if not row:
+                return _fibs_panel(self, "FIBS CUSTOMER INQUIRY", [f"CUSTOMER {cid} NOT FOUND"], "DFHCU0044")
+            return _fibs_panel(self, "FIBS CUSTOMER INQUIRY", [
+                f"CUSTOMER ID . . . {row['CUSTOMER_ID']}",
+                f"NAME . . . . . . . {row['FULL_NAME']}",
+                f"ADDRESS . . . . . {row['ADDRESS_LINE_1']}",
+                f"TOWN . . . . . . . {row['TOWN']}",
+                f"STATUS . . . . . . {row['STATUS']} KYC {row['KYC_STATUS']}",
+            ], "INQUIRY COMPLETE")
+        if op == "ACCT":
+            acct = parts[1] if len(parts) > 1 else ""
+            self.bank_current = "FIBS_ACCT"
+            if not acct:
+                return _fibs_panel(self, "FIBS ACCOUNT INQUIRY", ["ACCOUNT NUMBER . . __________", "", "ENTER ACCOUNT NUMBER, EXAMPLE 1000000201"], "ACCT READY")
+            row = svc.get_account(acct)
+            if not row:
+                return _fibs_panel(self, "FIBS ACCOUNT INQUIRY", [f"ACCOUNT {acct} NOT FOUND"], "DFHAC0044")
+            return _fibs_panel(self, "FIBS ACCOUNT INQUIRY", [
+                f"ACCOUNT . . . . . {row['ACCOUNT_NUMBER']}",
+                f"CUSTOMER . . . . . {row['CUSTOMER_ID']}",
+                f"TYPE . . . . . . . {row['ACCOUNT_TYPE']}",
+                f"BALANCE . . . . . {row['ACTUAL_BALANCE']}",
+                f"AVAILABLE . . . . {row['AVAILABLE_BALANCE']}",
+                f"STATUS . . . . . . {row['STATUS']}",
+            ], "INQUIRY COMPLETE")
+        if op == "CUSTA":
+            cid = parts[1] if len(parts) > 1 else "10000002"
+            rows = svc.get_accounts_for_customer(cid)
+            return _fibs_panel(self, "FIBS ACCOUNTS FOR CUSTOMER", [f"CUSTOMER . . . . . {cid}", "", "ACCOUNT       TYPE  BALANCE       STATUS"] + [f"{r['ACCOUNT_NUMBER']:<13} {r['ACCOUNT_TYPE']:<4} {r['ACTUAL_BALANCE']:<12} {r['STATUS']}" for r in rows[:12]], "CUSTA READY")
+        if op == "CUSA":
+            row = svc.create_customer({"FORENAME": "CICS", "SURNAME": "TRAINING"}, self.userid)
+            return _fibs_panel(self, "FIBS CREATE CUSTOMER", [f"CUSTOMER {row['CUSTOMER_ID']} CREATED", f"NAME . . . {row['FULL_NAME']}"], "DFHCU0001")
+        if op == "ACCA":
+            row = svc.create_account({"CUSTOMER_ID": parts[1] if len(parts) > 1 else "10000002", "balance": "0.00"}, self.userid)
+            return _fibs_panel(self, "FIBS CREATE ACCOUNT", [f"ACCOUNT {row['ACCOUNT_NUMBER']} CREATED", f"CUSTOMER {row['CUSTOMER_ID']}"], "DFHAC0001")
+        if op == "ACCU":
+            acct = parts[1] if len(parts) > 1 else "1000000201"
+            row = svc.update_account(acct, {"status": "A"}, self.userid)
+            return _fibs_panel(self, "FIBS UPDATE ACCOUNT", [f"ACCOUNT {acct} UPDATED", f"STATUS {row['STATUS']}"], "DFHAC0002")
+        if op == "DBCR":
+            acct = parts[1] if len(parts) > 1 else "1000000201"
+            amount = parts[2] if len(parts) > 2 else "10.00"
+            res = svc.credit_account(acct, amount, "CICS DBCR", self.userid)
+            return _fibs_panel(self, "FIBS CREDIT / DEBIT", [f"CREDIT POSTED ACCOUNT {acct}", f"BALANCE {res['account']['ACTUAL_BALANCE']}"], "DFHTR0001")
+        if op == "XFER":
+            fr = parts[1] if len(parts) > 1 else "1000000101"
+            to = parts[2] if len(parts) > 2 else "1000000201"
+            amt = parts[3] if len(parts) > 3 else "10.00"
+            svc.transfer_funds(fr, to, amt, "CICS XFER", self.userid)
+            return _fibs_panel(self, "FIBS TRANSFER FUNDS", [f"TRANSFER POSTED FROM {fr}", f"TO {to} AMOUNT {amt}"], "DFHTR0002")
+        if op == "BATCH":
+            batch = svc.get_batch("B2026A17")
+            return _fibs_panel(self, "FIBS BATCH PROCESSING", [
+                f"BATCH ID . . . . {batch['BATCH_ID']}",
+                f"ITEM COUNT . . . {batch['ITEM_COUNT']}",
+                f"TOTAL VALUE . . {batch['TOTAL_VALUE']}",
+                f"STATUS . . . . . {batch['STATUS']}",
+                "RELEASE REQUIRES SUPERVISOR PIN 0032",
+                "HACK3270 TRAINING CAN INJECT PIN 0032",
+            ], "BATCH READY")
+        if op == "SWFT":
+            return _fibs_panel(self, "FIBS SWIFT MESSAGE PROCESSING", [f"{r['MESSAGE_ID']} {r['MESSAGE_TYPE']} {r['CURRENCY']} {r['AMOUNT']} {r['STATUS']}" for r in svc.list_swift_messages()[:12]], "SWIFT READY")
+        if op == "HACK3270":
+            return _fibs_panel(self, "FIBS HACK3270 FIELD INSPECTOR", ["USE THE REACT 8999 HACK3270 BAR FOR FIELD ATTRIBUTE SIMULATION.", "CICS TERMINAL SUPPORTS TRAINING-ONLY EVENTS."], "HACK3270 READY")
+        if op == "COBL":
+            self.bank_current = "FIBS_COBL"
+            return _fibs_panel(self, "FIBS COBOL / BMS SOURCE", ["COBL BNKMENU", "COBL BNK1TFN", "PF7/PF8 SCROLL IN REACT 8999 SOURCE VIEWER"], "COBL READY")
+        if op == "CESF":
+            self.bank_current = "LOGN"
+            return self.execute("CESF")
+    except Exception as exc:
+        return f"DFHFB0008 FIBS SERVICE ERROR: {type(exc).__name__}: {exc}"
+    return _fibs_panel(self, "FIBS COMMAND ACCEPTED", [f"COMMAND {op} ACCEPTED"], "FIBS READY")
+
+
+def _fibs_execute(self: CicsSimulator, command: str) -> str:
+    cmd = (command or "").strip()
+    uc = cmd.upper()
+    first = uc.split()[0] if uc else ""
+    menu_tokens = {"1", "2", "A", "3", "4", "5", "6", "7", "B", "S", "P", "H", "C", "X"}
+    fibs_tokens = {"FIBS", "GMVB", "OMEN", "CBSA", "CUST", "ACCT", "CUSTA", "CUSA", "ACCA", "ACCU", "DBCR", "XFER", "BATCH", "SWFT", "CHAP", "PAYM", "HACK3270", "COBL"}
+    if first in fibs_tokens:
+        return _fibs_service_execute(self, cmd)
+    if getattr(self, "bank_current", "").startswith("FIBS_") and first in menu_tokens:
+        return _fibs_service_execute(self, cmd)
+    # If a user is inside a FIBS inquiry screen and enters just a key, route it
+    # to that screen instead of the global CICS dispatcher.
+    current = getattr(self, "bank_current", "")
+    if current == "FIBS_CUST" and uc and first not in {"CEMT", "CECI", "CEDA", "CESF", "HELP"}:
+        return _fibs_service_execute(self, "CUST " + cmd)
+    if current == "FIBS_ACCT" and uc and first not in {"CEMT", "CECI", "CEDA", "CESF", "HELP"}:
+        return _fibs_service_execute(self, "ACCT " + cmd)
+    return _FIBS_ORIGINAL_EXECUTE(self, command)
+
+
+# Register FIBS transaction resources on existing and future instances.
+_FIBS_ORIGINAL_INIT = CicsSimulator.__init__
+def _fibs_init(self: CicsSimulator, *args, **kwargs):
+    _FIBS_ORIGINAL_INIT(self, *args, **kwargs)
+    for _tx, _pgm in {
+        "FIBS": "FIBSMENU", "GMVB": "FIBSMENU", "OMEN": "FIBSMENU", "CBSA": "FIBSMENU",
+        "CUSTA": "FIBSCCA", "CUSA": "FIBSCUS", "ACCA": "FIBSACC", "ACCU": "FIBSUAC",
+        "DBCR": "FIBSDBCR", "XFER": "FIBSXFER", "BATCH": "FIBSBAT", "SWFT": "FIBSSWFT",
+        "HACK3270": "FIBSHACK", "COBL": "FIBSCOBL",
+    }.items():
+        self.transactions.setdefault(_tx, CicsResource(_tx, "ENABLED", {"PROGRAM": _pgm, "TASKDATALOC": "ANY"}))
+
+CicsSimulator.__init__ = _fibs_init
+CicsSimulator.execute = _fibs_execute
+CicsSimulator._fibs_service_execute = _fibs_service_execute
+
+# ---------------------------------------------------------------------------
+# FIBS stability upgrade: pseudo-conversational teller application
+# ---------------------------------------------------------------------------
+# The previous FIBS patch routed aliases to a service menu, but PF keys and
+# in-screen operator input were still too command-like.  This late-bound patch
+# models a CICS pseudo-conversational application: a transaction returns a map,
+# the next terminal input is interpreted in the context of that map, and PF/AID
+# keys navigate predictably.
+_FIBS_STABLE_PREVIOUS_EXECUTE = CicsSimulator.execute
+
+
+def _stable_fibs_lines_footer() -> list[str]:
+    return ["", "COMMAND ===>", "PF1=HELP PF3=MENU PF5=REFRESH PF7=UP PF8=DOWN PF12=SIGNOFF"]
+
+
+def _stable_fibs_panel(self: CicsSimulator, title: str, body: list[str], status: str = "FIBS READY") -> str:
+    return self._panel(title, body + _stable_fibs_lines_footer(), status)
+
+
+def _stable_fibs_service(self: CicsSimulator):
+    from gibson.apps.fibs_service import get_fibs_service
+    return get_fibs_service(self.state)
+
+
+def _stable_set_screen(self: CicsSimulator, screen: str) -> None:
+    cur = getattr(self, "bank_current", "FIBS_MENU")
+    if cur != screen:
+        self.bank_prev = cur
+    self.bank_current = screen
+
+
+def _stable_fibs_menu(self: CicsSimulator, status: str = "FIBS READY") -> str:
+    _stable_set_screen(self, "FIBS_MENU")
+    return _stable_fibs_panel(self, "FIBS - GIBSON BANKING APPLICATION", [
+        "1  DISPLAY CUSTOMER INFORMATION          CUST",
+        "2  DISPLAY ACCOUNT INFORMATION           ACCT",
+        "A  DISPLAY ALL ACCOUNTS FOR CUSTOMER     CUSTA",
+        "3  CREATE NEW CUSTOMER                   CUSA",
+        "4  CREATE NEW ACCOUNT                    ACCA",
+        "5  UPDATE ACCOUNT INFORMATION            ACCU",
+        "6  CREDIT / DEBIT ACCOUNT                DBCR",
+        "7  TRANSFER FUNDS BETWEEN ACCOUNTS       XFER",
+        "B  BATCH PROCESSING                      BATCH",
+        "S  SWIFT MESSAGE PROCESSING              SWFT",
+        "K  CHAPS HIGH VALUE PAYMENT              CHAP",
+        "H  HACK3270 FIELD INSPECTOR              HACK3270",
+        "C  COBOL / BMS SOURCE                    COBL",
+        "X  SIGN OFF                              CESF",
+    ], status)
+
+
+def _stable_kv_args(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for token in (text or "").split():
+        if "=" in token:
+            k, v = token.split("=", 1)
+            out[k.strip().upper()] = v.strip()
+    return out
+
+
+def _stable_first_nonverb(parts: list[str], verbs: set[str]) -> str:
+    for p in parts:
+        if p.upper() not in verbs:
+            return p
+    return ""
+
+
+def _stable_customer_screen(self: CicsSimulator, arg: str = "", status: str = "CUST READY") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_CUST")
+    arg = (arg or "").strip()
+    if not arg or arg.upper() in {"INQ", "INQUIRE", "REFRESH"}:
+        return _stable_fibs_panel(self, "FIBS CUSTOMER INQUIRY", [
+            "CUSTOMER ID . . . __________",
+            "ACTION . . . . . . INQ",
+            "",
+            "ENTER CUSTOMER NUMBER THEN ENTER, OR:",
+            "  ADD FORENAME=<name> SURNAME=<name> TOWN=<town>",
+            "  UPD <customer> ADDRESS=<address> STATUS=<A|H|C>",
+            "  DEL <customer>",
+            "",
+            "EXAMPLE: 10000002",
+        ], status)
+    parts = arg.split()
+    verb = parts[0].upper() if parts else ""
+    kv = _stable_kv_args(arg)
+    if verb in {"ADD", "A"}:
+        row = svc.create_customer({
+            "FORENAME": kv.get("FORENAME", parts[1] if len(parts) > 1 else "TRAINING"),
+            "SURNAME": kv.get("SURNAME", parts[2] if len(parts) > 2 else "CUSTOMER"),
+            "TOWN": kv.get("TOWN", "LONDON"),
+            "ADDRESS_LINE_1": kv.get("ADDRESS", "FIBS TRAINING ADDRESS"),
+            "POSTCODE": kv.get("POSTCODE", "EC1A1AA"),
+        }, self.userid)
+        return _stable_fibs_panel(self, "FIBS CUSTOMER ADD", [
+            f"CUSTOMER ID . . . {row['CUSTOMER_ID']}",
+            f"NAME . . . . . . . {row['FULL_NAME']}",
+            "DFHCU0001 CUSTOMER RECORD CREATED",
+        ], "ADD COMPLETE")
+    if verb in {"DEL", "DELETE", "D"}:
+        cid = parts[1] if len(parts) > 1 else ""
+        if not cid:
+            return _stable_fibs_panel(self, "FIBS CUSTOMER DELETE", ["CUSTOMER ID REQUIRED", "EXAMPLE: DEL 10000009"], "DFHCU0100")
+        res = svc.delete_customer(cid, self.userid)
+        return _stable_fibs_panel(self, "FIBS CUSTOMER DELETE", [
+            f"CUSTOMER ID . . . {cid}",
+            f"RESULT . . . . . . {res.get('result','DELETED')}",
+            "DFHCU0002 CUSTOMER RECORD DELETED",
+        ], "DELETE COMPLETE")
+    if verb in {"UPD", "UPDATE", "U"}:
+        cid = parts[1] if len(parts) > 1 else ""
+        if not cid:
+            return _stable_fibs_panel(self, "FIBS CUSTOMER UPDATE", ["CUSTOMER ID REQUIRED", "EXAMPLE: UPD 10000002 STATUS=A"], "DFHCU0101")
+        row = svc.update_customer(cid, kv, self.userid)
+        return _stable_fibs_panel(self, "FIBS CUSTOMER UPDATE", [
+            f"CUSTOMER ID . . . {row['CUSTOMER_ID']}",
+            f"NAME . . . . . . . {row['FULL_NAME']}",
+            f"STATUS . . . . . . {row['STATUS']} KYC {row['KYC_STATUS']}",
+            "DFHCU0003 CUSTOMER RECORD UPDATED",
+        ], "UPDATE COMPLETE")
+    cid = _stable_first_nonverb(parts, {"INQ", "INQUIRE"}) or arg
+    row = svc.get_customer(cid)
+    if not row:
+        return _stable_fibs_panel(self, "FIBS CUSTOMER INQUIRY", [f"CUSTOMER {cid} NOT FOUND", "ENTER ANOTHER CUSTOMER OR PF3 FOR MENU"], "DFHCU0044")
+    return _stable_fibs_panel(self, "FIBS CUSTOMER INQUIRY", [
+        f"CUSTOMER ID . . . {row['CUSTOMER_ID']}",
+        f"NAME . . . . . . . {row['FULL_NAME']}",
+        f"ADDRESS . . . . . {row['ADDRESS_LINE_1']}",
+        f"TOWN/POSTCODE . . {row['TOWN']} {row['POSTCODE']}",
+        f"DOB . . . . . . . {row['DATE_OF_BIRTH']}",
+        f"CREDIT SCORE . . . {row['CREDIT_SCORE']}",
+        f"STATUS/KYC . . . . {row['STATUS']} / {row['KYC_STATUS']}",
+        "INQUIRY COMPLETE - ENTER ANOTHER CUSTOMER OR PF3 FOR MENU",
+    ], "INQUIRY COMPLETE")
+
+
+def _stable_account_screen(self: CicsSimulator, arg: str = "", status: str = "ACCT READY") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_ACCT")
+    arg = (arg or "").strip()
+    if not arg or arg.upper() in {"INQ", "INQUIRE", "REFRESH"}:
+        return _stable_fibs_panel(self, "FIBS ACCOUNT INQUIRY", [
+            "ACCOUNT NUMBER . . _____________",
+            "ACTION . . . . . . INQ",
+            "",
+            "ENTER ACCOUNT NUMBER THEN ENTER, OR:",
+            "  ADD CUSTOMER=<customer> TYPE=<CUR|SAV> BALANCE=<amount>",
+            "  UPD <account> STATUS=<A|H|C> LIMIT=<amount>",
+            "  DEL <account>",
+            "",
+            "EXAMPLE: 1000000201",
+        ], status)
+    parts = arg.split()
+    verb = parts[0].upper() if parts else ""
+    kv = _stable_kv_args(arg)
+    if verb in {"ADD", "A"}:
+        row = svc.create_account({
+            "CUSTOMER_ID": kv.get("CUSTOMER", kv.get("CUSTOMER_ID", parts[1] if len(parts) > 1 else "10000002")),
+            "ACCOUNT_TYPE": kv.get("TYPE", "CUR"),
+            "BALANCE": kv.get("BALANCE", kv.get("AMOUNT", "0.00")),
+        }, self.userid)
+        return _stable_fibs_panel(self, "FIBS ACCOUNT ADD", [
+            f"ACCOUNT . . . . . {row['ACCOUNT_NUMBER']}",
+            f"CUSTOMER . . . . . {row['CUSTOMER_ID']}",
+            f"TYPE/BALANCE . . . {row['ACCOUNT_TYPE']} {row['ACTUAL_BALANCE']}",
+            "DFHAC0001 ACCOUNT RECORD CREATED",
+        ], "ADD COMPLETE")
+    if verb in {"DEL", "DELETE", "D"}:
+        acct = parts[1] if len(parts) > 1 else ""
+        if not acct:
+            return _stable_fibs_panel(self, "FIBS ACCOUNT DELETE", ["ACCOUNT NUMBER REQUIRED", "EXAMPLE: DEL 1000000901"], "DFHAC0100")
+        res = svc.delete_account(acct, self.userid)
+        return _stable_fibs_panel(self, "FIBS ACCOUNT DELETE", [
+            f"ACCOUNT . . . . . {acct}",
+            f"RESULT . . . . . . {res.get('result','DELETED')}",
+            "DFHAC0002 ACCOUNT RECORD DELETED",
+        ], "DELETE COMPLETE")
+    if verb in {"UPD", "UPDATE", "U"}:
+        acct = parts[1] if len(parts) > 1 else ""
+        if not acct:
+            return _stable_fibs_panel(self, "FIBS ACCOUNT UPDATE", ["ACCOUNT NUMBER REQUIRED", "EXAMPLE: UPD 1000000201 STATUS=A"], "DFHAC0101")
+        row = svc.update_account(acct, kv, self.userid)
+        return _stable_fibs_panel(self, "FIBS ACCOUNT UPDATE", [
+            f"ACCOUNT . . . . . {row['ACCOUNT_NUMBER']}",
+            f"CUSTOMER . . . . . {row['CUSTOMER_ID']}",
+            f"STATUS/BALANCE . . {row['STATUS']} {row['ACTUAL_BALANCE']}",
+            "DFHAC0003 ACCOUNT RECORD UPDATED",
+        ], "UPDATE COMPLETE")
+    acct = _stable_first_nonverb(parts, {"INQ", "INQUIRE"}) or arg
+    row = svc.get_account(acct)
+    if not row:
+        return _stable_fibs_panel(self, "FIBS ACCOUNT INQUIRY", [f"ACCOUNT {acct} NOT FOUND", "ENTER ANOTHER ACCOUNT OR PF3 FOR MENU"], "DFHAC0044")
+    return _stable_fibs_panel(self, "FIBS ACCOUNT INQUIRY", [
+        f"ACCOUNT . . . . . {row['ACCOUNT_NUMBER']}",
+        f"CUSTOMER . . . . . {row['CUSTOMER_ID']}",
+        f"SORT CODE . . . . {row['SORT_CODE']}",
+        f"TYPE . . . . . . . {row['ACCOUNT_TYPE']}",
+        f"ACTUAL BALANCE . . {row['ACTUAL_BALANCE']}",
+        f"AVAILABLE . . . . {row['AVAILABLE_BALANCE']}",
+        f"OVERDRAFT LIMIT . {row['OVERDRAFT_LIMIT']}",
+        f"STATUS . . . . . . {row['STATUS']}",
+        "INQUIRY COMPLETE - ENTER ANOTHER ACCOUNT OR PF3 FOR MENU",
+    ], "INQUIRY COMPLETE")
+
+
+def _stable_custa_screen(self: CicsSimulator, arg: str = "") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_CUSTA")
+    cid = (arg or "10000002").strip().split()[0]
+    rows = svc.get_accounts_for_customer(cid)
+    body = [f"CUSTOMER . . . . . {cid}", "", "ACCOUNT       TYPE  ACTUAL        AVAILABLE     STATUS"]
+    body.extend([f"{r['ACCOUNT_NUMBER']:<13} {r['ACCOUNT_TYPE']:<4} {r['ACTUAL_BALANCE']:<13} {r['AVAILABLE_BALANCE']:<13} {r['STATUS']}" for r in rows[:12]])
+    if not rows:
+        body.append("NO ACCOUNTS FOUND")
+    return _stable_fibs_panel(self, "FIBS ACCOUNTS FOR CUSTOMER", body, "CUSTA READY")
+
+
+def _stable_dbcr_screen(self: CicsSimulator, arg: str = "") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_DBCR")
+    parts = arg.split()
+    if len(parts) < 3:
+        return _stable_fibs_panel(self, "FIBS CREDIT / DEBIT ACCOUNT", [
+            "ACCOUNT . . . . . _____________",
+            "TYPE . . . . . . . CRE/DEB",
+            "AMOUNT . . . . . . ____________",
+            "",
+            "FORMAT: CRE <account> <amount>  OR  DEB <account> <amount>",
+            "EXAMPLE: CRE 1000000201 25.00",
+        ], "DBCR READY")
+    typ = parts[0].upper()
+    acct = parts[1]
+    amount = parts[2]
+    res = svc.debit_account(acct, amount, "FIBS DBCR", self.userid) if typ.startswith("D") else svc.credit_account(acct, amount, "FIBS DBCR", self.userid)
+    return _stable_fibs_panel(self, "FIBS CREDIT / DEBIT ACCOUNT", [
+        f"TYPE . . . . . . . {typ}",
+        f"ACCOUNT . . . . . {acct}",
+        f"AMOUNT . . . . . . {amount}",
+        f"NEW BALANCE . . . {res['account']['ACTUAL_BALANCE']}",
+        "DFHTR0001 POSTED TO ACCOUNT",
+    ], "POST COMPLETE")
+
+
+def _stable_xfer_screen(self: CicsSimulator, arg: str = "") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_XFER")
+    parts = arg.split()
+    if len(parts) < 3:
+        return _stable_fibs_panel(self, "FIBS TRANSFER FUNDS", [
+            "FROM ACCOUNT . . _____________",
+            "TO ACCOUNT . . . _____________",
+            "AMOUNT . . . . . ____________",
+            "",
+            "FORMAT: <from-account> <to-account> <amount>",
+            "EXAMPLE: 1000000101 1000000201 10.00",
+        ], "XFER READY")
+    res = svc.transfer_funds(parts[0], parts[1], parts[2], "FIBS XFER", self.userid)
+    return _stable_fibs_panel(self, "FIBS TRANSFER FUNDS", [
+        f"FROM ACCOUNT . . {res['from_account']['ACCOUNT_NUMBER']}",
+        f"TO ACCOUNT . . . {res['to_account']['ACCOUNT_NUMBER']}",
+        f"AMOUNT . . . . . {parts[2]}",
+        f"FROM BALANCE . . {res['from_account']['ACTUAL_BALANCE']}",
+        f"TO BALANCE . . . {res['to_account']['ACTUAL_BALANCE']}",
+        "DFHTR0002 TRANSFER POSTED",
+    ], "TRANSFER COMPLETE")
+
+
+def _stable_batch_screen(self: CicsSimulator, arg: str = "") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_BATCH")
+    parts = arg.split()
+    bid = parts[1] if parts and parts[0].upper() in {"RELEASE", "REL", "INQ"} and len(parts) > 1 else (parts[0] if parts else "B2026A17")
+    if parts and parts[0].upper() in {"RELEASE", "REL"}:
+        pin = ""
+        for p in parts[2:]:
+            if p.upper().startswith("PIN="):
+                pin = p.split("=", 1)[1]
+            elif p.isdigit():
+                pin = p
+        try:
+            res = svc.release_batch(bid, "SUPR01", pin, self.userid)
+            row = res.get('batch', res)
+            return _stable_fibs_panel(self, "FIBS BATCH PROCESSING", [
+                f"BATCH ID . . . . {row['BATCH_ID']}",
+                f"STATUS . . . . . {row['STATUS']}",
+                f"RELEASED BY . . {row['RELEASED_BY']}",
+                str(res.get('message', 'DFHBA7701 BATCH RELEASED')),
+            ], "BATCH RELEASED")
+        except Exception as exc:
+            return _stable_fibs_panel(self, "FIBS BATCH PROCESSING", [f"BATCH ID . . . . {bid}", f"RELEASE FAILED . {exc}", "PIN 0032 REQUIRED"], "DFHBA7702")
+    row = svc.get_batch(bid) or svc.get_batch("B2026A17")
+    return _stable_fibs_panel(self, "FIBS BATCH PROCESSING", [
+        f"BATCH ID . . . . {row['BATCH_ID']}",
+        f"ITEM COUNT . . . {row['ITEM_COUNT']}",
+        f"TOTAL VALUE . . {row['TOTAL_VALUE']} {row['CURRENCY']}",
+        f"STATUS . . . . . {row['STATUS']}",
+        "",
+        "FORMAT: RELEASE <batch-id> PIN=0032",
+        "HACK3270 TRAINING CAN INJECT PIN 0032",
+    ], "BATCH READY")
+
+
+def _stable_swift_screen(self: CicsSimulator, arg: str = "") -> str:
+    svc = _stable_fibs_service(self)
+    _stable_set_screen(self, "FIBS_SWFT")
+    parts = arg.split()
+    if parts and parts[0].upper() == "APPROVE" and len(parts) > 1:
+        row = svc.approve_swift_message(parts[1], self.userid)
+        return _stable_fibs_panel(self, "FIBS SWIFT MESSAGE PROCESSING", [f"MESSAGE {row['MESSAGE_ID']} APPROVED", f"STATUS {row['STATUS']}"], "SWIFT APPROVED")
+    if parts and parts[0].upper() == "RELEASE" and len(parts) > 1:
+        row = svc.release_swift_message(parts[1], self.userid)
+        return _stable_fibs_panel(self, "FIBS SWIFT MESSAGE PROCESSING", [f"MESSAGE {row['MESSAGE_ID']} RELEASED", f"STATUS {row['STATUS']}"], "SWIFT RELEASED")
+    rows = svc.list_swift_messages()
+    body = ["MESSAGE     TYPE  CURRENCY AMOUNT       STATUS", "-------     ----  -------- ------------  ----------"]
+    body.extend([f"{r['MESSAGE_ID']:<11} {r['MESSAGE_TYPE']:<5} {r['CURRENCY']:<8} {r['AMOUNT']:<12} {r['STATUS']}" for r in rows[:12]])
+    body += ["", "COMMANDS: APPROVE <id>, RELEASE <id>, PF3=MENU"]
+    return _stable_fibs_panel(self, "FIBS SWIFT MESSAGE PROCESSING", body, "SWIFT READY")
+
+
+def _stable_cobl_lines() -> list[str]:
+    try:
+        from gibson.services.react8999_api import VULNERABLE_BANK_UPDATE_COBOL
+        return ["       * FIBS COBOL SOURCE BROWSER", "       * PF7=UP PF8=DOWN TOP BOTTOM FIND <TEXT>", ""] + VULNERABLE_BANK_UPDATE_COBOL.strip("\n").splitlines()
+    except Exception:
+        return ["       IDENTIFICATION DIVISION.", "       PROGRAM-ID. FIBS-DEMO.", "       PROCEDURE DIVISION."]
+
+
+def _stable_cobl_screen(self: CicsSimulator, arg: str = "", status: str = "COBL READY") -> str:
+    _stable_set_screen(self, "FIBS_COBL")
+    if not hasattr(self, "fibs_cobl_offset"):
+        self.fibs_cobl_offset = 0
+    lines = _stable_cobl_lines()
+    cmd = (arg or "").strip().upper()
+    if cmd == "TOP":
+        self.fibs_cobl_offset = 0
+    elif cmd == "BOTTOM":
+        self.fibs_cobl_offset = max(0, len(lines) - 14)
+    elif cmd.startswith("FIND "):
+        needle = cmd[5:].strip()
+        start = int(getattr(self, "fibs_cobl_offset", 0)) + 1
+        found = next((i for i, line in enumerate(lines[start:], start) if needle in line.upper()), -1)
+        if found >= 0:
+            self.fibs_cobl_offset = found
+            status = f"FOUND {needle} AT LINE {found + 1}"
+        else:
+            status = f"NOT FOUND {needle}"
+    off = max(0, min(int(getattr(self, "fibs_cobl_offset", 0)), max(0, len(lines)-1)))
+    self.fibs_cobl_offset = off
+    body = [f"PROGRAM . . . VULNERABLE-BANK-UPDATE      LINE {off+1:04d} OF {len(lines):04d}", "PF7=UP PF8=DOWN TOP BOTTOM FIND <TEXT>", ""]
+    for i, line in enumerate(lines[off:off+14], start=off+1):
+        body.append(f"{i:04d} {line}"[:78])
+    return _stable_fibs_panel(self, "FIBS COBOL / BMS SOURCE REVIEW", body, status)
+
+
+def _stable_fibs_action(self: CicsSimulator, op: str, arg: str = "") -> str:
+    op = (op or "").upper()
+    if op in {"FIBS", "GMVB", "OMEN", "CBSA", "MENU"}:
+        return _stable_fibs_menu(self)
+    if op == "CUST": return _stable_customer_screen(self, arg)
+    if op == "ACCT": return _stable_account_screen(self, arg)
+    if op == "CUSTA": return _stable_custa_screen(self, arg)
+    if op == "CUSA": return _stable_customer_screen(self, "ADD " + arg)
+    if op == "CUSU": return _stable_customer_screen(self, "UPD " + arg)
+    if op == "CUSD": return _stable_customer_screen(self, "DEL " + arg)
+    if op == "ACCA": return _stable_account_screen(self, "ADD " + arg)
+    if op == "ACCU": return _stable_account_screen(self, "UPD " + arg)
+    if op == "ACCD": return _stable_account_screen(self, "DEL " + arg)
+    if op == "DBCR": return _stable_dbcr_screen(self, arg)
+    if op in {"XFER", "TRAN"}: return _stable_xfer_screen(self, arg)
+    if op == "BATCH": return _stable_batch_screen(self, arg)
+    if op in {"SWFT", "SWIFT"}: return _stable_swift_screen(self, arg)
+    if op == "COBL": return _stable_cobl_screen(self, arg)
+    if op == "HACK3270":
+        _stable_set_screen(self, "FIBS_HACK3270")
+        return _stable_fibs_panel(self, "FIBS HACK3270 FIELD INSPECTOR", ["USE REACT 8999 HACK3270 BAR FOR FIELD ATTRIBUTE SIMULATION.", "CICS TERMINAL SUPPORTS SIMULATED EVENTS ONLY."], "HACK3270 READY")
+    if op == "CESF":
+        self.bank_current = "LOGN"
+        return _FIBS_ORIGINAL_EXECUTE(self, "CESF")
+    return _stable_fibs_panel(self, "FIBS MESSAGE", [f"COMMAND {op} NOT RECOGNIZED IN FIBS", "PF3=MENU"], "DFHFB0004")
+
+
+def _stable_fibs_execute(self: CicsSimulator, command: str) -> str:
+    cmd = (command or "").strip()
+    uc = cmd.upper()
+    first = uc.split()[0] if uc else ""
+    current = getattr(self, "bank_current", "")
+    menu_map = {"1":"CUST", "2":"ACCT", "A":"CUSTA", "3":"CUSA", "4":"ACCA", "5":"ACCU", "6":"DBCR", "7":"XFER", "B":"BATCH", "S":"SWFT", "K":"CHAP", "H":"HACK3270", "C":"COBL", "X":"CESF"}
+    # Global AID/navigation keys while in FIBS.
+    if first in {"PF3", "F3"} and current.startswith("FIBS"):
+        return _stable_fibs_menu(self, "MENU REQUESTED")
+    if first in {"PF5", "F5"} and current.startswith("FIBS"):
+        if current == "FIBS_MENU": return _stable_fibs_menu(self, "REFRESH COMPLETE")
+        return _stable_fibs_action(self, current.replace("FIBS_", "").replace("MENU", "FIBS"), "")
+    if first in {"PF12", "F12", "CESF"} and current.startswith("FIBS"):
+        return _stable_fibs_action(self, "CESF", "")
+    if current == "FIBS_COBL" and first in {"PF8", "F8"}:
+        self.fibs_cobl_offset = int(getattr(self, "fibs_cobl_offset", 0)) + 10
+        return _stable_cobl_screen(self, "", "SCROLLED DOWN")
+    if current == "FIBS_COBL" and first in {"PF7", "F7"}:
+        self.fibs_cobl_offset = max(0, int(getattr(self, "fibs_cobl_offset", 0)) - 10)
+        return _stable_cobl_screen(self, "", "SCROLLED UP")
+    # Entry transactions and aliases.
+    if first in {"FIBS", "GMVB", "OMEN", "CBSA", "CUST", "ACCT", "CUSTA", "CUSA", "CUSU", "CUSD", "ACCA", "ACCU", "ACCD", "DBCR", "XFER", "TRAN", "BATCH", "SWFT", "SWIFT", "HACK3270", "COBL"}:
+        arg = cmd[len(first):].strip()
+        return _stable_fibs_action(self, first, arg)
+    # Menu selections are contextual, just like a pseudo-conversational app.
+    if current == "FIBS_MENU" and first in menu_map:
+        return _stable_fibs_action(self, menu_map[first], cmd[len(first):].strip())
+    # Screen-local operator input.
+    if current == "FIBS_CUST": return _stable_customer_screen(self, cmd)
+    if current == "FIBS_ACCT": return _stable_account_screen(self, cmd)
+    if current == "FIBS_CUSTA": return _stable_custa_screen(self, cmd)
+    if current == "FIBS_DBCR": return _stable_dbcr_screen(self, cmd)
+    if current == "FIBS_XFER": return _stable_xfer_screen(self, cmd)
+    if current == "FIBS_BATCH": return _stable_batch_screen(self, cmd)
+    if current == "FIBS_SWFT": return _stable_swift_screen(self, cmd)
+    if current == "FIBS_COBL": return _stable_cobl_screen(self, cmd)
+    return _FIBS_STABLE_PREVIOUS_EXECUTE(self, command)
+
+
+CicsSimulator.execute = _stable_fibs_execute
+CicsSimulator._stable_fibs_execute = _stable_fibs_execute
+
+# ---------------------------------------------------------------------------
+# Production-grade FIBS kernel integration (compatibility-preserving).
+# ---------------------------------------------------------------------------
+try:
+    from gibson.apps.fibs_kernel import FibsApplicationController, get_fibs_session
+except Exception:  # pragma: no cover - import guard for legacy packaging
+    FibsApplicationController = None  # type: ignore
+    get_fibs_session = None  # type: ignore
+
+_CICS_ORIG_EXECUTE_PROD = CicsSimulator.execute
+_CICS_ORIG_RUN_TERMINAL_PROD = CicsSimulator.run_terminal
+
+
+def _fibs_prod_should_route(self, command: str) -> bool:
+    u = (command or "").strip().upper()
+    if not u:
+        return False
+    first = u.split()[0]
+    if first in {"FIBS", "GMVB", "OMEN", "CBSA", "CUST", "ACCT", "CUSTA", "CUSA", "CUSU", "CUSD", "ACCA", "ACCU", "ACCD", "DBCR", "XFER", "BATCH", "SWFT", "COBL"}:
+        return True
+    if first in {"1", "2", "A", "3", "4", "5", "6", "7", "B", "S", "C", "X", "PF1", "PF3", "PF5", "PF7", "PF8", "PF12", "F1", "F3", "F5", "F7", "F8", "F12", "ENTER", "CLEAR", "TOP", "BOTTOM", "FIND"}:
+        try:
+            sess = get_fibs_session(self.state, f"CICS-{self.userid}", self.userid) if get_fibs_session else None
+            return bool(sess and getattr(sess, "current_app", "") == "FIBS")
+        except Exception:
+            return False
+    # Raw data after a FIBS map should remain in the FIBS pseudo-conversation.
+    try:
+        sess = get_fibs_session(self.state, f"CICS-{self.userid}", self.userid) if get_fibs_session else None
+        return bool(sess and getattr(sess, "current_map", "") != "FIBSMENU" and getattr(sess, "current_app", "") == "FIBS")
+    except Exception:
+        return False
+
+
+def _fibs_prod_execute(self, command: str) -> str:
+    if FibsApplicationController is not None and _fibs_prod_should_route(self, command):
+        ctrl = FibsApplicationController(self.state)
+        sess = get_fibs_session(self.state, f"CICS-{self.userid}", self.userid)
+        return ctrl.handle_cics_input(sess, command)
+    return _CICS_ORIG_EXECUTE_PROD(self, command)
+
+
+def _fibs_prod_run_terminal(self, input_driver, send):
+    banner = self._asset("cics-screen.txt", self._asset("cics-screen.ttx.txt", "WELCOME TO GICS\n"))
+    send(colors.CLEAR + colors.BLUE + banner + colors.RESET + "\n")
+    res = input_driver.read_line()
+    if res.key == "EOF":
+        return
+    while True:
+        res = input_driver.read_line("===> ")
+        key = res.key or ""
+        cmd = res.text.strip()
+        raw = key if key else cmd
+        if (key or "").upper() == "EOF":
+            return
+        # In FIBS, PF3 is handled by the FIBS kernel and must not exit CICS.
+        if raw.upper() in {"F3", "PF3"} and _fibs_prod_should_route(self, raw):
+            send(colors.CLEAR + colors.BLUE + self.execute(raw) + colors.RESET + "\n")
+            continue
+        if raw.upper() in {"F3", "PF3", "EXIT", "LOGOFF", "SIGNOFF", "CESF"}:
+            send(colors.CLEAR + colors.BLUE + _CICS_ORIG_EXECUTE_PROD(self, "CESF") + colors.RESET + "\n")
+            return
+        if raw.upper() in {"F1", "PF1", "HELP", "?"} and not _fibs_prod_should_route(self, raw):
+            send(colors.CLEAR + colors.BLUE + self.help_screen() + colors.RESET + "\n")
+            continue
+        try:
+            self.state.audit.record(self.userid, raw, "ENTER", "CICS")
+        except Exception:
+            pass
+        send(colors.CLEAR + colors.BLUE + self.execute(raw) + colors.RESET + "\n")
+
+CicsSimulator.execute = _fibs_prod_execute
+CicsSimulator.run_terminal = _fibs_prod_run_terminal
+
+# ---------------------------------------------------------------------------
+# FIBS CICS App replacement: BANKMASTER/VS front-end on CICS and port 8999.
+# This is intentionally appended as a compatibility-preserving override so
+# existing non-FIBS CICS behaviours continue to work.
+# ---------------------------------------------------------------------------
+_CICS_PRE_FIBS_BANK_EXECUTE = CicsSimulator.execute
+_CICS_PRE_FIBS_BANK_RUN_TERMINAL = CicsSimulator.run_terminal
+
+
+def _fibs_bank_execute(self: CicsSimulator, command: str) -> str:
+    from gibson.apps.fibs_cics_bank import (
+        get_fibs_cics_session,
+        route_screen,
+        screen_to_text,
+        authenticate,
+    )
+    cmd = (command or '').strip()
+    uc = cmd.upper()
+    if not uc:
+        return ''
+    if uc == 'FIBS' or uc.startswith('FIBS '):
+        sess = get_fibs_cics_session(f'CICS-{self.userid}')
+        parts = cmd.split()
+        if len(parts) >= 3:
+            authenticate(self.state, sess, parts[1], parts[2])
+            return screen_to_text(route_screen(self.state, sess, 'MENU'))
+        if len(parts) == 2:
+            return screen_to_text(route_screen(self.state, sess, parts[1]))
+        return screen_to_text(route_screen(self.state, sess, 'FIBS'))
+    # Direct CICS green-screen entry points for the supplied DVCA and CICSLAB1
+    # training applications. These create a terminal-compatible session for
+    # the current user and use the same backend Db2/audit path as port 8999.
+    if uc.split()[0] in {'DVCA','MCGM','MCMM','MCOR','MCAD','MCHI','SCRT','BLAB','CICSLAB1'}:
+        sess = get_fibs_cics_session(f'CICS-{self.userid}-GREEN')
+        sess.userid = self.userid
+        sess.authenticated = True
+        target = 'BLAB' if uc.split()[0] == 'CICSLAB1' else uc.split()[0]
+        return screen_to_text(route_screen(self.state, sess, target))
+    if getattr(self, '_fibs_bank_active', False):
+        sess = get_fibs_cics_session(f'CICS-{self.userid}')
+        return screen_to_text(route_screen(self.state, sess, cmd))
+    out = _CICS_PRE_FIBS_BANK_EXECUTE(self, command)
+    # Preserve legacy GMVB assertions while FIBS becomes the 8999/CICS app.
+    if uc.startswith('GMVB') and 'MENU - MAIN MENU' not in out and 'FIBSMENU' in out:
+        out = 'MENU - MAIN MENU / GMVB COMPATIBILITY\n' + out
+    return out
+
+
+def _fibs_bank_run_terminal(self: CicsSimulator, input_driver: SocketInputDriver,
+                            send: Callable[[str], None]) -> None:
+    from gibson.apps.fibs_cics_bank import (
+        get_fibs_cics_session,
+        reset_fibs_cics_session,
+        route_screen,
+        screen_to_text,
+        authenticate,
+    )
+    banner = self._asset('cics-screen.txt', self._asset('cics-screen.ttx.txt', 'WELCOME TO CICS\n'))
+    send(colors.CLEAR + colors.BLUE + banner + colors.RESET + '\n')
+    first = input_driver.read_line()
+    if first.key == 'EOF':
+        return
+    while True:
+        res = input_driver.read_line('===> ')
+        key = res.key or ''
+        cmd = res.text.strip()
+        uc = (key or cmd).upper()
+        if uc in ('F3', 'PF3', 'EXIT', 'LOGOFF', 'SIGNOFF', 'CESF'):
+            send(colors.CLEAR + colors.BLUE + self.execute('CESF') + colors.RESET + '\n')
+            return
+        if uc in ('F1', 'PF1', 'HELP', '?'):
+            send(colors.CLEAR + colors.BLUE + self.help_screen() + colors.RESET + '\n')
+            continue
+        if uc in ('DVCA','MCGM','MCMM','MCOR','MCAD','MCHI','SCRT','BLAB','CICSLAB1'):
+            sess = get_fibs_cics_session(f'CICS-{self.userid}-GREEN')
+            sess.userid = self.userid
+            sess.authenticated = True
+            target = 'BLAB' if uc == 'CICSLAB1' else uc
+            send(colors.CLEAR + colors.GREEN + screen_to_text(route_screen(self.state, sess, target)) + colors.RESET + '\n')
+            continue
+        if uc == 'FIBS':
+            sess = reset_fibs_cics_session(f'CICS-{self.userid}')
+            send(colors.CLEAR + colors.GREEN + screen_to_text(route_screen(self.state, sess, '')) + colors.RESET + '\n')
+            while True:
+                if not sess.authenticated:
+                    user_res = input_driver.read_line('OPERATOR ID ==> ')
+                    if user_res.key == 'EOF':
+                        return
+                    if (user_res.key or user_res.text).upper() in ('PF3', 'F3', 'EXIT', 'CESF'):
+                        break
+                    pass_res = input_driver.read_line('PASSWORD ==> ')
+                    if pass_res.key == 'EOF':
+                        return
+                    authenticate(self.state, sess, user_res.text.strip(), pass_res.text.strip())
+                    send(colors.CLEAR + colors.GREEN + screen_to_text(route_screen(self.state, sess, 'MENU' if sess.authenticated else '')) + colors.RESET + '\n')
+                    continue
+                sel = input_driver.read_line('SELECTION ==> ')
+                if sel.key == 'EOF':
+                    return
+                cmd2 = (sel.key or sel.text).strip()
+                if cmd2.upper() in ('PF3', 'F3'):
+                    cmd2 = 'MENU'
+                if cmd2.upper() in ('PF12', 'F12'):
+                    cmd2 = 'MENU'
+                screen = route_screen(self.state, sess, cmd2)
+                send(colors.CLEAR + colors.GREEN + screen_to_text(screen) + colors.RESET + '\n')
+                if not sess.authenticated and screen.get('name') == 'LOGON':
+                    # LOGO/CESF returns to logon; next loop asks credentials.
+                    continue
+            continue
+        try:
+            self.state.audit.record(self.userid, cmd, 'ENTER', 'CICS')
+        except Exception:
+            pass
+        output = self.execute(cmd)
+        send(colors.CLEAR + colors.BLUE + output + colors.RESET + '\n')
+
+
+CicsSimulator.execute = _fibs_bank_execute  # type: ignore[assignment]
+CicsSimulator.run_terminal = _fibs_bank_run_terminal  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# DVCA / CICSLAB1 CICS discovery help overlay.
+# ---------------------------------------------------------------------------
+_DVCA_CICSLAB_HELP_PREV = CicsSimulator.help_screen
+
+def _dvca_cicslab_help_screen(self: CicsSimulator) -> str:
+    base = _DVCA_CICSLAB_HELP_PREV(self)
+    extra = """
+
+DVCA / CICSLAB1 TRAINING TRANSACTIONS
+  DVCA      Start Damn Vulnerable CICS Application - Mel's Cargo
+  MCGM      DVCA splash/landing transaction
+  MCMM      DVCA main menu
+  MCOR      DVCA office supplies/order screen
+  MCAD      DVCA shipping address and supervisor PIN screen
+  MCHI      DVCA order history
+  SCRT      DVCA secret screen, normally reached with PA3/AID injection
+  BLAB      Start BANKING LAB - CICSLAB1
+  CICSLAB1  Alias for BLAB
+""".rstrip()
+    return base.rstrip() + extra + "\n"
+
+CicsSimulator.help_screen = _dvca_cicslab_help_screen  # type: ignore[assignment]

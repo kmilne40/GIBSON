@@ -1,0 +1,6 @@
+# s3270 sensitive dataset transfer validation for Gibson
+Connect(127.0.0.1:2023)
+String("IND$FILE GET DSN(SYS1.RACFDS) LOCAL(racfds.txt) MODE(ASCII) EXIST(REPLACE)")
+Enter
+Wait(Output)
+Disconnect

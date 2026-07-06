@@ -1,0 +1,385 @@
+import React from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AlertTriangle, Code, BookOpen, Shield, Play, ExternalLink } from "lucide-react";
+import { motion } from "framer-motion";
+import { Link } from "react-router-dom";
+import { createPageUrl } from "@/utils";
+
+const CobolCodeViewer = () => {
+    const code = `       IDENTIFICATION DIVISION.
+       PROGRAM-ID. VULNERABLE-BANK-UPDATE.
+       AUTHOR. SECURITY-TRAINER.
+       REMARKS. THIS PROGRAM CONTAINS INTENTIONAL VULNERABILITIES FOR TRAINING.
+
+      *===============================================================*
+      *                MULTIPLE INTENTIONAL VULNERABILITIES            *
+      *===============================================================*
+
+       ENVIRONMENT DIVISION.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+
+      *=================== UNSAFE DATA STRUCTURES ====================*
+      * Vulnerability 1: Buffer overflow potential due to mismatched sizes
+       01  INPUT-DATA.
+           05  USER-INPUT               PIC X(100).  *> Large input buffer
+           05  FILLER REDEFINES USER-INPUT.
+               10  CUSTOMER-ID         PIC X(10).
+               10  ACCOUNT-TYPE        PIC X(2).
+               10  TRANSACTION-AMOUNT  PIC X(12).
+
+      * Vulnerability 2: Sensitive data adjacent to overflowable buffers
+       01  SECURITY-CONTROL-FLAGS.
+           05  AUTHENTICATED-FLAG      PIC X VALUE 'N'.
+           05  ADMIN-FLAG              PIC X VALUE 'N'.
+           05  DEBUG-FLAG              PIC X VALUE 'N'.
+
+      * Vulnerability 3: Fixed-size buffer for variable-length data
+       01  CUSTOMER-RECORD.
+           05  CUST-NAME               PIC X(30).
+           05  CUST-ADDRESS            PIC X(50).
+           05  CUST-BALANCE            PIC S9(9)V99 COMP-3.
+           05  CUST-PIN                PIC X(4).  *> Easily overflowable
+
+      * Vulnerability 4: Uninitialized sensitive data
+       01  TEMP-STORAGE.
+           05  SENSITIVE-TEMP          PIC X(100).
+           05  LOG-BUFFER              PIC X(256).
+
+      * Vulnerability 5: Format string in message buffer
+       01  MESSAGE-AREA.
+           05  MSG-TEXT                PIC X(100).
+           05  MSG-SEVERITY            PIC X(1).
+
+       LINKAGE SECTION.
+      * Vulnerability 6: Exposed system control area
+       01  DFHCOMMAREA.
+           05  SYSTEM-CONTROL          PIC X(50).
+
+       PROCEDURE DIVISION.
+
+      *=================== VULNERABLE CODE SECTIONS ==================*
+      * Vulnerability 15: Unsafe CICS channel communication
+       500-GET-CHANNEL-DATA.
+           EXEC CICS GET CONTAINER('USERDATA')
+                         CHANNEL('BANKCHAN')
+                         INTO(USER-INPUT)
+                         FLENGTH(USER-INPUT-LENGTH) *> No MAXFLENGTH!
+                         RESP(RESPONSE-CODE)
+           END-EXEC.
+           
+           IF RESPONSE-CODE = DFHRESP(NORMAL)
+               MOVE USER-INPUT TO CUSTOMER-RECORD. *> Potential overflow
+           END-IF.
+           
+      * Vulnerability 7: Unsafe input handling with no length validation
+       100-GET-INPUT.
+           EXEC CICS RECEIVE MAP('BANKMAP') INTO(USER-INPUT) END-EXEC.
+
+      * Vulnerability 8: Direct move with potential overflow
+           MOVE USER-INPUT TO CUSTOMER-RECORD.
+
+      * Vulnerability 9: Format string vulnerability in message
+           STRING 'Tx for: ' CUST-NAME ' Amt: ' TRANSACTION-AMOUNT INTO MSG-TEXT.
+
+      * Vulnerability 10: Authentication bypass via buffer overflow
+           IF CUST-PIN = '9999' OR AUTHENTICATED-FLAG = 'Y'
+               PERFORM 200-PROCESS-TRANSACTION
+           ELSE
+               PERFORM 800-SEND-ERROR
+           END-IF.
+
+      * Vulnerability 11: Debug backdoor via overflow
+           IF DEBUG-FLAG = 'Y'
+               PERFORM 700-DEBG-DUMP
+           END-IF.
+
+       200-PROCESS-TRANSACTION.
+      * Vulnerability 12: Unsafe numeric conversion
+           COMPUTE CUST-BALANCE = FUNCTION NUMVAL(TRANSACTION-AMOUNT).
+      * Vulnerability 13: Logging sensitive data without sanitization
+           MOVE CUSTOMER-RECORD TO LOG-BUFFER.
+           EXEC CICS SEND MAP('BANKMAP') FROM(MESSAGE-AREA) END-EXEC.
+
+       700-DEBG-DUMP.
+      * Vulnerability 14: Exposing memory contents
+           DISPLAY 'DEBUG DUMP: ' TEMP-STORAGE.
+
+       800-SEND-ERROR.
+           MOVE 'AUTHENTICATION FAILED' TO MSG-TEXT.
+           EXEC CICS SEND MAP('BANKMAP') FROM(MESSAGE-AREA) END-EXEC.
+`;
+
+    return (
+        <Card className="bg-gray-900 font-mono text-sm text-white h-full">
+            <CardHeader>
+                <CardTitle className="text-lg flex items-center gap-2"><Code /> VULNERABLE-BANK-UPDATE.COBOL</CardTitle>
+            </CardHeader>
+            <CardContent className="overflow-auto h-[calc(100vh-20rem)]">
+                <pre><code>{code}</code></pre>
+            </CardContent>
+        </Card>
+    );
+};
+
+const LabGuide = () => {
+    const htmlContent = `
+        <h1>COBOL-CICS Security Training Lab</h1>
+        <p><em>Identifying and exploiting vulnerabilities in legacy COBOL-CICS systems</em></p>
+
+        <h2>Lab Overview</h2>
+        <p>This lab demonstrates multiple security vulnerabilities in a COBOL-CICS banking application. You can practice these attacks in the <strong>CICS Banking Lab</strong> with hack3270 Mode enabled.</p>
+
+        <div class="lab-link">
+            <h3>🎯 Practice Environment</h3>
+            <p>Test these vulnerabilities in the live CICS Banking Lab:</p>
+            <p><strong>1.</strong> Navigate to <strong>Mainframe → CICS Banking Lab</strong></p>
+            <p><strong>2.</strong> Enable <strong>hack3270 Mode</strong> (toggle switch)</p>
+            <p><strong>3.</strong> Login with <strong>ADMIN/PASS</strong> or <strong>USER/PASS</strong></p>
+            <p><strong>4.</strong> Try the exploits below!</p>
+        </div>
+
+        <h2>Hands-On Exploit Examples</h2>
+
+        <div class="vulnerability">
+            <h3>1. Authentication Bypass via Buffer Overflow</h3>
+            <p><strong>Target:</strong> Customer Management → Add New Customer</p>
+            <p><strong>Vulnerable Field:</strong> Customer Name (appears to have a 30-char limit)</p>
+            <div class="exploit">
+                <strong>Attack Steps:</strong>
+                <ol>
+                    <li>Navigate to <strong>1. Customer Management → 2. Add New Customer</strong></li>
+                    <li>In the Customer Name field, enter:</li>
+                    <pre>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY</pre>
+                    <li>Fill other required fields normally</li>
+                    <li>Enter Auth Code: <strong>XXXX</strong> (wrong code)</li>
+                    <li>Submit - the 'Y' should overflow into the admin flag</li>
+                </ol>
+                <p><strong>Expected Result:</strong> Admin privileges granted despite wrong auth code</p>
+            </div>
+        </div>
+
+        <div class="vulnerability">
+            <h3>2. Protected Field Tampering</h3>
+            <p><strong>Target:</strong> Transaction → Transfer Funds</p>
+            <p><strong>Vulnerability:</strong> Currency and Auth Code fields become editable in hack3270 mode</p>
+            <div class="exploit">
+                <strong>Attack Steps:</strong>
+                <ol>
+                    <li>Navigate to <strong>3. Transactions → 3. Transfer Funds</strong></li>
+                    <li>With hack3270 mode ON, notice the currency field is now editable</li>
+                    <li>Change currency from "USD" to "BTC" or any other value</li>
+                    <li>Set Auth Code to visible (shows the actual code: 7681)</li>
+                    <li>Process a transfer with manipulated currency</li>
+                </ol>
+                <p><strong>Expected Result:</strong> Transfer processed with tampered currency field</p>
+            </div>
+        </div>
+
+        <div class="vulnerability">
+            <h3>3. Hidden Field Privilege Escalation</h3>
+            <p><strong>Target:</strong> Customer Management screen</p>
+            <p><strong>Vulnerability:</strong> Hidden admin flag visible in hack3270 mode</p>
+            <div class="exploit">
+                <strong>Attack Steps:</strong>
+                <ol>
+                    <li>Navigate to <strong>1. Customer Management</strong></li>
+                    <li>With hack3270 mode enabled, observe the yellow text: <code>isAdmin = N</code></li>
+                    <li>Use the hack control panel: click <strong>"Flip 'isAdmin' Flag"</strong></li>
+                    <li>Watch the flag change to <code>Y</code> on screen</li>
+                    <li>Now you have elevated privileges throughout the application</li>
+                </ol>
+                <p><strong>Expected Result:</strong> Admin-only functions become accessible</p>
+            </div>
+        </div>
+
+        <div class="vulnerability">
+            <h3>4. Memory Corruption via Buffer Overflow</h3>
+            <p><strong>Target:</strong> Account Management → Modify Account</p>
+            <p><strong>Vulnerability:</strong> Sort Code field overflow causes system abend</p>
+            <div class="exploit">
+                <strong>Attack Steps:</strong>
+                <ol>
+                    <li>Navigate to <strong>2. Account Management → 3. Modify Account Details</strong></li>
+                    <li>In the Sort Code field, enter exactly 9 characters:</li>
+                    <pre>123456789</pre>
+                    <li>Enter any Auth Code and submit</li>
+                    <li><strong>OR</strong> for system crash, enter more than 9 characters:</li>
+                    <pre>1234567890ABCDEF</pre>
+                </ol>
+                <p><strong>Expected Result:</strong> 9 chars = Auth bypass; >9 chars = ASRA S0C4 Abend (system crash)</p>
+            </div>
+        </div>
+
+        <h2>Advanced Techniques</h2>
+
+        <div class="vulnerability">
+            <h3>5. AID Key Brute Force</h3>
+            <p><strong>Target:</strong> Any CICS screen</p>
+            <div class="exploit">
+                <strong>Attack Steps:</strong>
+                <ol>
+                    <li>Enable hack3270 mode</li>
+                    <li>In the hack control panel, click <strong>"Send All AID Keys"</strong></li>
+                    <li>Wait for the brute force to complete</li>
+                    <li>A hidden screen should be discovered on PF24</li>
+                </ol>
+                <p><strong>Expected Result:</strong> Access to secret admin/debug screen with COBOL source code</p>
+            </div>
+        </div>
+
+        <h2>Lab Exercises</h2>
+        <ol>
+            <li><strong>Buffer Overflow Discovery:</strong> Find all input fields that accept more data than they should</li>
+            <li><strong>Authentication Bypass:</strong> Successfully bypass auth checks using overflow techniques</li>
+            <li><strong>Privilege Escalation:</strong> Gain admin access from a regular user account</li>
+            <li><strong>System Crash:</strong> Trigger an ASRA abend through memory corruption</li>
+            <li><strong>Hidden Function Access:</strong> Discover and access the secret debug menu</li>
+            <li><strong>Data Manipulation:</strong> Modify protected fields like currency and auth codes</li>
+        </ol>
+
+        <div class="danger">
+            <p><strong>⚠️ Important:</strong> These vulnerabilities are for educational purposes only. The CICS Banking Lab is a safe, simulated environment. Never attempt these attacks on production systems.</p>
+        </div>
+    `;
+
+    const mitigationContent = `
+        <h2>Mitigation Strategies</h2>
+        <p>After successfully exploiting the vulnerabilities, learn how to fix them:</p>
+
+        <div class="fix">
+            <h3>1. Input Validation</h3>
+            <p><strong>Problem:</strong> No length checking on user input</p>
+            <pre>
+            IF FUNCTION LENGTH(FUNCTION TRIM(USER-INPUT)) > 100
+                MOVE 'INPUT TOO LONG' TO MSG-TEXT
+                PERFORM 800-SEND-ERROR
+            END-IF</pre>
+        </div>
+
+        <div class="fix">
+            <h3>2. Safe CICS Channel Handling</h3>
+            <p><strong>Problem:</strong> Missing MAXFLENGTH parameter</p>
+            <pre>
+            EXEC CICS GET CONTAINER('USERDATA')
+                         CHANNEL('BANKCHAN')
+                         INTO(SAFE-BUFFER)
+                         MAXFLENGTH(LENGTH OF SAFE-BUFFER)
+                         RESP(RESPONSE-CODE)
+            END-EXEC</pre>
+        </div>
+
+        <div class="fix">
+            <h3>3. Data Structure Rearrangement</h3>
+            <p><strong>Problem:</strong> Critical flags adjacent to overflowable buffers</p>
+            <pre>
+            01  SECURITY-CONTROL-FLAGS.
+                05  AUTHENTICATED-FLAG      PIC X VALUE 'N'.
+                05  ADMIN-FLAG              PIC X VALUE 'N'.
+                05  DEBUG-FLAG              PIC X VALUE 'N'.
+            
+            01  USER-INPUT                 PIC X(100). *<-- Moved after security flags</pre>
+        </div>
+
+        <div class="fix">
+            <h3>4. Server-Side Validation</h3>
+            <p><strong>Problem:</strong> Trusting client-side controls</p>
+            <ul>
+                <li>Always re-validate user permissions on the server</li>
+                <li>Never trust hidden field values from forms</li>
+                <li>Implement proper session management</li>
+                <li>Use strong authentication tokens</li>
+                <li>Use strong authentication tokens</li>
+            </ul>
+        </div>
+
+        <div class="fix">
+            <h3>5. Secure Coding Practices</h3>
+            <ul>
+                <li><strong>Compile with SSRANGE:</strong> Enable runtime bounds checking</li>
+                <li><strong>Use INSPECT:</strong> Validate input characters and length</li>
+                <li><strong>Separate buffers:</strong> Keep sensitive data away from input buffers</li>
+                <li><strong>Sanitize output:</strong> Don't expose internal system information</li>
+            </ul>
+        </div>
+    `;
+
+    return (
+        <Card className="h-full">
+             <style>{`
+                .guide-content h1, .guide-content h2, .guide-content h3 { color: #2c3e50; }
+                .guide-content .vulnerability { background-color: #f8f9fa; border-left: 4px solid #e74c3c; padding: 15px; margin: 15px 0; border-radius: 4px; }
+                .guide-content .exploit { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px 15px; margin: 10px 0; font-family: monospace; border-radius: 4px; }
+                .guide-content .fix { background-color: #e8f5e9; border-left: 4px solid #4caf50; padding: 15px; margin: 15px 0; border-radius: 4px; }
+                .guide-content .lab-link { background-color: #e3f2fd; border-left: 4px solid #2196f3; padding: 15px; margin: 15px 0; border-radius: 4px; }
+                .guide-content pre { background-color: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 0.9em; }
+                .guide-content .danger { color: #e74c3c; font-weight: bold; background-color: #ffebee; padding: 10px; border-radius: 4px; border-left: 4px solid #e74c3c; }
+                .guide-content ul, .guide-content ol { padding-left: 20px; }
+                .guide-content code { background-color: #f1f1f1; padding: 2px 4px; border-radius: 3px; font-family: monospace; }
+            `}</style>
+            <Tabs defaultValue="guide" className="h-full flex flex-col">
+                <TabsList className="m-4">
+                    <TabsTrigger value="guide">Exploit Guide</TabsTrigger>
+                    <TabsTrigger value="mitigation">Mitigation</TabsTrigger>
+                </TabsList>
+                <TabsContent value="guide" className="overflow-auto px-4 h-[calc(100vh-22rem)]">
+                    <div className="guide-content" dangerouslySetInnerHTML={{ __html: htmlContent }} />
+                    <div className="mt-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
+                        <Link to={createPageUrl("BankingLab")}>
+                            <Button className="w-full bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2">
+                                <Play className="w-4 h-4" />
+                                Launch CICS Banking Lab
+                                <ExternalLink className="w-4 h-4" />
+                            </Button>
+                        </Link>
+                    </div>
+                </TabsContent>
+                <TabsContent value="mitigation" className="overflow-auto px-4 h-[calc(100vh-22rem)]">
+                     <div className="guide-content" dangerouslySetInnerHTML={{ __html: mitigationContent }} />
+                </TabsContent>
+            </Tabs>
+        </Card>
+    );
+};
+
+export default function BufferOverflowLab() {
+    return (
+        <div className="min-h-screen bg-slate-100 p-6">
+            <div className="max-w-7xl mx-auto">
+                <motion.div 
+                  initial={{ opacity: 0, y: -20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mb-6"
+                >
+                    <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 bg-gradient-to-br from-red-600 to-red-800 rounded-xl flex items-center justify-center shadow-lg">
+                            <AlertTriangle className="w-7 h-7 text-white" />
+                        </div>
+                        <div>
+                            <h1 className="text-3xl font-bold text-slate-900">Advanced Buffer Overflow Lab</h1>
+                            <p className="text-slate-600 mt-1">Analyzing and Exploiting Memory Corruption in COBOL/CICS</p>
+                        </div>
+                    </div>
+                     <div className="mt-4 flex gap-2">
+                        <Badge variant="destructive">Offensive Security</Badge>
+                        <Badge className="bg-purple-100 text-purple-800">CICS</Badge>
+                        <Badge className="bg-blue-100 text-blue-800">COBOL</Badge>
+                        <Badge className="bg-green-100 text-green-800">Hands-On Lab</Badge>
+                    </div>
+                </motion.div>
+
+                <div className="grid lg:grid-cols-2 gap-6">
+                    <motion.div initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
+                        <CobolCodeViewer />
+                    </motion.div>
+                    <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }}>
+                        <LabGuide />
+                    </motion.div>
+                </div>
+            </div>
+        </div>
+    );
+}

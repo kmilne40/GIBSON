@@ -1,0 +1,1 @@
+TSO RSS uses the common CTI/RSS backend. RSS and CTI-RSS fetch live feeds by default, cache results in FIBS.CTI.RSS.CACHE, display the latest five stories per feed, and can open selected story links through the Gibson Lynx renderer.

@@ -1,0 +1,54 @@
+services:
+  gibson:
+    build: .
+    container_name: gibson-mainframe
+    restart: unless-stopped
+    ports:
+      - "8088:80"        # Welcome site  (host 8088 avoids needing root for port 80)
+      - "2022:2022"      # USS shell
+      - "2023:2023"      # TSO / VTAM telnet
+      - "3270:3270"      # TN3270 dedicated listener
+      - "2111:2111"      # FTP
+      - "8023:8023"      # Browser terminal
+      - "8080:8080"      # CBSA / DVCA REST API
+      - "8443:8443"      # Dashboard (HTTPS)
+      - "9080:9080"      # FIBS Bank web
+      - "50000:50000"    # DB2 DAS
+      - "50001:50001"    # DB2 WebSocket
+    networks:
+      - gibson-net
+
+    volumes:
+      - gibson-data:/mfsim
+    environment:
+      GIBSON_SIM_ROOT: /mfsim
+      GIBSON_HOST: "0.0.0.0"
+      # Ports — change here and in the ports section above together
+      GIBSON_PORT: "2023"
+      GIBSON_TN3270_PORT: "3270"
+      GIBSON_USS_PORT: "2022"
+      GIBSON_FTP_PORT: "2111"
+      GIBSON_DASHBOARD_PORT: "8443"
+      GIBSON_WEB_TERMINAL_PORT: "8023"
+      GIBSON_CBSA_API_PORT: "8080"
+      GIBSON_FIBS_WEB_PORT: "9080"
+      GIBSON_WELCOME_PORT: "80"
+      GIBSON_DB2_TCP_PORT: "50000"
+      GIBSON_DB2_WS_PORT: "50001"
+      # Feature flags
+      GIBSON_WITH_WEB_TERMINAL: "1"
+      GIBSON_WELCOME_ENABLED: "1"
+      GIBSON_WITH_FIBS_WEB: "1"
+      GIBSON_CBSA_VULN: "1"
+      GIBSON_DVCA_VULN: "1"
+      GIBSON_WITH_DVCA_WEB: "1"
+      GIBSON_SECURITY_MODE: "vuln"
+      GIBSON_SYSTEM_HOSTNAME: "GIBSON"
+
+networks:
+  gibson-net:
+    driver: bridge
+    name: gibson-net
+
+volumes:
+  gibson-data:

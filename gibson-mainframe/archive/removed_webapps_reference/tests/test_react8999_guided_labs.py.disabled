@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "gibson" / "web8999" / "src" / "data"
+SRC = ROOT / "gibson" / "web8999" / "src"
+
+
+def _load_exported_array(path: Path, name: str):
+    text = path.read_text()
+    m = re.search(rf"export const {name} = (\[.*?\]);\s*export default", text, re.S)
+    assert m, f"could not parse {name} from {path}"
+    return json.loads(m.group(1))
+
+
+def test_guided_lab_definitions_are_complete():
+    labs = _load_exported_array(DATA / "labDefinitions.js", "labDefinitions")
+    assert len(labs) >= 16
+    required = {
+        "id", "title", "summary", "category", "subsystem", "difficulty",
+        "estimatedMinutes", "status", "recommendedOrder", "vulnerabilityTypes",
+        "learningObjectives", "story", "launch", "backendRoutes", "cicsTransactions",
+        "db2Tables", "cobolPrograms", "steps", "hints", "evidenceChecklist",
+        "successCriteria", "remediation", "debriefQuestions", "badges", "safetyNotes",
+    }
+    ids = set()
+    for lab in labs:
+        missing = required - set(lab)
+        assert not missing, f"{lab.get('id')} missing {missing}"
+        assert lab["id"] not in ids
+        ids.add(lab["id"])
+        assert lab["learningObjectives"]
+        assert lab["steps"]
+        assert lab["evidenceChecklist"]
+        assert lab["remediation"]
+        assert lab["safetyNotes"]
+
+
+def test_sql_injection_lab_is_guided_and_safe():
+    labs = _load_exported_array(DATA / "labDefinitions.js", "labDefinitions")
+    lab = next(l for l in labs if l["id"] == "sqli-db2-customer-search")
+    text = json.dumps(lab).lower()
+    assert "cwe-89" in text
+    assert "'1'='1" in text
+    assert "parameter" in text or "host variables" in text
+    assert "simulator-only" in text
+    assert any("payload" in x.lower() for x in lab["evidenceChecklist"])
+
+
+def test_hack3270_labs_include_training_safety_notes():
+    labs = _load_exported_array(DATA / "labDefinitions.js", "labDefinitions")
+    hack_labs = [l for l in labs if "hack3270" in l["id"] or "3270" in json.dumps(l).lower()]
+    assert len(hack_labs) >= 4
+    for lab in hack_labs:
+        assert lab["safetyNotes"]
+        assert "simulator" in json.dumps(lab["safetyNotes"]).lower() or "synthetic" in json.dumps(lab["safetyNotes"]).lower()
+
+
+def test_badges_and_static_app_have_no_base44_dependency():
+    badges = _load_exported_array(DATA / "badgeDefinitions.js", "badgeDefinitions")
+    assert len(badges) >= 10
+    badge_ids = {b["badge_id"] for b in badges}
+    assert "db2-sqli-analyst" in badge_ids
+    assert "hack3270-analyst" in badge_ids
+    combined = "\n".join(p.read_text() for p in (SRC).rglob("*.js"))
+    assert "base44" not in combined.lower()
+    assert "@/entities" not in combined
+
+
+def test_ui8999_lab_metadata_routes_are_additive():
+    state = GibsonState.create()
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/labs")
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["data"]["count"] >= 16
+    status, payload = handle_ui8999(state, "/api/v1/ui8999/labs/sqli-db2-customer-search")
+    assert status == 200
+    assert payload["data"]["id"] == "sqli-db2-customer-search"
+
+
+def test_static_app_contains_guided_lab_capabilities():
+    app = (SRC / "static-app.js").read_text()
+    assert "Guided Lab Browser" in app
+    assert "Evidence checklist" in app
+    assert "Export progress JSON" in app
+    assert "Run SQL" in app
+    assert "Reveal Hidden Fields" in app

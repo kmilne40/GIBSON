@@ -1,0 +1,16 @@
+# Optional Gibson c3270 keymap fallback
+# Server-side v23 AID/PF recognition should work without this when c3270 sends
+# usable 3270 AID frames. Use this only if your local terminal or c3270 build
+# does not pass PF keys through as expected.
+#
+# Add to ~/.c3270pro and start with: c3270 -keymap gibson HOST:2023
+# Secure mode: c3270 -secure -keymap gibson HOST:1023
+
+c3270.keymap.gibson: #override \
+  <Key>F1: String("PF1\n") \n\
+  <Key>F3: String("PF3\n") \n\
+  <Key>F7: String("PF7\n") \n\
+  <Key>F8: String("PF8\n") \n\
+  <Key>F10: String("PF10\n") \n\
+  <Key>F11: String("PF11\n") \n\
+  <Key>F12: String("PF12\n")

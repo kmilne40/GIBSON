@@ -1,0 +1,2228 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.apps.gmvb_upgrade import gmvb_json_api, COBOL_SOURCES
+from gibson.apps import gmvb_hack3270
+from gibson.core.passticket import get_passticket_service
+
+_PROGRESS: dict[str, dict[str, Any]] = {}
+
+
+LAB_CATALOG = [
+    {"id": "cics-banking-orientation", "title": "CICS Banking Orientation", "status": "guided-ui-available"},
+    {"id": "sqli-db2-customer-search", "title": "SQL Injection in DB2-backed Customer Search", "status": "guided-ui-available", "cwe": ["CWE-89"]},
+    {"id": "idor-account-access", "title": "IDOR / BOLA Account Access", "status": "backend-scenario-available", "cwe": ["CWE-639", "CWE-862"]},
+    {"id": "hack3270-hidden-field-recon", "title": "Hack3270 Hidden Field Recon", "status": "guided-ui-available"},
+    {"id": "protected-field-tampering", "title": "Protected Field Tampering", "status": "guided-ui-available"},
+    {"id": "aid-pf-key-enumeration", "title": "AID/PF Key Enumeration", "status": "guided-ui-available"},
+    {"id": "cobol-buffer-overflow-asra", "title": "COBOL Buffer Overflow / ASRA Simulation", "status": "backend-scenario-available"},
+    {"id": "passticket-generation-replay", "title": "PassTicket Generation and Replay", "status": "backend-scenario-available"},
+    {"id": "cemt-resource-abuse", "title": "CEMT Resource Abuse", "status": "guided-ui-available"},
+    {"id": "ceci-command-abuse-simulation", "title": "CECI Command Abuse Simulation", "status": "guided-ui-available"},
+    {"id": "account-balance-manipulation", "title": "Account Balance Manipulation Scenario", "status": "backend-scenario-available"},
+    {"id": "round-trip-embezzlement", "title": "Round-trip Embezzlement Scenario", "status": "backend-scenario-available"},
+    {"id": "tn3270-credential-capture", "title": "Plaintext TN3270 Credential Capture", "status": "guided-ui-available"},
+    {"id": "audit-log-suppression-investigation", "title": "Audit Log Suppression Investigation", "status": "backend-scenario-available"},
+    {"id": "cobol-secure-code-review", "title": "COBOL Secure Code Review", "status": "guided-ui-available"},
+    {"id": "mfa-ipl-operator-reply", "title": "IPL MFA Operator Reply", "status": "backend-scenario-available"},
+]
+
+
+def ui_response(data: Any = None, *, ok: bool = True, error: str | None = None,
+                source: str = "runtime", notes: list[str] | None = None) -> dict[str, Any]:
+    return {"ok": ok, "data": data, "error": error, "source": source, "notes": notes or []}
+
+
+def _safe(callable_, *args, **kwargs) -> tuple[int, dict[str, Any]]:
+    try:
+        return callable_(*args, **kwargs)
+    except Exception as exc:  # pragma: no cover - defensive HTTP boundary
+        return 500, ui_response(ok=False, error=f"{type(exc).__name__}: {exc}", source="runtime")
+
+
+def _rows_for_table(lab: Any, name: str) -> list[dict[str, Any]]:
+    try:
+        rows = lab.catalog().get(name.upper(), [])
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _db2_schema(lab: Any) -> dict[str, Any]:
+    cat = lab.catalog()
+    tables = []
+    for full, rows in sorted(cat.items()):
+        schema, _, table = full.partition('.')
+        if schema in {"SYSIBM", "GIBSON", "GMVB"}:
+            columns = sorted({k for row in rows for k in row.keys()}) if isinstance(rows, list) else []
+            tables.append({"schema": schema, "table": table, "name": full, "columns": columns, "row_count": len(rows) if isinstance(rows, list) else 0})
+    return {"schemas": sorted({t["schema"] for t in tables}), "tables": tables}
+
+
+def _cics_transactions(state: Any) -> list[dict[str, Any]]:
+    cics = CicsSimulator(state, "IBMUSER")
+    rows = []
+    for name, res in sorted(cics.transactions.items()):
+        rows.append({
+            "name": name,
+            "status": res.status,
+            "program": res.attr("PROGRAM"),
+            "taskdataloc": res.attr("TASKDATALOC"),
+            "source": "CicsSimulator.region",
+        })
+    return rows
+
+
+
+VULNERABLE_BANK_UPDATE_COBOL = "\n       IDENTIFICATION DIVISION.\n       PROGRAM-ID. VULNERABLE-BANK-UPDATE.\n       AUTHOR. SECURITY-TRAINER.\n       REMARKS. THIS PROGRAM CONTAINS INTENTIONAL VULNERABILITIES FOR TRAINING.\n\n       ENVIRONMENT DIVISION.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n\n       01  INPUT-DATA.\n           05  USER-INPUT               PIC X(100).\n           05  FILLER REDEFINES USER-INPUT.\n               10  CUSTOMER-ID         PIC X(10).\n               10  ACCOUNT-TYPE        PIC X(2).\n               10  TRANSACTION-AMOUNT  PIC X(12).\n\n       01  SECURITY-CONTROL-FLAGS.\n           05  AUTHENTICATED-FLAG      PIC X VALUE 'N'.\n           05  ADMIN-FLAG              PIC X VALUE 'N'.\n           05  DEBUG-FLAG              PIC X VALUE 'N'.\n\n       01  CUSTOMER-RECORD.\n           05  CUST-NAME               PIC X(30).\n           05  CUST-ADDRESS            PIC X(50).\n           05  CUST-BALANCE            PIC S9(9)V99 COMP-3.\n           05  CUST-PIN                PIC X(4).\n\n       01  TEMP-STORAGE.\n           05  SENSITIVE-TEMP          PIC X(100).\n           05  LOG-BUFFER              PIC X(256).\n\n       01  MESSAGE-AREA.\n           05  MSG-TEXT                PIC X(100).\n           05  MSG-SEVERITY            PIC X(1).\n\n       LINKAGE SECTION.\n       01  DFHCOMMAREA.\n           05  SYSTEM-CONTROL          PIC X(50).\n\n       PROCEDURE DIVISION.\n\n       500-GET-CHANNEL-DATA.\n           EXEC CICS GET CONTAINER('USERDATA')\n                        CHANNEL('BANKCHAN')\n                        INTO(USER-INPUT)\n                        FLENGTH(USER-INPUT-LENGTH)\n                        RESP(RESPONSE-CODE)\n           END-EXEC.\n           IF RESPONSE-CODE = DFHRESP(NORMAL)\n               MOVE USER-INPUT TO CUSTOMER-RECORD\n           END-IF.\n\n       100-GET-INPUT.\n           EXEC CICS RECEIVE MAP('BANKMAP') INTO(USER-INPUT) END-EXEC.\n           MOVE USER-INPUT TO CUSTOMER-RECORD.\n           STRING 'Tx for: ' CUST-NAME ' Amt: ' TRANSACTION-AMOUNT INTO MSG-TEXT.\n           IF CUST-PIN = '9999' OR AUTHENTICATED-FLAG = 'Y'\n               PERFORM 200-PROCESS-TRANSACTION\n           ELSE\n               PERFORM 800-SEND-ERROR\n           END-IF.\n           IF DEBUG-FLAG = 'Y'\n               PERFORM 700-DEBG-DUMP\n           END-IF.\n\n       200-PROCESS-TRANSACTION.\n           COMPUTE CUST-BALANCE = FUNCTION NUMVAL(TRANSACTION-AMOUNT).\n           MOVE CUSTOMER-RECORD TO LOG-BUFFER.\n           EXEC CICS SEND MAP('BANKMAP') FROM(MESSAGE-AREA) END-EXEC.\n\n       700-DEBG-DUMP.\n           DISPLAY 'DEBUG DUMP: ' TEMP-STORAGE.\n\n       800-SEND-ERROR.\n           MOVE 'AUTHENTICATION FAILED' TO MSG-TEXT.\n           EXEC CICS SEND MAP('BANKMAP') FROM(MESSAGE-AREA) END-EXEC.\n"
+
+_TERMINAL_SESSIONS: dict[str, dict[str, Any]] = {}
+_BANK_TRANS = ["GMVB", "CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "COBL", "CEMT", "CECI", "CESF", "HELP"]
+
+
+def _now() -> str:
+    return datetime.utcnow().strftime("%H:%M:%S")
+
+
+def _hack_state(enabled: bool = False) -> dict[str, bool]:
+    return {
+        "enabled": bool(enabled),
+        "hidden_fields_revealed": bool(enabled),
+        "disable_protection": bool(enabled),
+        "numeric_bypass": bool(enabled),
+        "modify_field": bool(enabled),
+        "start_field": bool(enabled),
+        "start_field_extended": bool(enabled),
+        "high_visibility": bool(enabled),
+    }
+
+
+def _normalise_hack(sess: dict[str, Any], enabled: bool) -> dict[str, bool]:
+    sess["hack"] = _hack_state(enabled)
+    return sess["hack"]
+
+
+def _new_session(sid: str, user: str = "GUEST") -> dict[str, Any]:
+    sess = {
+        "sid": sid,
+        "userid": user.upper(),
+        "logged_on": False,
+        "screen": "CESN",
+        "hack": _hack_state(False),
+        "field_values": {},
+        "logs": [],
+        "batch_pin": "0032",
+        "api_leakage": [],
+    }
+    _TERMINAL_SESSIONS[sid] = sess
+    return sess
+
+
+def _session(sid: str) -> dict[str, Any]:
+    return _TERMINAL_SESSIONS.get(sid) or _new_session(sid)
+
+
+def _text(row:int, col:int, text:str, color:str="green") -> dict[str, Any]:
+    return {"row": row, "col": col, "text": text, "color": color}
+
+
+def _field(
+    fid: str,
+    label: str,
+    row: int,
+    col: int,
+    length: int,
+    value: str = "",
+    *,
+    protected: bool = False,
+    hidden: bool = False,
+    numeric: bool = False,
+    editableNormal: bool | None = None,
+    editableWhenHack: bool = True,
+    source: str = "screen",
+    role: str = "input",
+    exploitSink: bool = False,
+    modified: bool = False,
+) -> dict[str, Any]:
+    if editableNormal is None:
+        editableNormal = not protected
+    return {
+        "id": fid,
+        "label": label,
+        "row": row,
+        "col": col,
+        "length": length,
+        "value": str(value),
+        "protected": bool(protected),
+        "hidden": bool(hidden),
+        "numericOnly": bool(numeric),
+        "editableNormal": bool(editableNormal),
+        "editableWhenHack": bool(editableWhenHack),
+        "source": source,
+        "role": role,
+        "exploitSink": bool(exploitSink),
+        "modified": bool(modified),
+    }
+
+
+def _db_field(fid: str, label: str, row: int, col: int, length: int, value: str = "", *, numeric: bool = False, source: str = "GMVB") -> dict[str, Any]:
+    return _field(fid, label, row, col, length, value, protected=True, numeric=numeric, editableNormal=False, editableWhenHack=True, source=source, role="db-returned")
+
+
+def _screen(name: str, title: str, rows: list[dict[str, Any]], fields: list[dict[str, Any]] | None = None, message: str = "") -> dict[str, Any]:
+    pf = [{"key":"PF1","label":"HELP"},{"key":"PF3","label":"EXIT"},{"key":"PF5","label":"REFRESH"},{"key":"ENTER","label":"EXECUTE"}]
+    return {"name": name, "title": title, "rows": rows, "fields": fields or [], "cursor": {"row": 22, "col": 15}, "pfkeys": pf, "message": message, "commandLine": True}
+
+
+def _base_hidden(screen: str, sql: str = "") -> list[dict[str, Any]]:
+    return [
+        _field("AUTHFLAG", "AUTHFLAG", 16, 2, 1, "N", protected=True, hidden=True, editableNormal=False, source="BMS-HIDDEN", role="control-flag"),
+        _field("ADMINFLAG", "ADMINFLAG", 16, 18, 1, "N", protected=True, hidden=True, editableNormal=False, source="BMS-HIDDEN", role="control-flag"),
+        _field("DEBUGFLAG", "DEBUGFLAG", 16, 36, 1, "N", protected=True, hidden=True, editableNormal=False, source="BMS-HIDDEN", role="control-flag"),
+        _field("PROGRAM", "PROGRAM", 17, 2, 12, {"CUST":"CUSTINQ","ACCT":"ACCTINQ","TRAN":"TRANPST","BATCH":"BATCHREL","CCAP":"CCAPPROV","SWFT":"SWIFTPMT","CHAP":"CHAPPMT"}.get(screen,"VULNBANK"), protected=True, hidden=True, editableNormal=False, source="COBOL", role="program"),
+        _field("MAPSET", "MAPSET", 17, 24, 10, "BANKMAP", protected=True, hidden=True, editableNormal=False, source="BMS", role="mapset"),
+        _field("SQLTRACE", "SQLTRACE", 18, 2, 70, sql, protected=True, hidden=True, editableNormal=False, source="COBOL-DYNAMIC-SQL", role="sql-trace", exploitSink=True),
+    ]
+
+
+def _is_sqli(value: str) -> bool:
+    v = value.upper()
+    return "'" in v and (" OR " in v or "--" in v or "1'='1" in v or "1=1" in v)
+
+
+def _sample_customer_rows(lab: Any) -> list[dict[str, Any]]:
+    rows = _rows_for_table(lab, "GMVB.CUSTOMER") or _rows_for_table(lab, "GIBSON.CUSTOMERS")
+    return rows or [{"CUSTOMER_ID":"100001","NAME":"ALICE EXAMPLE","STATUS":"ACTIVE","ADDRESS":"22 HIGH STREET"},{"CUSTOMER_ID":"100002","NAME":"BOB EXAMPLE","STATUS":"ACTIVE","ADDRESS":"11 BANK ROAD"}]
+
+
+def _sample_account_rows(lab: Any) -> list[dict[str, Any]]:
+    rows = _rows_for_table(lab, "GMVB.ACCOUNT") or _rows_for_table(lab, "GIBSON.ACCOUNTS")
+    return rows or [{"ACCOUNT_ID":"10001","CUSTOMER_ID":"100001","BALANCE":"12500.00","STATUS":"ACTIVE"},{"ACCOUNT_ID":"20002","CUSTOMER_ID":"100002","BALANCE":"950000.00","STATUS":"ACTIVE"}]
+
+
+def _terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    screen = (screen or sess.get("screen") or "CESN").upper()
+    payload = payload or {}
+    msg = str(payload.get("message") or "")
+    if screen == "CESN":
+        return _screen("CESN", "CICS SIGN-ON", [_text(1,1,"CESN                    CICS SIGN-ON                    GIBSON REGION A","blue"),_text(4,12,"USERID . . . . .","cyan"),_text(5,12,"PASSWORD . . . .","cyan"),_text(6,12,"GROUP . . . . . .","cyan"),_text(9,12,msg or "MESSAGE: ENTER GACF USERID AND PASSWORD","yellow"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF1=HELP PF3=EXIT ENTER=SIGNON","blue")], [_field("userid","USERID",4,30,8,sess.get("userid","GUEST")), _field("password","PASSWORD",5,30,8,""), _field("group","GROUP",6,30,8,"")], msg)
+    if screen == "GMVB":
+        rows=[_text(1,1,f"GMVB                 GIBSON MUTUAL VIRTUAL BANK                  {_now()}","yellow"),_text(2,22,"CICS/DB2 CORE BANKING SYSTEM","cyan")]
+        labels=[("1","Customer Inquiry","CUST"),("2","Account Inquiry","ACCT"),("3","Funds Transfer","TRAN"),("4","Batch Transfer Release","BATCH"),("5","Credit Card Approval","CCAP"),("6","SWIFT Payment Entry","SWFT"),("7","CHAPS High-Value Payment","CHAP"),("8","API / Integration Gateway","APIM"),("9","TN3270 Buffer Viewer","TN32"),("10","COBOL Source Review","COBL"),("C","CICS Control","CEMT"),("E","Command Interpreter","CECI"),("X","Sign off","CESF")]
+        for idx,(n,l,t) in enumerate(labels,start=5): rows.append(_text(idx,5,f"{n:<3}{l:<36}{t}","green" if idx<15 else "blue"))
+        rows += [_text(22,1,"COMMAND ===>","cyan"), _text(24,1,"PF1=HELP PF3=EXIT PF5=REFRESH ENTER=EXECUTE","blue")]
+        return _screen("GMVB", "GIBSON MUTUAL VIRTUAL BANK", rows, [], msg)
+    if screen == "CUST":
+        q = str(payload.get("customer_id") or payload.get("input") or sess["field_values"].get("customer_id", "100001"))
+        rowsd = _sample_customer_rows(lab); r = rowsd[0] if rowsd else {}; sqli=_is_sqli(q); sql=f"SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID = '{q}'"
+        rows=[_text(1,1,"CUST                 CUSTOMER INQUIRY","blue"),_text(3,5,"CUSTOMER ID . .","cyan"),_text(5,5,"NAME . . . . . .","cyan"),_text(5,24,str(r.get("NAME") or r.get("CUSTOMER_NAME") or "ALICE EXAMPLE"),"white"),_text(6,5,"ADDRESS . . . .","cyan"),_text(6,24,str(r.get("ADDRESS") or "22 HIGH STREET"),"white"),_text(7,5,"STATUS . . . . .","cyan"),_text(7,24,str(r.get("STATUS") or "ACTIVE"),"white"),_text(9,5,"RESULT COUNT . .","cyan"),_text(9,24,str(len(rowsd[:5]) if sqli else 1),"yellow" if sqli else "white"),_text(11,5,"TRAINING NOTE .","cyan"),_text(11,24,"CONTROLLED SQL INJECTION BRANCH" if sqli else "NORMAL DB2 HOST LOOKUP","red" if sqli else "green"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT PF5=REFRESH PF8=NEXT ENTER=SEARCH","blue")]
+        return _screen("CUST","CUSTOMER INQUIRY",rows,[_field("customer_id","CUSTOMER ID",3,24,20,q)]+_base_hidden("CUST", sql),"SQL injection training result" if sqli else msg)
+    if screen == "ACCT":
+        q = str(payload.get("account") or payload.get("account_id") or payload.get("input") or sess["field_values"].get("account", "10001"))
+        rowsd = _sample_account_rows(lab); r = rowsd[0] if rowsd else {}; sqli=_is_sqli(q); sql=f"SELECT * FROM GMVB.ACCOUNT WHERE ACCOUNT_ID = '{q}'"
+        rows=[_text(1,1,"ACCT                 ACCOUNT INQUIRY","blue"),_text(3,5,"ACCOUNT NUMBER .","cyan"),_text(5,5,"CUSTOMER ID . .","cyan"),_text(5,24,str(r.get("CUSTOMER_ID") or "100001"),"white"),_text(6,5,"ACCOUNT TYPE . .","cyan"),_text(6,24,str(r.get("TYPE") or "DDA"),"white"),_text(7,5,"BALANCE . . . .","cyan"),_text(7,24,str(r.get("BALANCE") or "12500.00"),"white"),_text(8,5,"STATUS . . . . .","cyan"),_text(8,24,str(r.get("STATUS") or "ACTIVE"),"white"),_text(10,5,"RESULT COUNT . .","cyan"),_text(10,24,str(len(rowsd[:5]) if sqli else 1),"yellow" if sqli else "white"),_text(12,5,"TRAINING NOTE .","cyan"),_text(12,24,"SQLI/IDOR TRAINING PATH ACTIVE" if sqli else "NORMAL ACCOUNT LOOKUP","red" if sqli else "green"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT PF5=REFRESH ENTER=SEARCH","blue")]
+        return _screen("ACCT","ACCOUNT INQUIRY",rows,[_field("account","ACCOUNT NUMBER",3,24,20,q,numeric=True)]+_base_hidden("ACCT", sql)+[_field("OWNER_USERID","OWNER_USERID",19,2,8,"OTHERUSR",protected=True,hidden=True),_field("AUTH_CHECK_DONE","AUTH_CHECK_DONE",19,24,1,"N",protected=True,hidden=True)],"SQL injection training result" if sqli else msg)
+    if screen in {"TRAN","BATCH","CCAP","SWFT","CHAP"}:
+        templates = {
+          "TRAN": ("FUNDS TRANSFER", [(4,"FROM ACCOUNT . .","10001"),(5,"TO ACCOUNT . . .","20002"),(6,"AMOUNT . . . . .","00000100.00"),(7,"REFERENCE . . .","RENT"),(8,"APPROVAL . . . .","N")], ["LIMITCHECK","DAILY_LIMIT","OVERRIDE"]),
+          "BATCH": ("BATCH TRANSFER RELEASE", [(4,"BATCH ID . . . .","B2026A17"),(5,"ITEM COUNT . . .","00012"),(6,"TOTAL VALUE . .","000245000.00"),(7,"STATUS . . . . .","HELD-PIN-REQ"),(10,"SUPERVISOR ID .","SUPR01"),(11,"RELEASE PIN . .",""),(12,"ACTION . . . . .","RELEASE")], ["MAX_ATTEMPTS","LOCKOUT_FLAG","PIN_HASH","BYPASS_FLAG","APPROVER_ROLE"]),
+          "CCAP": ("CREDIT CARD APPROVAL", [(4,"APPLICATION ID .","CCA000183"),(5,"CUSTOMER ID . .","100001"),(6,"REQUESTED LIMIT","00005000"),(7,"RISK SCORE . . .","072"),(8,"STATUS . . . . .","REFER"),(10,"APPROVAL CODE .",""),(11,"DECISION . . . .","REFER")], ["RISK_OVERRIDE","APPROVED_LIMIT"]),
+          "SWFT": ("INTERNATIONAL PAYMENT ENTRY", [(4,"MESSAGE TYPE . .","MT103"),(5,"SENDER BIC . . .","GMVBGB2L"),(6,"RECEIVER BIC . .","DEUTDEFF"),(7,"VALUE DATE . . .","260523"),(8,"CURRENCY . . . .","USD"),(9,"AMOUNT . . . . .","000125000.00"),(10,"BENEFICIARY . .","ACME EXPORTS"),(11,"DETAILS . . . .","INVOICE 7781"),(13,"STATUS . . . . .","HELD-REVIEW")], ["SWIFT_RAW","RELEASE_FLAG","SANCTIONS_CHECK","DUAL_CONTROL"]),
+          "CHAP": ("CHAPS HIGH VALUE PAYMENT", [(4,"PAYMENT ID . . .","CH20260523001"),(5,"SORT CODE . . .","20-00-00"),(6,"ACCOUNT . . . .","12345678"),(7,"AMOUNT . . . . .","000950000.00"),(8,"BENEFICIARY . .","PROPERTY SOLICITORS LLP"),(9,"PURPOSE . . . .","COMPLETION FUNDS"),(10,"STATUS . . . . .","AWAITING-DUAL-AUTH"),(12,"SUPERVISOR PIN .","")], ["DUAL_AUTH_OK","LIMIT_BYPASS","SANCTIONS_STATUS","RTGS_QUEUE_ID"]),
+        }
+        title, lines, hidden_names = templates[screen]
+        rows=[_text(1,1,f"{screen:<20}{title}","blue")]
+        fields=[]
+        for row,label,val in lines:
+            rows.append(_text(row,5,label,"cyan")); fields.append(_field(label.lower().replace(" ","_").replace(".",""), label, row, 24, max(4,len(str(val))+4), val, numeric="PIN" in label or "AMOUNT" in label or "ACCOUNT" in label))
+        rows += [_text(15,5,"HACK3270 TRAINING: HIDDEN FIELDS, OVERTYPE AND WEAK VALIDATION AVAILABLE","red"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT PF5=REFRESH PF9=RELEASE ENTER=SUBMIT","blue")]
+        for i,h in enumerate(hidden_names): fields.append(_field(h,h,18+i//3,2+(i%3)*24,16,"SIMULATED" if "HASH" in h or "RAW" in h else "N",protected=True,hidden=True))
+        return _screen(screen,title,rows,fields+_base_hidden(screen),msg)
+    if screen == "APIM":
+        leak={"endpoint":"/api/v1/bank/customer","internal_flags":"DEBUG ENABLED","sqltrace":"SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID='<input>'","program":"VULNERABLE-BANK-UPDATE"}
+        rows=[_text(1,1,"APIM                 API / INTEGRATION GATEWAY TEST","blue"),_text(4,5,"1  Customer API Lookup","green"),_text(5,5,"2  Account API Lookup","green"),_text(6,5,"3  Payment Status API","green"),_text(7,5,"4  SWIFT/CHAPS Message API","green"),_text(8,5,"5  Debug Headers / Token View","green"),_text(9,5,"6  Unsafe Query Test","red"),_text(11,5,"SELECT OPTION . .","cyan"),_text(13,5,"API RESPONSE / LEAKAGE:","yellow"),_text(14,5,str(leak)[:70],"white"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT ENTER=SELECT","blue")]
+        return _screen("APIM","API / INTEGRATION GATEWAY TEST",rows,[_field("api_option","SELECT OPTION",11,24,1,"6",numeric=True),_field("api_input","API INPUT",12,24,24,"' OR '1'='1")]+_base_hidden("APIM","SELECT * FROM API_CUSTOMER WHERE ID='<input>'"),"API data leakage training screen")
+    if screen == "TN32":
+        rows=[_text(1,1,"TN32                 SIMULATED TN3270 BUFFER VIEW","blue"),_text(4,5,"CAPTURE ID . . . CAP000042","cyan"),_text(5,5,f"SESSION . . . . . {sess.get('sid')}","cyan"),_text(6,5,f"USERID . . . . .  {sess.get('userid')}","cyan"),_text(9,5,"BUFFER EXCERPT:","yellow"),_text(10,5,f"USERID={sess.get('userid')}","white"),_text(11,5,f"TRAN={sess.get('screen')}","white"),_text(12,5,"FIELD=RELEASE-PIN ATTR=NUM PROT=Y VALUE=****","white"),_text(13,5,"FIELD=AUTHFLAG ATTR=HID PROT=Y VALUE=N","white"),_text(17,5,"WARNING: SIMULATED PLAINTEXT 3270 BUFFER FOR TRAINING ONLY","red"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT PF5=REFRESH","blue")]
+        return _screen("TN32","SIMULATED TN3270 BUFFER VIEW",rows,[],msg)
+    if screen == "COBL":
+        rows=[_text(1,1,"COBL                 VULNERABLE COBOL SOURCE REVIEW","blue"),_text(3,1,"VULNERABLE-BANK-UPDATE.COBOL","yellow"),_text(5,1,"VULN-07 UNSAFE RECEIVE MAP / VULN-08 DIRECT MOVE OVERFLOW","red"),_text(6,1,"VULN-10 AUTH BYPASS FLAG / VULN-11 DEBUG BACKDOOR","red"),_text(7,1,"VULN-12 UNSAFE NUMVAL / VULN-13 SENSITIVE LOGGING","red"),_text(8,1,"VULN-15 UNSAFE CHANNEL CONTAINER","red")]
+        for idx,line in enumerate(VULNERABLE_BANK_UPDATE_COBOL.splitlines()[:12], start=10): rows.append(_text(idx,1,line[:78],"green"))
+        rows += [_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT PF8=NEXT","blue")]
+        return _screen("COBL","VULNERABLE COBOL SOURCE REVIEW",rows,[],msg)
+    if screen == "CEMT":
+        out = CicsSimulator(state, sess.get("userid","IBMUSER")).execute("CEMT I TRAN")
+        rows=[_text(1,1,"CEMT                 CICS MASTER TERMINAL","blue")]
+        for i,line in enumerate(str(out).splitlines()[:18], start=3): rows.append(_text(i,1,line[:78],"green"))
+        return _screen("CEMT","CICS MASTER TERMINAL",rows+[_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT ENTER=EXECUTE","blue")],[],msg)
+    if screen == "CECI":
+        return _screen("CECI","CICS COMMAND INTERPRETER",[_text(1,1,"CECI                 CICS COMMAND INTERPRETER","blue"),_text(4,5,"COMMAND . . . EXEC CICS READ FILE('FILEA')","cyan"),_text(8,5,"CONTROLLED TRAINING COMMAND INTERPRETER - NO HOST ACTIONS","yellow"),_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT ENTER=EXECUTE","blue")],[],msg)
+    if screen == "CESF":
+        sess["logged_on"] = False
+        return _terminal_screen(state, sess, lab, "CESN", {"message":"CESF SIGNOFF COMPLETE"})
+    if screen == "HELP":
+        rows=[_text(1,1,"HELP                 GIBSON CICS BANKING TERMINAL","blue")]
+        for i,t in enumerate(_BANK_TRANS, start=3): rows.append(_text(i,5,t,"green"))
+        return _screen("HELP","HELP",rows+[_text(22,1,"COMMAND ===>","cyan"),_text(24,1,"PF3=EXIT","blue")],[],msg)
+    return _terminal_screen(state, sess, lab, "GMVB", {"message": f"UNKNOWN TRANSACTION {screen}"})
+
+
+def _screen_response(state: Any, sess: dict[str, Any], lab: Any, screen: dict[str, Any], *, messages: list[str] | None = None) -> dict[str, Any]:
+    hack = sess.get("hack", _hack_state(False))
+    hack_on = bool(hack.get("enabled"))
+    visible = []
+    hidden = []
+    session_values = sess.get("field_values", {}) or {}
+    for raw in screen.get("fields", []):
+        f = dict(raw)
+        if f.get("id") in session_values and (not f.get("protected") or hack_on):
+            f["value"] = str(session_values.get(f.get("id"), f.get("value", "")))
+            if f.get("protected") or f.get("hidden"):
+                f["modified"] = True
+        if f.get("hidden"):
+            hidden.append(f)
+            if not hack_on:
+                continue
+        visible.append(f)
+    screen = dict(screen)
+    screen["fields"] = visible
+    out_messages = messages or ([screen.get("message")] if screen.get("message") else [])
+    if out_messages:
+        rows = list(screen.get("rows", []))
+        for idx, msg in enumerate(out_messages[:3], start=19):
+            rows.append(_text(idx, 5, str(msg)[:70], "red" if "REJECTED" in str(msg).upper() else "yellow"))
+        screen["rows"] = rows
+    return {
+        "sid": sess["sid"],
+        "userid": sess.get("userid"),
+        "logged_on": sess.get("logged_on"),
+        "screen": screen,
+        "messages": out_messages,
+        "audit": sess.get("logs", [])[-10:],
+        "hack3270": {**hack, "hidden_field_count": len(hidden), "training_only": True},
+    }
+
+
+def _route_terminal(state: Any, lab: Any, p: str, method: str, data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if not p.startswith("/api/v1/ui8999/terminal") and not p.startswith("/api/v1/ui8999/hack3270/session") and not p.startswith("/api/v1/ui8999/api-menu"):
+        return None
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+    sess = _session(sid)
+    if p == "/api/v1/ui8999/terminal/config":
+        return 200, ui_response({"application":"Gibson Vulnerable CICS Bank Terminal","default_route":"/","transactions":_BANK_TRANS,"react":True,"training_only":True})
+    if p == "/api/v1/ui8999/terminal/transactions":
+        return 200, ui_response([{"name": t, "status":"ENABLED", "terminal": True} for t in _BANK_TRANS])
+    if p == "/api/v1/ui8999/terminal/start" and method == "POST":
+        sess = _new_session(sid, str(data.get("userid") or "GUEST")); scr = _terminal_screen(state, sess, lab, "CESN")
+        return 200, ui_response(_screen_response(state, sess, lab, scr))
+    if p == "/api/v1/ui8999/terminal/logon" and method == "POST":
+        user=str(data.get("userid") or data.get("user") or "GUEST").upper(); password=str(data.get("password") or "GUEST"); sess["userid"]=user
+        if user and password:
+            sess["logged_on"]=True; sess["screen"]="GMVB"; sess["logs"].append({"event":"LOGON","userid":user,"result":"ACCEPTED","training_only":True})
+            scr=_terminal_screen(state, sess, lab, "GMVB", {"message": f"DFHAC2001 {user} SIGNED ON"})
+            return 200, ui_response(_screen_response(state, sess, lab, scr, messages=[f"DFHAC2001 {user} SIGNED ON"]))
+        scr=_terminal_screen(state, sess, lab, "CESN", {"message":"DFHAC2206 SIGNON FAILED"})
+        return 401, ui_response(_screen_response(state, sess, lab, scr), ok=False, error="signon failed")
+    if p.startswith("/api/v1/ui8999/terminal/session/"):
+        if method == "GET":
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab)))
+        if p.endswith("/command") and method == "POST":
+            cmd=str(data.get("command") or data.get("input") or "GMVB").strip().upper(); aliases={"1":"CUST","2":"ACCT","3":"TRAN","4":"BATCH","5":"CCAP","6":"SWFT","7":"CHAP","8":"APIM","9":"TN32","10":"COBL","C":"CEMT","E":"CECI","X":"CESF"}; cmd=aliases.get(cmd,cmd); screen=cmd.split()[0] if cmd else "GMVB"; screen=screen if screen in _BANK_TRANS else "GMVB"; sess["screen"]=screen; sess["logs"].append({"event":"COMMAND","command":cmd,"screen":screen}); return 200, ui_response(_screen_response(state,sess,lab,_terminal_screen(state,sess,lab,screen,data)))
+        if p.endswith("/field") and method == "POST":
+            fid=str(data.get("field") or data.get("field_id") or ""); val=str(data.get("value") or ""); sess["field_values"][fid]=val; sess["logs"].append({"event":"FIELD_OVERTYPE","field":fid,"value":val,"training_only":True}); return 200, ui_response(_screen_response(state,sess,lab,_terminal_screen(state,sess,lab),messages=[f"FIELD {fid} OVERTYPED IN TRAINING MODE"]))
+        if p.endswith("/aid") and method == "POST":
+            aid=str(data.get("aid") or "ENTER").upper(); sess["logs"].append({"event":"AID","aid":aid}); return 200, ui_response(_screen_response(state,sess,lab,_terminal_screen(state,sess,lab),messages=[f"AID {aid} SENT"]))
+    if p == "/api/v1/ui8999/terminal/cobol/vulnerable-bank-update":
+        return 200, ui_response({"name":"VULNERABLE-BANK-UPDATE.COBOL","source":VULNERABLE_BANK_UPDATE_COBOL,"markers":["VULN-07","VULN-08","VULN-10","VULN-11","VULN-12","VULN-13","VULN-15"]})
+    if p.startswith("/api/v1/ui8999/hack3270/session/"):
+        if p.endswith("/toggle") and method == "POST":
+            action = str(data.get("action") or "toggle").lower()
+            if action == "toggle":
+                enabled = not bool(sess.get("hack", {}).get("enabled"))
+            else:
+                enabled = action == "on"
+            _normalise_hack(sess, enabled)
+            sess["logs"].append({"event":"HACK_TOGGLE","hack":dict(sess["hack"]),"training_only":True})
+            msg = "DFHHK0001 HACK FIELDS ON - FIELD ATTRIBUTES BYPASSED" if enabled else "DFHHK0002 HACK FIELDS OFF - NORMAL BMS ATTRIBUTES RESTORED"
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+        if p.endswith("/field-inject") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0007 FIELD INJECTION REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"HACK_FIELD_INJECT_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            fid = str(data.get("field") or "AUTHFLAG")
+            val = str(data.get("value") or "Y")
+            sess.setdefault("field_values", {})[fid] = val
+            sess["logs"].append({"event":"HACK_FIELD_INJECT","field":fid,"value":val,"training_only":True})
+            msg = f"DFHHK0003 FIELD {fid} OVERTYPED IN SIMULATED BUFFER"
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg])
+            resp.update({"field": fid, "value": val, "result": "INJECTED", "training_only": True})
+            return 200, ui_response(resp)
+        if p.endswith("/aid-scan") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0009 AID SCAN REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"AID_SCAN_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            rows = [{"aid":k,"result":"supported" if k in {"PF1","PF3","PF5","PF8","PF9","ENTER","CLEAR"} else "hidden/not exposed"} for k in ["PF1","PF3","PF5","PF8","PF9","PF12","PF24","ENTER","CLEAR","PA1","PA2"]]
+            sess["logs"].append({"event":"AID_SCAN","rows":rows,"training_only":True})
+            msg = "DFHHK0004 AID SCAN COMPLETE - PF24 DEBUG BRANCH SIMULATED"
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg])
+            resp.update({"rows": rows, "hidden_function": "PF24 debug/admin branch is simulated only"})
+            return 200, ui_response(resp)
+        if p.endswith("/batch-pin-bruteforce") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0010 BATCH PIN BRUTE FORCE REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"BATCH_PIN_BRUTE_FORCE_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            pins = [str(x) for x in (data.get("pins") or ["0000", "1111", "1234", "0032"])]
+            target = str(data.get("target_pin") or sess.get("batch_pin") or "0032")
+            accepted = [target]
+            if "1337" not in accepted:
+                accepted.append("1337")  # legacy simulator PIN retained for backward compatibility
+            found = next((pin for pin in pins if pin in accepted), None)
+            attempts = [{"pin":pin,"result":"MATCH" if pin in accepted else "NO"} for pin in pins]
+            message = "DFHBA7701 BATCH B2026A17 RELEASED BY SUPERVISOR OVERRIDE" if found else "DFHBA7702 BATCH RELEASE PIN NOT FOUND"
+            sess["logs"].append({"event":"BATCH_PIN_BRUTE_FORCE","result":"FOUND" if found else "NOT_FOUND","pin":found or "","attempts":attempts,"training_only":True})
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "BATCH_PIN_BRUTE_FORCE", message, "FOUND" if found else "NOT_FOUND")
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab, "BATCH"), messages=[message, f"ATTEMPTS={len(attempts)} FOUND={found or 'NO'}"])
+            resp.update({"found": found, "attempts": attempts, "message": message, "training_only": True})
+            return 200, ui_response(resp)
+        if p.endswith("/buffer"):
+            return 200, ui_response({"capture_id":"CAP000042","session":sid,"userid":sess.get("userid"),"buffer":["USERID=" + sess.get("userid", "GUEST"), "TRAN=" + sess.get("screen", "GMVB"), "FIELD=RELEASE-PIN ATTR=NUM PROT=Y VALUE=****", "FIELD=AUTHFLAG ATTR=HID PROT=Y VALUE=" + str(sess.get("field_values", {}).get("AUTHFLAG", "N"))],"training_only":True})
+        if p.endswith("/logs"):
+            return 200, ui_response(sess.get("logs", []))
+        if p.endswith("/statistics"):
+            return 200, ui_response({"commands":len([l for l in sess.get("logs", []) if l.get("event") == "COMMAND"]),"hack_events":len([l for l in sess.get("logs", []) if str(l.get("event", "")).startswith("HACK") or "BRUTE" in str(l.get("event", ""))]),"training_only":True})
+    if p.startswith("/api/v1/ui8999/api-menu"):
+        q = str(data.get("input") or data.get("customer_id") or "' OR '1'='1")
+        rows = _rows_for_table(lab, "GMVB.CUSTOMER")[:8] if _is_sqli(q) else _rows_for_table(lab, "GMVB.CUSTOMER")[:1]
+        sess["screen"] = "APIM"
+        sess.setdefault("field_values", {})["api_input"] = q
+        sess["logs"].append({"event":"API_LEAKAGE","endpoint":p,"sqli":_is_sqli(q),"training_only":True})
+        _gmvb_audit(lab, sess.get("userid", "GUEST"), "API_LEAKAGE", f"API menu unsafe query {q}", "SQLI" if _is_sqli(q) else "OK")
+        msg = "DFHAP0002 API SQLI/DATA LEAKAGE RESULT RENDERED IN TERMINAL" if _is_sqli(q) else "DFHAP0001 API QUERY COMPLETE"
+        leaked = {"program":"VULNERABLE-BANK-UPDATE","mapset":"BANKMAP","role_flags":["AUTHFLAG","ADMINFLAG","DEBUGFLAG"],"sqltrace":f"SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID = '{q}'"}
+        resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab, "APIM", {"fields":{"api_input":q}}), messages=[msg, f"ROWS RETURNED={len(rows)} ENDPOINT={p}"])
+        resp.update({"endpoint": p, "input": q, "vulnerable": _is_sqli(q), "rows": rows, "leaked_internal_fields": leaked, "training_only": True})
+        return 200, ui_response(resp)
+    return None
+
+
+def handle_ui8999(state: Any, path: str, method: str = "GET", data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    data = data or {}
+    query = query or {}
+    p = (path or "/").rstrip("/") or "/"
+    lab = get_banking_lab(state)
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+
+    try:
+        if p.startswith("/api/v1/gmvb"):
+            return gmvb_json_api(lab, p, method, data, query)
+
+        terminal_route = _route_terminal(state, lab, p, method, data, query)
+        if terminal_route is not None:
+            return terminal_route
+
+        if p in {"/api/v1/ui8999/config", "/api/v1/ui8999/health"}:
+            payload = {
+                "application": "Gibson CICS Banking Training Console",
+                "port": getattr(state.config, "react8999_port", 8999),
+                "backend": "Gibson",
+                "version": "vulnerable-cics-bank-react8999",
+                "routes": ["/api/v1/ui8999/*", "/api/v1/gmvb/*", "/bank/*", "/query"],
+                "modules": ["CICS", "DB2", "GMVB", "COBOL", "Hack3270", "PassTicket", "TrainingProgress", "VulnerableBankTerminal"],
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            return 200, ui_response(payload)
+
+
+        if p == "/api/v1/ui8999/labs":
+            return 200, ui_response({"labs": LAB_CATALOG, "count": len(LAB_CATALOG)}, source="runtime")
+        if p.startswith("/api/v1/ui8999/labs/"):
+            lab_id = p.rsplit("/", 1)[-1]
+            for item in LAB_CATALOG:
+                if item["id"] == lab_id:
+                    return 200, ui_response(item, source="runtime")
+            return 404, ui_response(ok=False, error="lab metadata not found", source="runtime")
+
+        if p == "/api/v1/ui8999/capabilities":
+            return 200, ui_response({
+                "cics_transactions": [r["name"] for r in _cics_transactions(state)],
+                "db2_schemas": _db2_schema(lab)["schemas"],
+                "hack3270": True,
+                "passticket": True,
+                "mfa_r04": True,
+                "frontend_fallback_visible": True,
+            })
+
+        if p == "/api/v1/ui8999/cics/transactions":
+            return 200, ui_response(_cics_transactions(state))
+        if p in {"/api/v1/ui8999/cics/command", "/api/v1/ui8999/cics/cemt", "/api/v1/ui8999/cics/ceci"} and method == "POST":
+            cmd = str(data.get("command") or data.get("input") or "HELP")
+            cics = CicsSimulator(state, str(data.get("userid") or "IBMUSER"))
+            return 200, ui_response({"command": cmd, "output": cics.execute(cmd)})
+        if p == "/api/v1/ui8999/cics/ceda/resources":
+            cics = CicsSimulator(state, "IBMUSER")
+            return 200, ui_response({
+                "transactions": _cics_transactions(state),
+                "programs": [{"name": k, "status": v.status, "attrs": v.attrs or {}} for k, v in sorted(cics.programs.items())],
+                "files": [{"name": k, "status": v.status, "attrs": v.attrs or {}} for k, v in sorted(cics.files.items())],
+            })
+
+        if p == "/api/v1/ui8999/db2/schema":
+            return 200, ui_response(_db2_schema(lab))
+        if p == "/api/v1/ui8999/db2/tables":
+            return 200, ui_response(_db2_schema(lab)["tables"])
+        if p == "/api/v1/ui8999/db2/query" and method == "POST":
+            sql = str(data.get("sql") or "SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES")
+            rows = Db2Simulator(state).run_sql(sql, str(data.get("userid") or "IBMUSER"))
+            return 200, ui_response({"sql": sql, "rows": rows})
+
+        if p == "/api/v1/ui8999/gmvb/customers":
+            return 200, ui_response(_rows_for_table(lab, "GMVB.CUSTOMER"))
+        if p == "/api/v1/ui8999/gmvb/accounts":
+            return 200, ui_response(_rows_for_table(lab, "GMVB.ACCOUNT"))
+        if p.startswith("/api/v1/ui8999/gmvb/customers/"):
+            cid = p.rsplit("/", 1)[-1]
+            st, payload = gmvb_json_api(lab, f"/api/v1/gmvb/customers/{cid}", "GET", data, query)
+            return st, ui_response(payload, ok=st < 400)
+        if "/transactions" in p and p.startswith("/api/v1/ui8999/gmvb/accounts/"):
+            acct = p.split("/accounts/", 1)[1].split("/", 1)[0]
+            st, payload = gmvb_json_api(lab, f"/api/v1/gmvb/transactions/{acct}", "GET", data, query)
+            return st, ui_response(payload, ok=st < 400)
+        if p.startswith("/api/v1/ui8999/gmvb/accounts/"):
+            acct = p.rsplit("/", 1)[-1]
+            st, payload = gmvb_json_api(lab, f"/api/v1/gmvb/accounts/{acct}", "GET", data, query)
+            return st, ui_response(payload, ok=st < 400)
+        if p == "/api/v1/ui8999/gmvb/transactions" and method == "POST":
+            st, payload = gmvb_json_api(lab, "/api/v1/gmvb/transactions", "POST", data, query)
+            return st, ui_response(payload, ok=st < 400)
+        if p == "/api/v1/ui8999/gmvb/session/start" and method == "POST":
+            st, payload = gmvb_json_api(lab, "/api/v1/gmvb/session/start", "GET", {**data, "sid": sid}, query)
+            return st, ui_response(payload, ok=st < 400)
+        if p.startswith("/api/v1/ui8999/gmvb/session/"):
+            tail = p.split("/session/", 1)[1]
+            if tail.endswith("/action") and method == "POST":
+                real_sid = tail.rsplit("/", 1)[0]
+                st, payload = gmvb_json_api(lab, "/api/v1/gmvb/session/action", "POST", {**data, "sid": real_sid}, query)
+                return st, ui_response(payload, ok=st < 400)
+            st, payload = gmvb_json_api(lab, f"/api/v1/gmvb/session/{tail}", "GET", data, query)
+            return st, ui_response(payload, ok=st < 400)
+
+        if p == "/api/v1/ui8999/cobol/programs":
+            rows = []
+            for name, src in sorted(COBOL_SOURCES.items()):
+                rows.append({"name": name, "lines": len(str(src).splitlines()), "source": "COBOL_SOURCES"})
+            return 200, ui_response(rows)
+        if p.startswith("/api/v1/ui8999/cobol/programs/"):
+            name = p.rsplit("/", 1)[-1].upper()
+            if name in COBOL_SOURCES:
+                return 200, ui_response({"name": name, "source": COBOL_SOURCES[name]})
+            return 404, ui_response(ok=False, error="COBOL program not found")
+
+        if p == "/api/v1/ui8999/audit":
+            return 200, ui_response(list(getattr(lab, "gmvb_audit", [])))
+        if p.startswith("/api/v1/ui8999/scenarios/"):
+            scenario = p.split("/scenarios/", 1)[1].split("/", 1)[0]
+            if p.endswith("/activate") and method == "POST":
+                return 200, ui_response(lab.gmvb_activate_lab(sid, scenario))
+            if p.endswith("/reset") and method == "POST":
+                return 200, ui_response({"status": f"SCENARIO {scenario} RESET IS LOCAL UI ONLY", "scenario_id": scenario})
+
+        if p == "/api/v1/ui8999/hack3270/reveal-fields" and method == "POST":
+            return 200, ui_response(gmvb_hack3270.action(lab, sid, "REVEAL", data))
+        if p == "/api/v1/ui8999/hack3270/bruteforce-pin" and method == "POST":
+            attempts = list(data.get("pins") or data.get("attempts") or ["0000", "1234", "0032"])
+            found = "0032" if "0032" in [str(x) for x in attempts] else ("1337" if "1337" in [str(x) for x in attempts] else None)
+            gmvb_hack3270.log_event(lab, sid, "BRUTEFORCE_PIN", field_name="SUPERVISOR_PIN", new_value=found or "", result="FOUND" if found else "NOT FOUND")
+            return 200, ui_response({"attempts": len(attempts), "found": found, "message": "Training simulation only"})
+        if p == "/api/v1/ui8999/hack3270/aid-scan" and method == "POST":
+            rows = [{"aid": k, "result": "supported" if k in {"PF3", "PF5", "PF8", "ENTER", "CLEAR"} else "not exposed"} for k in ["PF1", "PF3", "PF5", "PF8", "PF12", "PF24", "ENTER", "CLEAR"]]
+            gmvb_hack3270.log_event(lab, sid, "AID_SCAN", result="SCAN COMPLETE")
+            return 200, ui_response({"rows": rows, "hidden_function": "PF24/admin debug not directly exposed unless lab mode is active"})
+        if p == "/api/v1/ui8999/hack3270/field-tamper" and method == "POST":
+            return 200, ui_response(gmvb_hack3270.action(lab, sid, "UNPROTECT", data))
+
+        if p == "/api/v1/ui8999/training/progress":
+            key = str(query.get("student") or data.get("student") or "local")
+            if method == "POST":
+                _PROGRESS[key] = dict(data.get("progress") or data)
+            return 200, ui_response(_PROGRESS.setdefault(key, {"completed_labs": [], "earned_badges": [], "assessment_scores": []}), source="simulated")
+        if p.startswith("/api/v1/ui8999/training/labs/") and p.endswith("/complete") and method == "POST":
+            lab_id = p.split("/labs/", 1)[1].split("/", 1)[0]
+            prog = _PROGRESS.setdefault("local", {"completed_labs": [], "earned_badges": [], "assessment_scores": []})
+            if lab_id not in prog["completed_labs"]:
+                prog["completed_labs"].append(lab_id)
+            return 200, ui_response(prog, source="simulated")
+        if p.startswith("/api/v1/ui8999/training/badges/") and p.endswith("/award") and method == "POST":
+            badge_id = p.split("/badges/", 1)[1].split("/", 1)[0]
+            prog = _PROGRESS.setdefault("local", {"completed_labs": [], "earned_badges": [], "assessment_scores": []})
+            if badge_id not in prog["earned_badges"]:
+                prog["earned_badges"].append(badge_id)
+            return 200, ui_response(prog, source="simulated")
+
+        if p == "/api/v1/ui8999/passticket/generate" and method == "POST":
+            svc = get_passticket_service(state)
+            result = svc.generate(str(data.get("userid") or "IBMUSER"), str(data.get("applid") or "GMVB"), str(data.get("requester") or data.get("userid") or "WEB8999"), source="REACT8999")
+            ticket = result.get("ticket") if isinstance(result, dict) else str(result)
+            return 200, ui_response({"passticket": ticket, "ticket": ticket, "applid": str(data.get("applid") or "GMVB"), "requester": str(data.get("requester") or data.get("userid") or "WEB8999"), "result": result})
+        if p == "/api/v1/ui8999/passticket/scenario":
+            return 200, ui_response({"scenario": "PassTicket generation/use is available through existing Gibson backend services."})
+
+        return 404, ui_response(ok=False, error="ui8999 route not found")
+    except Exception as exc:
+        return 500, ui_response(ok=False, error=f"{type(exc).__name__}: {exc}", source="runtime")
+
+# ---------------------------------------------------------------------------
+# Enhanced terminal back-end binding for vulnerable CICS banking terminal
+# ---------------------------------------------------------------------------
+# These late-bound overrides deliberately keep all previous ui8999 routes in
+# place while making the green-screen terminal submit fields to the simulated
+# GMVB/DB2 back-end instead of falling back to the menu on non-transaction input.
+
+_BANK_TRANS = [
+    "CESN", "GMVB", "CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT",
+    "CHAP", "APIM", "TN32", "COBL", "CEMT", "CECI", "CESF", "HELP",
+]
+_TRANSACTION_ALIASES = {
+    "1": "CUST", "2": "ACCT", "3": "TRAN", "4": "BATCH", "5": "CCAP",
+    "6": "SWFT", "7": "CHAP", "8": "APIM", "9": "TN32", "10": "COBL",
+    "C": "CEMT", "E": "CECI", "X": "CESF", "MENU": "GMVB", "LOGOFF": "CESF",
+}
+
+def _normalise_customer_id(raw: str) -> str:
+    val = str(raw or "").strip().upper()
+    if len(val) == 7 and val.isdigit():
+        return val[0] + "0" + val[1:]
+    return val
+
+
+def _gmvb_customer_map(lab: Any) -> dict[str, dict[str, Any]]:
+    if hasattr(lab, "gmvb_customers"):
+        return getattr(lab, "gmvb_customers")
+    rows = _rows_for_table(lab, "GMVB.CUSTOMER")
+    return {str(r.get("CUSTOMER_ID") or r.get("CUSTOMERID")): dict(r) for r in rows}
+
+
+def _gmvb_account_map(lab: Any) -> dict[str, dict[str, Any]]:
+    if hasattr(lab, "gmvb_accounts"):
+        return getattr(lab, "gmvb_accounts")
+    rows = _rows_for_table(lab, "GMVB.ACCOUNT")
+    return {str(r.get("ACCOUNT_NUMBER") or r.get("ACCTNO")): dict(r) for r in rows}
+
+
+def _gmvb_audit(lab: Any, operator: str, event: str, detail: str, result: str = "OK") -> None:
+    try:
+        if hasattr(lab, "gmvb_audit"):
+            lab.gmvb_audit.append({
+                "TIMESTAMP": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "EVENT_TYPE": event,
+                "OPERATOR": operator or "ANON",
+                "DETAILS": detail[:120],
+                "RESULT": result,
+            })
+            lab.gmvb_audit = lab.gmvb_audit[-250:]
+    except Exception:
+        pass
+
+
+def _find_customer(lab: Any, key: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    key = _normalise_customer_id(key)
+    rows = _rows_for_table(lab, "GMVB.CUSTOMER")
+    if _is_sqli(key):
+        return None, rows[:8]
+    for r in rows:
+        if str(r.get("CUSTOMER_ID") or r.get("CUSTOMERID") or "").upper() == key:
+            return r, [r]
+    # Support operator shorthand: 1000002 -> 10000002 and suffix matching.
+    for r in rows:
+        cid = str(r.get("CUSTOMER_ID") or r.get("CUSTOMERID") or "").upper()
+        if cid.endswith(key[-6:]) and key.isdigit():
+            return r, [r]
+    return None, []
+
+
+def _find_account(lab: Any, key: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    key = str(key or "").strip().upper()
+    rows = _rows_for_table(lab, "GMVB.ACCOUNT") or _rows_for_table(lab, "GIBSON.ACCOUNTS")
+    if _is_sqli(key):
+        return None, rows[:8]
+    for r in rows:
+        acct = str(r.get("ACCOUNT_NUMBER") or r.get("ACCTNO") or r.get("ACCOUNT_ID") or "").upper()
+        if acct == key:
+            return r, [r]
+    return None, []
+
+
+def _field_value(sess: dict[str, Any], payload: dict[str, Any], name: str, default: str = "") -> str:
+    fields = payload.get("fields") or {}
+    if name in fields:
+        return str(fields.get(name) or "")
+    if name in payload:
+        return str(payload.get(name) or "")
+    return str(sess.get("field_values", {}).get(name, default))
+
+
+def _screen_tail() -> list[dict[str, Any]]:
+    return [_text(22, 1, "COMMAND ===>", "cyan"), _text(24, 1, "PF1=HELP PF3=EXIT PF5=REFRESH ENTER=EXECUTE", "blue")]
+
+
+def _terminal_screen(state: Any, sess: dict[str, Any], lab: Any,
+                     screen: str | None = None,
+                     payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    screen = (screen or sess.get("screen") or "CESN").upper()
+    payload = payload or {}
+    msg = str(payload.get("message") or "")
+    fields_in = payload.get("fields") or {}
+    hack_on = bool(sess.get("hack", {}).get("enabled"))
+    for k, v in fields_in.items():
+        # Do not let direct API callers overtype protected/hidden fields unless
+        # Hack Fields is enabled.  Normal input fields are still captured.
+        if k in {"SQLTRACE", "AUTHFLAG", "ADMINFLAG", "DEBUGFLAG", "OWNER_USERID", "AUTH_CHECK_DONE", "ACCOUNT_ROLE"} and not hack_on:
+            continue
+        sess.setdefault("field_values", {})[k] = v
+
+    if screen == "CESN":
+        return _screen("CESN", "CICS SIGN-ON", [
+            _text(1, 1, "CESN                    CICS SIGN-ON                    GIBSON REGION A", "blue"),
+            _text(4, 12, "USERID . . . . .", "cyan"),
+            _text(5, 12, "PASSWORD . . . .", "cyan"),
+            _text(6, 12, "GROUP . . . . . .", "cyan"),
+            _text(9, 12, msg or "MESSAGE: ENTER GACF USERID AND PASSWORD", "yellow"),
+        ] + _screen_tail(), [
+            _field("userid", "USERID", 4, 30, 8, sess.get("userid", "GUEST")),
+            _field("password", "PASSWORD", 5, 30, 8, ""),
+            _field("group", "GROUP", 6, 30, 8, ""),
+        ], msg)
+
+    if screen == "GMVB":
+        rows = [
+            _text(1, 1, f"GMVB                 GIBSON MUTUAL VIRTUAL BANK                  {_now()}", "yellow"),
+            _text(2, 22, "CICS/DB2 CORE BANKING SYSTEM", "cyan"),
+        ]
+        labels = [
+            ("1", "Customer Inquiry / Maintenance", "CUST"),
+            ("2", "Account Inquiry / Maintenance", "ACCT"),
+            ("3", "Funds Transfer", "TRAN"),
+            ("4", "Batch Transfer Release", "BATCH"),
+            ("5", "Credit Card Approval", "CCAP"),
+            ("6", "SWIFT Payment Entry", "SWFT"),
+            ("7", "CHAPS High-Value Payment", "CHAP"),
+            ("8", "API / Integration Gateway", "APIM"),
+            ("9", "TN3270 Buffer Viewer", "TN32"),
+            ("10", "COBOL Source Review", "COBL"),
+            ("C", "CICS Control", "CEMT"),
+            ("E", "Command Interpreter", "CECI"),
+            ("X", "Sign off", "CESF"),
+        ]
+        for idx, (n, label, trans) in enumerate(labels, start=5):
+            rows.append(_text(idx, 5, f"{n:<3}{label:<38}{trans}", "green" if idx < 15 else "blue"))
+        if msg:
+            rows.append(_text(20, 5, msg[:70], "yellow"))
+        return _screen("GMVB", "GIBSON MUTUAL VIRTUAL BANK", rows + _screen_tail(), [], msg)
+
+    if screen == "CUST":
+        q = _field_value(sess, payload, "customer_id", "10000001")
+        action = _field_value(sess, payload, "cust_action", "INQ").strip().upper() or "INQ"
+        cust_map = _gmvb_customer_map(lab)
+        db_msg = msg
+        if action in {"ADD", "A"}:
+            cid = _normalise_customer_id(q or f"{10000000 + len(cust_map) + 1}")
+            cust_map[cid] = {
+                "SURNAME": _field_value(sess, payload, "surname", "NEWCUSTOMER").upper()[:30],
+                "FORENAME": _field_value(sess, payload, "forename", "TRAINING").upper()[:20],
+                "DOB": _field_value(sess, payload, "dob", "01/01/60")[:8],
+                "SORTCODE": _field_value(sess, payload, "sortcode", "204514")[:6],
+                "NI": _field_value(sess, payload, "ni", "ZZ999999Z")[:9],
+                "ADDRESS": _field_value(sess, payload, "address", "TRAINING ADDRESS LONDON EC1")[:70],
+                "STATUS": _field_value(sess, payload, "status", "A")[:1].upper(),
+                "TYPE": _field_value(sess, payload, "cust_type", "P")[:1].upper(),
+                "OWNER": sess.get("userid", "GUEST")[:8].upper(),
+            }
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "CUST_ADD", f"Customer {cid} added from CICS terminal")
+            q, db_msg = cid, f"DFHCU0001 CUSTOMER {cid} ADDED"
+        elif action in {"DEL", "DELETE", "D"}:
+            cid = _normalise_customer_id(q)
+            if cid in cust_map:
+                cust_map.pop(cid, None)
+                _gmvb_audit(lab, sess.get("userid", "GUEST"), "CUST_DELETE", f"Customer {cid} deleted from CICS terminal")
+                db_msg = f"DFHCU0002 CUSTOMER {cid} DELETED"
+            else:
+                db_msg = f"DFHCU0044 CUSTOMER {cid} NOT FOUND"
+        supplied_sqltrace = str(fields_in.get("SQLTRACE") or "")
+        if supplied_sqltrace and not hack_on:
+            db_msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+        rec, result_rows = _find_customer(lab, q)
+        trace_sqli = bool(supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace))
+        sqli = _is_sqli(q) or trace_sqli
+        if trace_sqli:
+            result_rows = _rows_for_table(lab, "GMVB.CUSTOMER")[:8]
+            db_msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+            sess["logs"].append({"event":"SQLTRACE_OVERTYPE","screen":"CUST","result":"CONTROLLED-SQLI","training_only":True})
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "SQLTRACE_OVERTYPE", "CUST SQLTRACE controlled SQLi", "CONTROLLED-SQLI")
+        if not rec and result_rows:
+            rec = result_rows[0]
+        rec = rec or {}
+        sql = supplied_sqltrace if supplied_sqltrace and hack_on else f"SELECT CUSTOMER_ID,SURNAME,FORENAME,DOB,SORTCODE,NI,ADDRESS,STATUS,TYPE FROM GMVB.CUSTOMER WHERE CUSTOMER_ID = '{q}'"
+        name = f"{rec.get('SURNAME',''):<22} {rec.get('FORENAME','')}".strip() or "NOT FOUND"
+        rows = [
+            _text(1, 1, "CUST                 CUSTOMER MASTER FILE MAINTENANCE", "blue"),
+            _text(3, 5, "CUSTOMER ID . . . .", "cyan"),
+            _text(4, 5, "SURNAME . . . . . .", "cyan"),
+            _text(5, 5, "FORENAME . . . . .", "cyan"),
+            _text(6, 5, "DATE OF BIRTH . . .", "cyan"),
+            _text(7, 5, "SORT CODE . . . . .", "cyan"),
+            _text(8, 5, "NI NUMBER . . . . .", "cyan"),
+            _text(9, 5, "ADDRESS . . . . . .", "cyan"),
+            _text(11, 5, "STATUS/TYPE/OWNER .", "cyan"),
+            _text(11, 28, f"{rec.get('STATUS','')} {rec.get('TYPE','')} {rec.get('OWNER','')}", "white"),
+            _text(13, 5, "RESULT COUNT . . .", "cyan"),
+            _text(13, 28, str(len(result_rows) if result_rows else 0), "yellow" if sqli else "white"),
+            _text(14, 5, "DB2 STATUS . . . .", "cyan"),
+            _text(14, 28, db_msg if db_msg else ("DFHSQ0001 CONTROLLED SQLI RESULT" if sqli else "DSN0000I SELECT COMPLETE"), "red" if (sqli or "REJECTED" in str(db_msg).upper()) else "green"),
+            _text(20, 5, "ACTION: INQ ADD DEL   PF5=ADD PF7=DELETE PF8=INQUIRE", "yellow"),
+        ] + _screen_tail()
+        return _screen("CUST", "CUSTOMER MASTER FILE MAINTENANCE", rows, [
+            _field("customer_id", "CUSTOMER ID", 3, 28, 12, q),
+            _db_field("surname", "SURNAME", 4, 28, 30, rec.get("SURNAME", ""), source="GMVB.CUSTOMER"),
+            _db_field("forename", "FORENAME", 5, 28, 20, rec.get("FORENAME", ""), source="GMVB.CUSTOMER"),
+            _db_field("dob", "DATE OF BIRTH", 6, 28, 8, rec.get("DOB", ""), source="GMVB.CUSTOMER"),
+            _db_field("sortcode", "SORT CODE", 7, 28, 6, rec.get("SORTCODE", ""), numeric=True, source="GMVB.CUSTOMER"),
+            _db_field("ni", "NI NUMBER", 8, 28, 9, rec.get("NI", ""), source="GMVB.CUSTOMER"),
+            _db_field("address", "ADDRESS", 9, 28, 50, rec.get("ADDRESS", "")[:50], source="GMVB.CUSTOMER"),
+            _field("cust_action", "ACTION", 20, 13, 6, action),
+        ] + _base_hidden("CUST", sql), "SQL injection training result" if sqli else db_msg)
+
+    if screen == "ACCT":
+        q = _field_value(sess, payload, "account", "1000000101")
+        action = _field_value(sess, payload, "acct_action", "INQ").strip().upper() or "INQ"
+        acct_map = _gmvb_account_map(lab)
+        db_msg = msg
+        if action in {"ADD", "A"}:
+            acct = q or f"{1000000000 + len(acct_map) + 1}"
+            acct_map[acct] = {
+                "CUSTOMER": _normalise_customer_id(_field_value(sess, payload, "acct_customer", "10000001")),
+                "TYPE": _field_value(sess, payload, "acct_type", "CUR")[:3].upper(),
+                "SORTCODE": _field_value(sess, payload, "acct_sortcode", "204514")[:6],
+                "OPENED": _field_value(sess, payload, "opened", "23/05/86")[:8],
+                "CURRENCY": _field_value(sess, payload, "currency", "GBP")[:3].upper(),
+                "BALANCE": _field_value(sess, payload, "balance", "0.00"),
+                "LIMIT": _field_value(sess, payload, "limit", "0.00"),
+                "RATE": _field_value(sess, payload, "rate", "0.00"),
+                "STATUS": _field_value(sess, payload, "acct_status", "A")[:1].upper(),
+                "OWNER": sess.get("userid", "GUEST")[:8].upper(),
+            }
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "ACCT_ADD", f"Account {acct} added from CICS terminal")
+            db_msg = f"DFHAC0001 ACCOUNT {acct} ADDED"
+        elif action in {"DEL", "DELETE", "D"}:
+            if q in acct_map:
+                acct_map.pop(q, None)
+                _gmvb_audit(lab, sess.get("userid", "GUEST"), "ACCT_DELETE", f"Account {q} deleted from CICS terminal")
+                db_msg = f"DFHAC0002 ACCOUNT {q} DELETED"
+            else:
+                db_msg = f"DFHAC0044 ACCOUNT {q} NOT FOUND"
+        supplied_sqltrace = str(fields_in.get("SQLTRACE") or "")
+        if supplied_sqltrace and not hack_on:
+            db_msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+        rec, result_rows = _find_account(lab, q)
+        trace_sqli = bool(supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace))
+        sqli = _is_sqli(q) or trace_sqli
+        if trace_sqli:
+            result_rows = (_rows_for_table(lab, "GMVB.ACCOUNT") or _rows_for_table(lab, "GIBSON.ACCOUNTS"))[:8]
+            db_msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+            sess["logs"].append({"event":"SQLTRACE_OVERTYPE","screen":"ACCT","result":"CONTROLLED-SQLI","training_only":True})
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "SQLTRACE_OVERTYPE", "ACCT SQLTRACE controlled SQLi", "CONTROLLED-SQLI")
+        if not rec and result_rows:
+            rec = result_rows[0]
+        rec = rec or {}
+        sql = supplied_sqltrace if supplied_sqltrace and hack_on else f"SELECT ACCOUNT_NUMBER,CUSTOMER,TYPE,BALANCE,STATUS FROM GMVB.ACCOUNT WHERE ACCOUNT_NUMBER = '{q}'"
+        rows = [
+            _text(1, 1, "ACCT                 ACCOUNT MASTER FILE MAINTENANCE", "blue"),
+            _text(3, 5, "ACCOUNT NUMBER . .", "cyan"),
+            _text(4, 5, "CUSTOMER ID . . .", "cyan"),
+            _text(5, 5, "ACCOUNT TYPE . . .", "cyan"),
+            _text(6, 5, "SORT CODE . . . .", "cyan"),
+            _text(7, 5, "BALANCE . . . . .", "cyan"),
+            _text(8, 5, "LIMIT . . . . . .", "cyan"),
+            _text(9, 5, "STATUS/OWNER . . .", "cyan"),
+            _text(9, 28, f"{rec.get('STATUS','')} {rec.get('OWNER','')}", "white"),
+            _text(11, 5, "LAST TRANSACTION .", "cyan"),
+            _text(11, 28, _last_transaction_for(lab, str(rec.get('ACCOUNT_NUMBER') or q)), "white"),
+            _text(13, 5, "RESULT COUNT . . .", "cyan"),
+            _text(13, 28, str(len(result_rows) if result_rows else 0), "yellow" if sqli else "white"),
+            _text(14, 5, "DB2 STATUS . . . .", "cyan"),
+            _text(14, 28, db_msg if db_msg else ("DFHSQ0001 CONTROLLED SQLI/IDOR RESULT" if sqli else "DSN0000I SELECT COMPLETE"), "red" if (sqli or "REJECTED" in str(db_msg).upper()) else "green"),
+            _text(20, 5, "ACTION: INQ ADD DEL   PF5=ADD PF7=DELETE PF8=INQUIRE", "yellow"),
+        ] + _screen_tail()
+        return _screen("ACCT", "ACCOUNT MASTER FILE MAINTENANCE", rows, [
+            _field("account", "ACCOUNT NUMBER", 3, 28, 14, q, numeric=True),
+            _db_field("acct_customer", "CUSTOMER ID", 4, 28, 12, rec.get("CUSTOMER", rec.get("CUSTOMER_ID", "")), source="GMVB.ACCOUNT"),
+            _db_field("acct_type", "ACCOUNT TYPE", 5, 28, 3, rec.get("TYPE", ""), source="GMVB.ACCOUNT"),
+            _db_field("acct_sortcode", "SORT CODE", 6, 28, 6, rec.get("SORTCODE", ""), numeric=True, source="GMVB.ACCOUNT"),
+            _db_field("balance", "BALANCE", 7, 28, 14, rec.get("BALANCE", "0.00"), numeric=True, source="GMVB.ACCOUNT"),
+            _db_field("limit", "LIMIT", 8, 28, 12, rec.get("LIMIT", "0.00"), numeric=True, source="GMVB.ACCOUNT"),
+            _field("acct_action", "ACTION", 20, 13, 6, action),
+        ] + _base_hidden("ACCT", sql) + [
+            _field("OWNER_USERID", "OWNER_USERID", 19, 2, 8, rec.get("OWNER", "OTHERUSR"), protected=True, hidden=True),
+            _field("AUTH_CHECK_DONE", "AUTH_CHECK_DONE", 19, 24, 1, "N", protected=True, hidden=True),
+            _field("ACCOUNT_ROLE", "ACCOUNT_ROLE", 19, 46, 12, "UNVERIFIED", protected=True, hidden=True),
+        ], "SQL injection training result" if sqli else db_msg)
+
+    if screen == "TRAN":
+        from_acct = _field_value(sess, payload, "from_account", "1000000101")
+        to_acct = _field_value(sess, payload, "to_account", "1000000201")
+        amount = _field_value(sess, payload, "amount", "00000100.00")
+        approval = _field_value(sess, payload, "approval", "N")
+        if payload.get("submit") or str(payload.get("command", "")).upper() in {"ENTER", "SUBMIT"}:
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "TRAN_POST", f"Transfer {from_acct}->{to_acct} amount {amount} approval {approval}", "TRAINING")
+            msg = f"DFHTR0001 TRANSFER {amount} POSTED - TRAINING MODE"
+        rows = [_text(1, 1, "TRAN                 FUNDS TRANSFER POSTING", "blue"),
+                _text(4, 5, "FROM ACCOUNT . .", "cyan"), _text(5, 5, "TO ACCOUNT . . .", "cyan"),
+                _text(6, 5, "AMOUNT . . . . .", "cyan"), _text(7, 5, "REFERENCE . . .", "cyan"),
+                _text(8, 5, "APPROVAL . . . .", "cyan"), _text(15, 5, msg or "ENTER DETAILS AND PRESS ENTER", "yellow")]
+        return _screen("TRAN", "FUNDS TRANSFER POSTING", rows + _screen_tail(), [
+            _field("from_account", "FROM ACCOUNT", 4, 28, 14, from_acct, numeric=True),
+            _field("to_account", "TO ACCOUNT", 5, 28, 14, to_acct, numeric=True),
+            _field("amount", "AMOUNT", 6, 28, 14, amount, numeric=True),
+            _field("reference", "REFERENCE", 7, 28, 30, _field_value(sess, payload, "reference", "RENT")),
+            _field("approval", "APPROVAL", 8, 28, 1, approval, protected=True),
+        ] + _base_hidden("TRAN"), msg)
+
+    if screen == "BATCH":
+        batches = _rows_for_table(lab, "GMVB.PAYMENT_BATCH") or []
+        batch_id = _field_value(sess, payload, "batch_id", batches[0].get("BATCH_ID", "B2026A17") if batches else "B2026A17")
+        batch = next((b for b in batches if b.get("BATCH_ID") == batch_id), batches[0] if batches else {})
+        rows = [_text(1, 1, "BATCH                BATCH TRANSFER RELEASE", "blue"),
+                _text(4, 5, "BATCH ID . . . .", "cyan"), _text(5, 5, "ITEM COUNT . . .", "cyan"), _text(5, 28, str(batch.get("RECORDS", "00012")), "white"),
+                _text(6, 5, "TOTAL VALUE . .", "cyan"), _text(6, 28, str(batch.get("VALUE", "000245000.00")), "white"),
+                _text(7, 5, "STATUS . . . . .", "cyan"), _text(7, 28, str(batch.get("STATUS", "HELD-PIN-REQ")), "yellow"),
+                _text(10, 5, "SUPERVISOR ID .", "cyan"), _text(11, 5, "RELEASE PIN . .", "cyan"), _text(12, 5, "ACTION . . . . .", "cyan"),
+                _text(15, 5, "HACK3270 BATCH PIN TAB PROVIDES LOCAL SIMULATED BRUTE FORCE", "red")]
+        return _screen("BATCH", "BATCH TRANSFER RELEASE", rows + _screen_tail(), [
+            _field("batch_id", "BATCH ID", 4, 28, 16, batch_id),
+            _field("supervisor", "SUPERVISOR ID", 10, 28, 8, _field_value(sess, payload, "supervisor", "SUPR01")),
+            _field("release_pin", "RELEASE PIN", 11, 28, 4, _field_value(sess, payload, "release_pin", ""), numeric=True, protected=True),
+            _field("batch_action", "ACTION", 12, 28, 8, _field_value(sess, payload, "batch_action", "RELEASE")),
+            _field("MAX_ATTEMPTS", "MAX_ATTEMPTS", 18, 2, 4, "9999", protected=True, hidden=True),
+            _field("LOCKOUT_FLAG", "LOCKOUT_FLAG", 18, 24, 1, "N", protected=True, hidden=True),
+            _field("PIN_HASH", "PIN_HASH", 18, 46, 20, "SIMULATED", protected=True, hidden=True),
+            _field("BYPASS_FLAG", "BYPASS_FLAG", 19, 2, 1, "N", protected=True, hidden=True),
+            _field("APPROVER_ROLE", "APPROVER_ROLE", 19, 24, 12, "BATCHSUP", protected=True, hidden=True),
+        ] + _base_hidden("BATCH"), msg)
+
+    if screen == "CCAP":
+        cards = _rows_for_table(lab, "GMVB.CARD_APPLICATION") or []
+        app_id = _field_value(sess, payload, "app_id", cards[0].get("APP_ID", "APP-CC-001") if cards else "APP-CC-001")
+        app = next((c for c in cards if c.get("APP_ID") == app_id), cards[0] if cards else {})
+        rows = [_text(1, 1, "CCAP                 CREDIT CARD APPROVAL", "blue"),
+                _text(4, 5, "APPLICATION ID .", "cyan"), _text(5, 5, "CUSTOMER NAME . .", "cyan"), _text(5, 28, f"{app.get('SURNAME','')} {app.get('FORENAME','')}", "white"),
+                _text(6, 5, "REQUESTED LIMIT", "cyan"), _text(7, 5, "RISK SCORE . . .", "cyan"), _text(7, 28, str(app.get("SCORE", "072")), "white"),
+                _text(8, 5, "STATUS . . . . .", "cyan"), _text(8, 28, str(app.get("STATUS", "REFER")), "yellow"),
+                _text(10, 5, "APPROVAL CODE .", "cyan"), _text(11, 5, "DECISION . . . .", "cyan"),
+                _text(15, 5, "TRAINING: DISABLE PROTECTION AND OVERTYPE DECISION", "red")]
+        return _screen("CCAP", "CREDIT CARD APPROVAL", rows + _screen_tail(), [
+            _field("app_id", "APPLICATION ID", 4, 28, 12, app_id),
+            _field("requested_limit", "REQUESTED LIMIT", 6, 28, 8, _field_value(sess, payload, "requested_limit", "00005000"), numeric=True),
+            _field("approval_code", "APPROVAL CODE", 10, 28, 8, _field_value(sess, payload, "approval_code", "")),
+            _field("decision", "DECISION", 11, 28, 8, _field_value(sess, payload, "decision", app.get("SYSTEM", "REFER")), protected=True),
+            _field("RISK_OVERRIDE", "RISK_OVERRIDE", 18, 2, 1, "N", protected=True, hidden=True),
+            _field("APPROVED_LIMIT", "APPROVED_LIMIT", 18, 24, 8, "00005000", protected=True, hidden=True),
+        ] + _base_hidden("CCAP"), msg)
+
+    if screen in {"SWFT", "CHAP"}:
+        is_swift = screen == "SWFT"
+        title = "INTERNATIONAL PAYMENT ENTRY" if is_swift else "CHAPS HIGH VALUE PAYMENT"
+        rows = [_text(1, 1, f"{screen:<20}{title}", "blue")]
+        if is_swift:
+            layout = [(4,"MESSAGE TYPE . .","MT103"),(5,"SENDER BIC . . .","GMVBGB2L"),(6,"RECEIVER BIC . .","DEUTDEFF"),(7,"VALUE DATE . . .","260523"),(8,"CURRENCY . . . .","USD"),(9,"AMOUNT . . . . .","000125000.00"),(10,"BENEFICIARY . .","ACME EXPORTS"),(11,"DETAILS . . . .","INVOICE 7781"),(13,"STATUS . . . . .","HELD-REVIEW")]
+            hidden = ["SWIFT_RAW", "RELEASE_FLAG", "SANCTIONS_CHECK", "DUAL_CONTROL"]
+        else:
+            layout = [(4,"PAYMENT ID . . .","CH20260523001"),(5,"SORT CODE . . .","20-00-00"),(6,"ACCOUNT . . . .","12345678"),(7,"AMOUNT . . . . .","000950000.00"),(8,"BENEFICIARY . .","PROPERTY SOLICITORS LLP"),(9,"PURPOSE . . . .","COMPLETION FUNDS"),(10,"STATUS . . . . .","AWAITING-DUAL-AUTH"),(12,"SUPERVISOR PIN .","")]
+            hidden = ["DUAL_AUTH_OK", "LIMIT_BYPASS", "SANCTIONS_STATUS", "RTGS_QUEUE_ID"]
+        fields = []
+        for row, label, default in layout:
+            fid = label.lower().replace(" ", "_").replace(".", "").strip("_")
+            rows.append(_text(row, 5, label, "cyan"))
+            fields.append(_field(fid, label, row, 28, max(4, len(default) + 4), _field_value(sess, payload, fid, default), numeric="AMOUNT" in label or "PIN" in label))
+        rows.append(_text(15, 5, "TRAINING: HIDDEN RELEASE/DUAL CONTROL FLAGS AND WEAK VALIDATION", "red"))
+        for i, h in enumerate(hidden):
+            fields.append(_field(h, h, 18 + i // 2, 2 + (i % 2) * 28, 20, "SIMULATED" if h.endswith("RAW") else "N", protected=True, hidden=True))
+        return _screen(screen, title, rows + _screen_tail(), fields + _base_hidden(screen), msg)
+
+    if screen == "APIM":
+        api_input = _field_value(sess, payload, "api_input", "' OR '1'='1")
+        sqli = _is_sqli(api_input)
+        rows = [_text(1, 1, "APIM                 API / INTEGRATION GATEWAY TEST", "blue"),
+                _text(4, 5, "1  Customer API Lookup", "green"), _text(5, 5, "2  Account API Lookup", "green"),
+                _text(6, 5, "3  Payment Status API", "green"), _text(7, 5, "4  SWIFT/CHAPS Message API", "green"),
+                _text(8, 5, "5  Debug Headers / Token View", "green"), _text(9, 5, "6  Unsafe Query Test", "red"),
+                _text(11, 5, "SELECT OPTION . .", "cyan"), _text(12, 5, "API INPUT . . . .", "cyan"),
+                _text(14, 5, "API RESPONSE / LEAKAGE:", "yellow"),
+                _text(15, 5, "MULTI-RECORD CUSTOMER RESPONSE + INTERNAL FLAGS" if sqli else "NORMAL API LOOKUP READY", "red" if sqli else "white"),
+                _text(16, 5, "LEAK: PROGRAM=VULNERABLE-BANK-UPDATE MAPSET=BANKMAP SQLTRACE=ON", "white")]
+        return _screen("APIM", "API / INTEGRATION GATEWAY TEST", rows + _screen_tail(), [
+            _field("api_option", "SELECT OPTION", 11, 28, 1, _field_value(sess, payload, "api_option", "6"), numeric=True),
+            _field("api_input", "API INPUT", 12, 28, 32, api_input),
+        ] + _base_hidden("APIM", f"SELECT * FROM API_CUSTOMER WHERE CUSTOMER_ID = '{api_input}'"), "API SQL injection / data leakage result" if sqli else msg)
+
+    if screen == "TN32":
+        return _screen("TN32", "SIMULATED TN3270 BUFFER VIEW", [
+            _text(1, 1, "TN32                 SIMULATED TN3270 BUFFER VIEW", "blue"),
+            _text(4, 5, "CAPTURE ID . . . CAP000042", "cyan"),
+            _text(5, 5, f"SESSION . . . . . {sess.get('sid')}", "cyan"),
+            _text(6, 5, f"USERID . . . . .  {sess.get('userid')}", "cyan"),
+            _text(7, 5, f"TRANSID . . . . . {sess.get('screen')}", "cyan"),
+            _text(9, 5, "BUFFER EXCERPT:", "yellow"),
+            _text(10, 5, f"USERID={sess.get('userid')}", "white"),
+            _text(11, 5, f"TRAN={sess.get('screen')}", "white"),
+            _text(12, 5, "FIELD=RELEASE-PIN ATTR=NUM PROT=Y VALUE=****", "white"),
+            _text(13, 5, "FIELD=AUTHFLAG ATTR=HID PROT=Y VALUE=N", "white"),
+            _text(14, 5, "FIELD=BYPASS_FLAG ATTR=HID PROT=Y VALUE=N", "white"),
+            _text(17, 5, "WARNING: SIMULATED PLAINTEXT 3270 BUFFER FOR TRAINING ONLY", "red"),
+        ] + _screen_tail(), [], msg)
+
+    if screen == "COBL":
+        rows = [_text(1, 1, "COBL                 VULNERABLE COBOL SOURCE REVIEW", "blue"),
+                _text(3, 1, "VULNERABLE-BANK-UPDATE.COBOL", "yellow"),
+                _text(5, 1, "VULN-07 UNSAFE RECEIVE MAP / VULN-08 DIRECT MOVE OVERFLOW", "red"),
+                _text(6, 1, "VULN-10 AUTH BYPASS FLAG / VULN-11 DEBUG BACKDOOR", "red"),
+                _text(7, 1, "VULN-12 UNSAFE NUMVAL / VULN-13 SENSITIVE LOGGING", "red"),
+                _text(8, 1, "VULN-15 UNSAFE CHANNEL CONTAINER", "red")]
+        for idx, line in enumerate(VULNERABLE_BANK_UPDATE_COBOL.splitlines()[:12], start=10):
+            rows.append(_text(idx, 1, line[:78], "green"))
+        return _screen("COBL", "VULNERABLE COBOL SOURCE REVIEW", rows + _screen_tail(), [], msg)
+
+    if screen == "CEMT":
+        out = CicsSimulator(state, sess.get("userid", "IBMUSER")).execute("CEMT I TRAN")
+        rows = [_text(1, 1, "CEMT                 CICS MASTER TERMINAL", "blue")]
+        for i, line in enumerate(str(out).splitlines()[:18], start=3):
+            rows.append(_text(i, 1, line[:78], "green"))
+        return _screen("CEMT", "CICS MASTER TERMINAL", rows + _screen_tail(), [], msg)
+
+    if screen == "CECI":
+        return _screen("CECI", "CICS COMMAND INTERPRETER", [
+            _text(1, 1, "CECI                 CICS COMMAND INTERPRETER", "blue"),
+            _text(4, 5, "COMMAND . . . EXEC CICS READ FILE('FILEA')", "cyan"),
+            _text(8, 5, "CONTROLLED TRAINING COMMAND INTERPRETER - NO HOST ACTIONS", "yellow"),
+        ] + _screen_tail(), [], msg)
+
+    if screen == "CESF":
+        sess["logged_on"] = False
+        return _terminal_screen(state, sess, lab, "CESN", {"message": "CESF SIGNOFF COMPLETE"})
+
+    if screen == "HELP":
+        rows = [_text(1, 1, "HELP                 GIBSON CICS BANKING TERMINAL", "blue")]
+        for i, t in enumerate(_BANK_TRANS, start=3):
+            rows.append(_text(i, 5, t, "green"))
+        return _screen("HELP", "HELP", rows + _screen_tail(), [], msg)
+
+    return _terminal_screen(state, sess, lab, "GMVB", {"message": f"UNKNOWN TRANSACTION {screen}"})
+
+
+def _last_transaction_for(lab: Any, account: str) -> str:
+    rows = _rows_for_table(lab, "GMVB.TRANSACTION") or []
+    for r in reversed(rows):
+        if str(r.get("ACCOUNT") or r.get("ACCOUNT_NUMBER") or "") == account:
+            return f"{r.get('TRANID','')} {r.get('TYPE','')} {r.get('AMOUNT','')} {r.get('DESC','')}"[:48]
+    return "NO RECENT ACTIVITY"
+
+
+def _route_terminal(state: Any, lab: Any, p: str, method: str,
+                    data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if not p.startswith("/api/v1/ui8999/terminal") and not p.startswith("/api/v1/ui8999/hack3270/session") and not p.startswith("/api/v1/ui8999/api-menu"):
+        return None
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+    sess = _session(sid)
+    if p == "/api/v1/ui8999/terminal/config":
+        return 200, ui_response({"application":"Gibson Vulnerable CICS Bank Terminal","default_route":"/","transactions":_BANK_TRANS,"react":True,"training_only":True})
+    if p == "/api/v1/ui8999/terminal/transactions":
+        return 200, ui_response([{"name": t, "status":"ENABLED", "terminal": True} for t in _BANK_TRANS])
+    if p == "/api/v1/ui8999/terminal/start" and method == "POST":
+        sess = _new_session(sid, str(data.get("userid") or "GUEST"))
+        return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab, "CESN")))
+    if p == "/api/v1/ui8999/terminal/logon" and method == "POST":
+        user = str(data.get("userid") or data.get("user") or "GUEST").upper()
+        password = str(data.get("password") or "GUEST")
+        sess["userid"] = user
+        if user and password:
+            sess["logged_on"] = True
+            sess["screen"] = "GMVB"
+            sess["logs"].append({"event":"LOGON","userid":user,"result":"ACCEPTED","training_only":True})
+            _gmvb_audit(lab, user, "LOGON", f"{user} signed on through React8999 terminal")
+            scr = _terminal_screen(state, sess, lab, "GMVB", {"message": f"DFHAC2001 {user} SIGNED ON"})
+            return 200, ui_response(_screen_response(state, sess, lab, scr, messages=[f"DFHAC2001 {user} SIGNED ON"]))
+        return 401, ui_response(ok=False, error="signon failed")
+    if p.startswith("/api/v1/ui8999/terminal/session/"):
+        if method == "GET":
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab)))
+        if p.endswith("/command") and method == "POST":
+            fields = dict(data.get("fields") or {})
+            for k, v in fields.items():
+                sess.setdefault("field_values", {})[k] = v
+            raw_cmd = str(data.get("command") or data.get("input") or "").strip()
+            current = str(data.get("current_screen") or sess.get("screen") or "GMVB").upper()
+            cmd_up = raw_cmd.upper()
+            if current == "CESN":
+                user = fields.get("userid") or data.get("userid") or sess.get("userid") or "GUEST"
+                password = fields.get("password") or data.get("password") or "GUEST"
+                return _route_terminal(state, lab, "/api/v1/ui8999/terminal/logon", "POST", {"sid": sid, "userid": user, "password": password}, query)
+            aliases = _TRANSACTION_ALIASES
+            first = cmd_up.split()[0] if cmd_up else ""
+            if first in aliases:
+                first = aliases[first]
+            if first in _BANK_TRANS:
+                screen = first
+                payload = {**data, "fields": fields}
+            elif not raw_cmd or cmd_up in {"ENTER", "SUBMIT"}:
+                screen = current
+                payload = {**data, "fields": fields, "submit": True}
+            elif current == "CUST":
+                screen = "CUST"
+                payload = {**data, "fields": {**fields, "customer_id": raw_cmd}}
+            elif current == "ACCT":
+                screen = "ACCT"
+                payload = {**data, "fields": {**fields, "account": raw_cmd}}
+            elif current == "APIM":
+                screen = "APIM"
+                payload = {**data, "fields": {**fields, "api_input": raw_cmd}}
+            elif current in {"BATCH", "CCAP", "SWFT", "CHAP", "TRAN"}:
+                screen = current
+                payload = {**data, "fields": fields, "submit": True, "command": cmd_up}
+            else:
+                screen = "GMVB"
+                payload = {"message": f"UNKNOWN TRANSACTION {raw_cmd}"}
+            sess["screen"] = screen
+            sess["logs"].append({"event":"COMMAND","command":raw_cmd or "ENTER","screen":screen,"fields":list(fields.keys())})
+            scr = _terminal_screen(state, sess, lab, screen, payload)
+            return 200, ui_response(_screen_response(state, sess, lab, scr))
+        if p.endswith("/field") and method == "POST":
+            fid = str(data.get("field") or data.get("field_id") or "")
+            val = str(data.get("value") or "")
+            protected_ids = {"SQLTRACE", "AUTHFLAG", "ADMINFLAG", "DEBUGFLAG", "OWNER_USERID", "AUTH_CHECK_DONE", "ACCOUNT_ROLE", "balance", "limit", "acct_customer", "acct_type", "acct_sortcode", "surname", "forename", "dob", "sortcode", "ni", "address"}
+            if fid in protected_ids and not sess.get("hack", {}).get("enabled"):
+                msg = f"DFHHK0007 FIELD {fid} OVERTYPE REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"FIELD_OVERTYPE_REJECTED","field":fid,"reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            sess.setdefault("field_values", {})[fid] = val
+            sess["logs"].append({"event":"FIELD_OVERTYPE","field":fid,"value":val,"training_only":True})
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[f"FIELD {fid} OVERTYPED IN TRAINING MODE"]))
+        if p.endswith("/aid") and method == "POST":
+            aid = str(data.get("aid") or "ENTER").upper()
+            sess["logs"].append({"event":"AID","aid":aid})
+            if aid in {"PF3", "CLEAR"}:
+                sess["screen"] = "GMVB"
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[f"AID {aid} SENT"]))
+    if p == "/api/v1/ui8999/terminal/cobol/vulnerable-bank-update":
+        return 200, ui_response({"name":"VULNERABLE-BANK-UPDATE.COBOL","source":VULNERABLE_BANK_UPDATE_COBOL,"markers":["VULN-07","VULN-08","VULN-10","VULN-11","VULN-12","VULN-13","VULN-15"]})
+    if p.startswith("/api/v1/ui8999/hack3270/session/"):
+        if p.endswith("/toggle") and method == "POST":
+            action = str(data.get("action") or "toggle").lower()
+            if action == "toggle":
+                enabled = not bool(sess.get("hack", {}).get("enabled"))
+            else:
+                enabled = action == "on"
+            _normalise_hack(sess, enabled)
+            sess["logs"].append({"event":"HACK_TOGGLE","hack":dict(sess["hack"]),"training_only":True})
+            msg = "DFHHK0001 HACK FIELDS ON - FIELD ATTRIBUTES BYPASSED" if enabled else "DFHHK0002 HACK FIELDS OFF - NORMAL BMS ATTRIBUTES RESTORED"
+            return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+        if p.endswith("/field-inject") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0007 FIELD INJECTION REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"HACK_FIELD_INJECT_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            fid = str(data.get("field") or "AUTHFLAG")
+            val = str(data.get("value") or "Y")
+            sess.setdefault("field_values", {})[fid] = val
+            sess["logs"].append({"event":"HACK_FIELD_INJECT","field":fid,"value":val,"training_only":True})
+            msg = f"DFHHK0003 FIELD {fid} OVERTYPED IN SIMULATED BUFFER"
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg])
+            resp.update({"field": fid, "value": val, "result": "INJECTED", "training_only": True})
+            return 200, ui_response(resp)
+        if p.endswith("/aid-scan") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0009 AID SCAN REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"AID_SCAN_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            rows = [{"aid":k,"result":"supported" if k in {"PF1","PF3","PF5","PF8","PF9","ENTER","CLEAR"} else "hidden/not exposed"} for k in ["PF1","PF3","PF5","PF8","PF9","PF12","PF24","ENTER","CLEAR","PA1","PA2"]]
+            sess["logs"].append({"event":"AID_SCAN","rows":rows,"training_only":True})
+            msg = "DFHHK0004 AID SCAN COMPLETE - PF24 DEBUG BRANCH SIMULATED"
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg])
+            resp.update({"rows": rows, "hidden_function": "PF24 debug/admin branch is simulated only"})
+            return 200, ui_response(resp)
+        if p.endswith("/batch-pin-bruteforce") and method == "POST":
+            if not sess.get("hack", {}).get("enabled"):
+                msg = "DFHHK0010 BATCH PIN BRUTE FORCE REJECTED - HACK FIELDS OFF"
+                sess["logs"].append({"event":"BATCH_PIN_BRUTE_FORCE_REJECTED","reason":"HACK_OFF","training_only":True})
+                return 200, ui_response(_screen_response(state, sess, lab, _terminal_screen(state, sess, lab), messages=[msg]))
+            pins = [str(x) for x in (data.get("pins") or ["0000", "1111", "1234", "0032"])]
+            target = str(data.get("target_pin") or sess.get("batch_pin") or "0032")
+            accepted = [target]
+            if "1337" not in accepted:
+                accepted.append("1337")  # legacy simulator PIN retained for backward compatibility
+            found = next((pin for pin in pins if pin in accepted), None)
+            attempts = [{"pin":pin,"result":"MATCH" if pin in accepted else "NO"} for pin in pins]
+            message = "DFHBA7701 BATCH B2026A17 RELEASED BY SUPERVISOR OVERRIDE" if found else "DFHBA7702 BATCH RELEASE PIN NOT FOUND"
+            sess["logs"].append({"event":"BATCH_PIN_BRUTE_FORCE","result":"FOUND" if found else "NOT_FOUND","pin":found or "","attempts":attempts,"training_only":True})
+            _gmvb_audit(lab, sess.get("userid", "GUEST"), "BATCH_PIN_BRUTE_FORCE", message, "FOUND" if found else "NOT_FOUND")
+            resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab, "BATCH"), messages=[message, f"ATTEMPTS={len(attempts)} FOUND={found or 'NO'}"])
+            resp.update({"found": found, "attempts": attempts, "message": message, "training_only": True})
+            return 200, ui_response(resp)
+        if p.endswith("/buffer"):
+            return 200, ui_response({"capture_id":"CAP000042","session":sid,"userid":sess.get("userid"),"buffer":["USERID=" + sess.get("userid", "GUEST"), "TRAN=" + sess.get("screen", "GMVB"), "FIELD=RELEASE-PIN ATTR=NUM PROT=Y VALUE=****", "FIELD=AUTHFLAG ATTR=HID PROT=Y VALUE=" + str(sess.get("field_values", {}).get("AUTHFLAG", "N"))],"training_only":True})
+        if p.endswith("/logs"):
+            return 200, ui_response(sess.get("logs", []))
+        if p.endswith("/statistics"):
+            return 200, ui_response({"commands":len([l for l in sess.get("logs", []) if l.get("event") == "COMMAND"]),"hack_events":len([l for l in sess.get("logs", []) if str(l.get("event", "")).startswith("HACK") or "BRUTE" in str(l.get("event", ""))]),"training_only":True})
+    if p.startswith("/api/v1/ui8999/api-menu"):
+        q = str(data.get("input") or data.get("customer_id") or "' OR '1'='1")
+        rows = _rows_for_table(lab, "GMVB.CUSTOMER")[:8] if _is_sqli(q) else _rows_for_table(lab, "GMVB.CUSTOMER")[:1]
+        sess["screen"] = "APIM"
+        sess.setdefault("field_values", {})["api_input"] = q
+        sess["logs"].append({"event":"API_LEAKAGE","endpoint":p,"sqli":_is_sqli(q),"training_only":True})
+        _gmvb_audit(lab, sess.get("userid", "GUEST"), "API_LEAKAGE", f"API menu unsafe query {q}", "SQLI" if _is_sqli(q) else "OK")
+        msg = "DFHAP0002 API SQLI/DATA LEAKAGE RESULT RENDERED IN TERMINAL" if _is_sqli(q) else "DFHAP0001 API QUERY COMPLETE"
+        leaked = {"program":"VULNERABLE-BANK-UPDATE","mapset":"BANKMAP","role_flags":["AUTHFLAG","ADMINFLAG","DEBUGFLAG"],"sqltrace":f"SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID = '{q}'"}
+        resp = _screen_response(state, sess, lab, _terminal_screen(state, sess, lab, "APIM", {"fields":{"api_input":q}}), messages=[msg, f"ROWS RETURNED={len(rows)} ENDPOINT={p}"])
+        resp.update({"endpoint": p, "input": q, "vulnerable": _is_sqli(q), "rows": rows, "leaked_internal_fields": leaked, "training_only": True})
+        return 200, ui_response(resp)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# FIBS terminal routing override
+# ---------------------------------------------------------------------------
+# Late-bound compatibility layer: FIBS is the primary visible application, while
+# GMVB/OMEN/CBSA are compatibility aliases.  The previous GMVB terminal renderer
+# remains available for legacy screens, but the default/session authority is FIBS.
+from gibson.apps.fibs_service import get_fibs_service
+
+_FIBS_OLD_TERMINAL_SCREEN = _terminal_screen
+_FIBS_OLD_ROUTE_TERMINAL = _route_terminal
+_FIBS_OLD_HANDLE_UI8999 = handle_ui8999
+
+_FIBS_TRANS = ["CESN", "FIBS", "GMVB", "OMEN", "CUST", "ACCT", "CUSTA", "CUSA", "ACCA", "ACCU", "TRAN", "DBCR", "XFER", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "COBL", "CEMT", "CECI", "CESF", "HELP"]
+_FIBS_ALIASES = {
+    "GMVB": "FIBS", "OMEN": "FIBS", "CBSA": "FIBS", "MENU": "FIBS",
+    "1": "CUST", "2": "ACCT", "A": "CUSTA", "3": "CUSA", "4": "ACCA", "5": "ACCU",
+    "6": "DBCR", "7": "XFER", "B": "BATCH", "S": "SWFT", "P": "PAYM", "K": "CHAP", "H": "HACK3270", "C": "COBL", "X": "CESF",
+}
+
+
+def _fibs_menu_screen(message: str = "") -> dict[str, Any]:
+    rows = [
+        _text(1, 1, f"FIBS READY                                      {_now()}", "blue"),
+        _text(2, 1, "FIBS - GIBSON BANKING APPLICATION", "blue"),
+    ]
+    labels = [
+        ("1", "DISPLAY CUSTOMER INFORMATION", "CUST"),
+        ("2", "DISPLAY ACCOUNT INFORMATION", "ACCT"),
+        ("A", "DISPLAY ALL ACCOUNTS FOR CUSTOMER", "CUSTA"),
+        ("3", "CREATE NEW CUSTOMER", "CUSA"),
+        ("4", "CREATE NEW ACCOUNT", "ACCA"),
+        ("5", "UPDATE ACCOUNT INFORMATION", "ACCU"),
+        ("6", "CREDIT / DEBIT ACCOUNT", "DBCR"),
+        ("7", "TRANSFER FUNDS BETWEEN ACCOUNTS", "XFER"),
+        ("B", "BATCH PROCESSING", "BATCH"),
+        ("S", "SWIFT MESSAGE PROCESSING", "SWFT"),
+        ("K", "CHAPS HIGH VALUE PAYMENT", "CHAP"),
+        ("H", "HACK3270 FIELD INSPECTOR", "HACK3270"),
+        ("C", "COBOL / BMS SOURCE", "COBL"),
+        ("X", "SIGN OFF", "CESF"),
+    ]
+    for idx, (n, label, trans) in enumerate(labels, start=5):
+        rows.append(_text(idx, 2, f"{n:<3}{label:<40}{trans}", "green" if idx < 15 else "blue"))
+    if message:
+        rows.append(_text(20, 2, message[:75], "yellow"))
+    return _screen("FIBS", "FIBS - GIBSON BANKING APPLICATION", rows + _screen_tail(), [], message)
+
+
+def _fibs_source_lines() -> list[str]:
+    source = VULNERABLE_BANK_UPDATE_COBOL.strip("\n").splitlines()
+    # Add a few CBSA-derived labels now exposed as FIBS for a better source list.
+    prefix = [
+        "       * FIBS / GMVB CICS BANKING SOURCE BROWSER",
+        "       * AVAILABLE PROGRAMS: BNKMENU BNK1TFN BNK1DAC VULNERABLE-BANK-UPDATE",
+        "       * PF7=UP PF8=DOWN TOP BOTTOM FIND <TEXT>",
+        "",
+    ]
+    return prefix + source
+
+
+def _fibs_cobl_screen(sess: dict[str, Any], payload: dict[str, Any] | None = None, message: str = "") -> dict[str, Any]:
+    payload = payload or {}
+    lines = _fibs_source_lines()
+    if "cobl_offset" not in sess:
+        sess["cobl_offset"] = 0
+    off = max(0, min(int(sess.get("cobl_offset") or 0), max(0, len(lines)-1)))
+    page = 13
+    rows = [
+        _text(1, 1, "COBL                 FIBS COBOL / BMS SOURCE REVIEW", "blue"),
+        _text(2, 1, f"PROGRAM . . . VULNERABLE-BANK-UPDATE      LINE {off+1:04d} OF {len(lines):04d}", "yellow"),
+        _text(3, 1, "PF7=UP PF8=DOWN  COMMANDS: TOP BOTTOM FIND <TEXT> COBL <PROGRAM>", "cyan"),
+    ]
+    for idx, line in enumerate(lines[off:off+page], start=5):
+        rows.append(_text(idx, 1, f"{idx-4+off:04d} {line}"[:78], "green"))
+    if message:
+        rows.append(_text(19, 1, message[:78], "yellow"))
+    return _screen("COBL", "FIBS COBOL / BMS SOURCE REVIEW", rows + _screen_tail(), [], message)
+
+
+def _fibs_terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    screen = (screen or sess.get("screen") or "CESN").upper()
+    screen = _FIBS_ALIASES.get(screen, screen)
+    payload = payload or {}
+    msg = str(payload.get("message") or "")
+    svc = get_fibs_service(state)
+    if screen == "FIBS":
+        return _fibs_menu_screen(msg)
+    if screen == "CUSTA":
+        cid = str((payload.get("fields") or {}).get("customer_id") or payload.get("customer_id") or sess.get("field_values", {}).get("customer_id") or "10000002")
+        rows = [_text(1,1,"CUSTA                FIBS ACCOUNTS FOR CUSTOMER", "blue"), _text(3,5,"CUSTOMER ID . .", "cyan")]
+        accts = svc.get_accounts_for_customer(cid)
+        rows += [_text(5,5,"ACCOUNT       TYPE   BALANCE       STATUS", "yellow")]
+        for i, r in enumerate(accts[:10], start=6):
+            rows.append(_text(i,5,f"{r['ACCOUNT_NUMBER']:<13} {r['ACCOUNT_TYPE']:<5} {r['ACTUAL_BALANCE']:<13} {r['STATUS']}", "green"))
+        rows += _screen_tail()
+        return _screen("CUSTA", "FIBS ACCOUNTS FOR CUSTOMER", rows, [_field("customer_id", "CUSTOMER ID", 3, 24, 12, cid)], msg)
+    if screen == "CUSA":
+        if payload.get("submit"):
+            fields = payload.get("fields") or {}
+            row = svc.create_customer(fields, sess.get("userid", "GUEST"))
+            msg = f"DFHCU0001 CUSTOMER {row['CUSTOMER_ID']} CREATED"
+        rows = [_text(1,1,"CUSA                 FIBS CREATE NEW CUSTOMER", "blue"),
+                _text(3,5,"FORENAME . . . .", "cyan"), _text(4,5,"SURNAME . . . . .", "cyan"),
+                _text(5,5,"ADDRESS . . . . .", "cyan"), _text(6,5,"TOWN . . . . . .", "cyan"),
+                _text(8,5,msg or "ENTER CUSTOMER DETAILS AND PRESS ENTER", "yellow")] + _screen_tail()
+        return _screen("CUSA", "FIBS CREATE NEW CUSTOMER", rows, [_field("FORENAME","FORENAME",3,25,18,""),_field("SURNAME","SURNAME",4,25,22,""),_field("address","ADDRESS",5,25,40,""),_field("town","TOWN",6,25,18,"LONDON")], msg)
+    if screen == "ACCA":
+        if payload.get("submit"):
+            fields = payload.get("fields") or {}
+            row = svc.create_account(fields, sess.get("userid", "GUEST"))
+            msg = f"DFHAC0001 ACCOUNT {row['ACCOUNT_NUMBER']} CREATED"
+        rows = [_text(1,1,"ACCA                 FIBS CREATE NEW ACCOUNT", "blue"),
+                _text(3,5,"CUSTOMER ID . .", "cyan"), _text(4,5,"ACCOUNT TYPE .", "cyan"),
+                _text(5,5,"OPEN BALANCE .", "cyan"), _text(7,5,msg or "ENTER ACCOUNT DETAILS AND PRESS ENTER", "yellow")] + _screen_tail()
+        return _screen("ACCA", "FIBS CREATE NEW ACCOUNT", rows, [_field("customer_id","CUSTOMER ID",3,25,12,"10000002"),_field("account_type","ACCOUNT TYPE",4,25,3,"CUR"),_field("balance","OPEN BALANCE",5,25,12,"0.00", numeric=True)], msg)
+    if screen == "DBCR":
+        if payload.get("submit"):
+            f=payload.get("fields") or {}; acct=str(f.get("account") or "1000000201"); amount=str(f.get("amount") or "10.00"); typ=str(f.get("tran_type") or "CRE").upper()
+            res = svc.debit_account(acct, amount, "FIBS DBCR", sess.get("userid","GUEST")) if typ.startswith("D") else svc.credit_account(acct, amount, "FIBS DBCR", sess.get("userid","GUEST"))
+            msg=f"DFHTR0001 {typ} POSTED ACCOUNT {acct} BALANCE {res['account']['ACTUAL_BALANCE']}"
+        rows=[_text(1,1,"DBCR                 FIBS CREDIT / DEBIT ACCOUNT", "blue"), _text(3,5,"ACCOUNT . . . .", "cyan"), _text(4,5,"TYPE CRE/DEB .", "cyan"), _text(5,5,"AMOUNT . . . .", "cyan"), _text(7,5,msg or "ENTER CREDIT/DEBIT DETAILS", "yellow")] + _screen_tail()
+        return _screen("DBCR", "FIBS CREDIT / DEBIT ACCOUNT", rows, [_field("account","ACCOUNT",3,25,13,"1000000201"),_field("tran_type","TYPE",4,25,3,"CRE"),_field("amount","AMOUNT",5,25,12,"10.00", numeric=True)], msg)
+    if screen == "XFER":
+        if payload.get("submit"):
+            f=payload.get("fields") or {}; svc.transfer_funds(str(f.get("from_account") or "1000000101"), str(f.get("to_account") or "1000000201"), str(f.get("amount") or "10.00"), "FIBS XFER", sess.get("userid","GUEST")); msg="DFHTR0002 TRANSFER POSTED"
+        rows=[_text(1,1,"XFER                 FIBS TRANSFER FUNDS", "blue"), _text(3,5,"FROM ACCOUNT .", "cyan"), _text(4,5,"TO ACCOUNT . .", "cyan"), _text(5,5,"AMOUNT . . . .", "cyan"), _text(7,5,msg or "ENTER TRANSFER DETAILS", "yellow")] + _screen_tail()
+        return _screen("XFER", "FIBS TRANSFER FUNDS", rows, [_field("from_account","FROM",3,25,13,"1000000101"),_field("to_account","TO",4,25,13,"1000000201"),_field("amount","AMOUNT",5,25,12,"10.00", numeric=True)], msg)
+    if screen == "COBL":
+        return _fibs_cobl_screen(sess, payload, msg)
+    # Reuse current working screens but label them via compatibility where possible.
+    if screen in {"CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "CEMT", "CECI", "CESF", "HELP"}:
+        scr = _FIBS_OLD_TERMINAL_SCREEN(state, sess, lab, screen, payload)
+        if screen in {"CUST", "ACCT", "BATCH", "SWFT"}:
+            scr["title"] = scr.get("title", "").replace("GMVB", "FIBS").replace("GIBSON MUTUAL VIRTUAL BANK", "FIBS")
+            for r in scr.get("rows", []):
+                if isinstance(r.get("text"), str):
+                    r["text"] = r["text"].replace("GMVB", "FIBS")
+        return scr
+    return _fibs_menu_screen(f"UNKNOWN TRANSACTION {screen}")
+
+
+def _terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _fibs_terminal_screen(state, sess, lab, screen, payload)
+
+
+def _route_terminal(state: Any, lab: Any, p: str, method: str, data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if not p.startswith("/api/v1/ui8999/terminal") and not p.startswith("/api/v1/ui8999/fibs") and not p.startswith("/api/v1/ui8999/hack3270/session") and not p.startswith("/api/v1/ui8999/api-menu"):
+        return None
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+    sess = _session(sid)
+    # FIBS-specific aliases share the same session implementation.
+    if p in {"/api/v1/ui8999/terminal/config", "/api/v1/ui8999/fibs/config"}:
+        return 200, ui_response({"application":"FIBS - Gibson Banking Application", "transactions":_FIBS_TRANS, "aliases":["GMVB","OMEN","CBSA"], "react": True})
+    if p in {"/api/v1/ui8999/terminal/start", "/api/v1/ui8999/fibs/session/start"} and method == "POST":
+        sess = _new_session(sid, str(data.get("userid") or "GUEST")); sess["screen"] = "FIBS"
+        return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab, "FIBS", {"message":"FIBS READY"})))
+    if p == "/api/v1/ui8999/terminal/logon" and method == "POST":
+        user = str(data.get("userid") or data.get("user") or "GUEST").upper(); sess["userid"] = user; sess["logged_on"] = True; sess["screen"] = "FIBS"
+        return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab, "FIBS", {"message": f"DFHAC2001 {user} SIGNED ON"})))
+    if p.startswith("/api/v1/ui8999/fibs/session/"):
+        # Normalize to old terminal path shape.
+        if p.endswith("/input"):
+            p = f"/api/v1/ui8999/terminal/session/{sid}/command"
+        elif method == "GET":
+            p = f"/api/v1/ui8999/terminal/session/{sid}"
+    if p.startswith("/api/v1/ui8999/terminal/session/"):
+        if method == "GET":
+            return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab)))
+        if p.endswith("/aid") and method == "POST":
+            aid = str(data.get("aid") or "ENTER").upper()
+            if sess.get("screen") == "COBL":
+                if aid in {"PF8", "F8"}: sess["cobl_offset"] = int(sess.get("cobl_offset") or 0) + 10
+                if aid in {"PF7", "F7"}: sess["cobl_offset"] = max(0, int(sess.get("cobl_offset") or 0) - 10)
+                if aid in {"PF3", "F3"}: sess["screen"] = "FIBS"
+                return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab), messages=[f"AID {aid} SENT"]))
+            if aid in {"PF3", "CLEAR"}: sess["screen"] = "FIBS"
+            return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab), messages=[f"AID {aid} SENT"]))
+        if p.endswith("/command") and method == "POST":
+            fields = dict(data.get("fields") or {})
+            sess.setdefault("field_values", {}).update(fields)
+            raw_cmd = str(data.get("command") or data.get("input") or "").strip()
+            current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+            cmd_up = raw_cmd.upper()
+            if current == "CESN":
+                user = fields.get("userid") or data.get("userid") or sess.get("userid") or "GUEST"
+                return _route_terminal(state, lab, "/api/v1/ui8999/terminal/logon", "POST", {"sid": sid, "userid": user, "password": fields.get("password") or "GUEST"}, query)
+            first = cmd_up.split()[0] if cmd_up else ""
+            first = _FIBS_ALIASES.get(first, first)
+            if current == "FIBS" and first in _FIBS_ALIASES:
+                first = _FIBS_ALIASES[first]
+            if first in _FIBS_TRANS:
+                screen = first; payload = {**data, "fields": fields}
+            elif not raw_cmd or cmd_up in {"ENTER", "SUBMIT"}:
+                screen = current; payload = {**data, "fields": fields, "submit": True}
+            elif current == "FIBS" and first:
+                screen = _FIBS_ALIASES.get(first, "FIBS"); payload = {**data, "fields": fields}
+            elif current == "CUST":
+                screen = "CUST"; payload = {**data, "fields": {**fields, "customer_id": raw_cmd}}
+            elif current == "ACCT":
+                screen = "ACCT"; payload = {**data, "fields": {**fields, "account": raw_cmd}}
+            elif current == "CUSTA":
+                screen = "CUSTA"; payload = {**data, "fields": {**fields, "customer_id": raw_cmd or fields.get("customer_id", "10000002")}}
+            elif current == "COBL":
+                screen = "COBL"; payload = {**data, "fields": fields};
+                if cmd_up == "TOP": sess["cobl_offset"] = 0
+                elif cmd_up == "BOTTOM": sess["cobl_offset"] = max(0, len(_fibs_source_lines()) - 13)
+                elif cmd_up.startswith("FIND "):
+                    needle = cmd_up[5:].strip(); lines = [l.upper() for l in _fibs_source_lines()]; start = int(sess.get("cobl_offset") or 0) + 1
+                    found = next((i for i,l in enumerate(lines[start:], start) if needle in l), -1)
+                    if found >= 0: sess["cobl_offset"] = found; payload["message"] = f"FOUND {needle} AT LINE {found+1}"
+                    else: payload["message"] = f"NOT FOUND {needle}"
+                elif cmd_up.startswith("COBL"):
+                    sess["cobl_offset"] = 0; payload["message"] = "PROGRAM OPENED"
+            elif current in {"BATCH", "CCAP", "SWFT", "CHAP", "TRAN", "CUSA", "ACCA", "DBCR", "XFER"}:
+                screen = current; payload = {**data, "fields": fields, "submit": True, "command": cmd_up}
+            else:
+                screen = "FIBS"; payload = {"message": f"UNKNOWN TRANSACTION {raw_cmd}"}
+            sess["screen"] = screen
+            sess.setdefault("logs", []).append({"event":"COMMAND", "command": raw_cmd or "ENTER", "screen": screen})
+            return 200, ui_response(_screen_response(state, sess, lab, _fibs_terminal_screen(state, sess, lab, screen, payload)))
+    # Preserve existing hack3270 and api-menu behaviour by delegating.
+    return _FIBS_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+
+
+def _fibs_rest_payload(state: Any, path: str, method: str, data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if not path.startswith("/api/v1/fibs"):
+        return None
+    svc = get_fibs_service(state)
+    p = path.rstrip("/")
+    try:
+        if p in {"/api/v1/fibs/health", "/api/v1/fibs/capabilities"}:
+            return 200, ui_response({"application":"FIBS", "service":"fibs-service", "ok": True})
+        if p == "/api/v1/fibs/tables":
+            return 200, ui_response([k for k in svc.catalog().keys() if k.startswith("FIBS.")])
+        if p == "/api/v1/fibs/audit":
+            return 200, ui_response(svc.export_evidence().get("audit", []))
+        if p.startswith("/api/v1/fibs/customers/search"):
+            return 200, ui_response(svc.search_customers_by_name(query.get("name", ""), int(query.get("limit", 10))))
+        if p == "/api/v1/fibs/customers" and method == "POST":
+            return 201, ui_response(svc.create_customer(data, str(data.get("operator") or "API")))
+        if p.startswith("/api/v1/fibs/customers/"):
+            cid = p.rsplit("/", 1)[-1]
+            if method == "GET": return 200, ui_response(svc.get_customer(cid))
+            if method == "PUT": return 200, ui_response(svc.update_customer(cid, data, str(data.get("operator") or "API")))
+            if method == "DELETE": return 200, ui_response(svc.delete_customer(cid, str(data.get("operator") or "API")))
+        if p == "/api/v1/fibs/accounts" and method == "POST":
+            return 201, ui_response(svc.create_account(data, str(data.get("operator") or "API")))
+        if p.startswith("/api/v1/fibs/accounts/by-customer/"):
+            return 200, ui_response(svc.get_accounts_for_customer(p.rsplit("/", 1)[-1]))
+        if p.startswith("/api/v1/fibs/accounts/"):
+            acct = p.rsplit("/", 1)[-1]
+            if method == "GET": return 200, ui_response(svc.get_account(acct))
+            if method == "PUT": return 200, ui_response(svc.update_account(acct, data, str(data.get("operator") or "API")))
+            if method == "DELETE": return 200, ui_response(svc.delete_account(acct, str(data.get("operator") or "API")))
+        if p == "/api/v1/fibs/transactions": return 200, ui_response(svc.list_transactions(limit=100))
+        if p.endswith("/credit") and method == "POST": return 200, ui_response(svc.credit_account(data.get("account_id") or data.get("account"), data.get("amount"), data.get("description", "API CREDIT"), data.get("operator", "API")))
+        if p.endswith("/debit") and method == "POST": return 200, ui_response(svc.debit_account(data.get("account_id") or data.get("account"), data.get("amount"), data.get("description", "API DEBIT"), data.get("operator", "API")))
+        if p.endswith("/transfer") and method == "POST": return 200, ui_response(svc.transfer_funds(data.get("from_account"), data.get("to_account"), data.get("amount"), data.get("description", "API XFER"), data.get("operator", "API")))
+        if p == "/api/v1/fibs/batch": return 200, ui_response(svc.list_batches())
+        if p.startswith("/api/v1/fibs/batch/"):
+            parts = p.split("/"); bid = parts[5]
+            if p.endswith("/release") and method == "POST": return 200, ui_response(svc.release_batch(bid, data.get("supervisor_id", "SUPR01"), data.get("pin", ""), data.get("operator", "API")))
+            if p.endswith("/reject") and method == "POST": return 200, ui_response(svc.reject_batch(bid, data.get("reason", "API REJECT"), data.get("operator", "API")))
+            return 200, ui_response(svc.get_batch(bid))
+        if p == "/api/v1/fibs/swift":
+            if method == "POST": return 201, ui_response(svc.create_swift_message(data, data.get("operator", "API")))
+            return 200, ui_response(svc.list_swift_messages())
+        if p.startswith("/api/v1/fibs/swift/"):
+            parts = p.split("/"); mid = parts[5]
+            if p.endswith("/approve") and method == "POST": return 200, ui_response(svc.approve_swift_message(mid, data.get("approver", "SUPR01")))
+            if p.endswith("/release") and method == "POST": return 200, ui_response(svc.release_swift_message(mid, data.get("releaser", "SUPR01")))
+            if p.endswith("/repair") and method == "POST": return 200, ui_response(svc.repair_swift_message(mid, data, data.get("operator", "API")))
+            return 200, ui_response(svc.get_swift_message(mid))
+    except Exception as exc:
+        return 400, ui_response(ok=False, error=f"{type(exc).__name__}: {exc}", source="fibs-service")
+    return 404, ui_response(ok=False, error="fibs route not found")
+
+
+def handle_ui8999(state: Any, path: str, method: str = "GET", data: dict[str, Any] | None = None, query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    data = data or {}; query = query or {}
+    fibs = _fibs_rest_payload(state, path.rstrip("/") or "/", method, data, query)
+    if fibs is not None:
+        return fibs
+    return _FIBS_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# ---------------------------------------------------------------------------
+# FIBS stability upgrade for React 8999 terminal
+# ---------------------------------------------------------------------------
+# This override keeps the existing Hack3270 toolbar and UI contract but makes
+# FIBS behave like a stateful CICS/BMS banking application with stable PF-key
+# navigation, inquiry screens, create/update/delete workflows and service-backed
+# data changes.
+_FIBS_STABLE_OLD_TERMINAL_SCREEN = _terminal_screen
+_FIBS_STABLE_OLD_ROUTE_TERMINAL = _route_terminal
+
+
+def _stable_screen_tail() -> list[dict[str, Any]]:
+    return [_text(22, 1, "COMMAND ===>", "cyan"), _text(24, 1, "PF1=HELP PF3=MENU PF5=REFRESH PF7=UP PF8=DOWN PF12=SIGNOFF", "blue")]
+
+
+def _stable_fibs_menu_screen(message: str = "") -> dict[str, Any]:
+    rows = [_text(1, 1, f"FIBS READY                                      {_now()}", "blue"), _text(2, 1, "FIBS - GIBSON BANKING APPLICATION", "blue")]
+    labels = [("1", "DISPLAY CUSTOMER INFORMATION", "CUST"), ("2", "DISPLAY ACCOUNT INFORMATION", "ACCT"), ("A", "DISPLAY ALL ACCOUNTS FOR CUSTOMER", "CUSTA"), ("3", "CREATE NEW CUSTOMER", "CUSA"), ("4", "CREATE NEW ACCOUNT", "ACCA"), ("5", "UPDATE ACCOUNT INFORMATION", "ACCU"), ("6", "CREDIT / DEBIT ACCOUNT", "DBCR"), ("7", "TRANSFER FUNDS BETWEEN ACCOUNTS", "XFER"), ("B", "BATCH PROCESSING", "BATCH"), ("S", "SWIFT MESSAGE PROCESSING", "SWFT"), ("K", "CHAPS HIGH VALUE PAYMENT", "CHAP"), ("H", "HACK3270 FIELD INSPECTOR", "HACK3270"), ("C", "COBOL / BMS SOURCE", "COBL"), ("X", "SIGN OFF", "CESF")]
+    for idx, (n, label, trans) in enumerate(labels, start=5):
+        rows.append(_text(idx, 2, f"{n:<3}{label:<40}{trans}", "green" if idx < 15 else "blue"))
+    if message:
+        rows.append(_text(20, 2, message[:75], "yellow"))
+    return _screen("FIBS", "FIBS - GIBSON BANKING APPLICATION", rows + _stable_screen_tail(), [], message)
+
+
+def _stable_ui_kv(fields: dict[str, Any]) -> dict[str, Any]:
+    return {str(k).upper(): v for k, v in (fields or {}).items() if v not in (None, "")}
+
+
+def _stable_ui_cust(state: Any, sess: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; fields = payload.get("fields") or {}; svc = get_fibs_service(state)
+    action = str(fields.get("cust_action") or payload.get("action") or "INQ").strip().upper() or "INQ"
+    cid = str(fields.get("customer_id") or payload.get("customer_id") or sess.get("field_values", {}).get("customer_id") or "").strip()
+    msg = str(payload.get("message") or "")
+    rec = None
+    if payload.get("submit"):
+        if action in {"ADD", "A"}:
+            rec = svc.create_customer({"FORENAME": fields.get("forename") or fields.get("FORENAME") or "TRAINING", "SURNAME": fields.get("surname") or fields.get("SURNAME") or "CUSTOMER", "ADDRESS_LINE_1": fields.get("address") or "FIBS TRAINING ADDRESS", "TOWN": fields.get("town") or "LONDON", "STATUS": fields.get("status") or "A"}, sess.get("userid", "GUEST")); cid = rec["CUSTOMER_ID"]; msg = f"DFHCU0001 CUSTOMER {cid} ADDED"
+        elif action in {"DEL", "DELETE", "D"} and cid:
+            svc.delete_customer(cid, sess.get("userid", "GUEST")); msg = f"DFHCU0002 CUSTOMER {cid} DELETED"
+        elif action in {"UPD", "UPDATE", "U"} and cid:
+            rec = svc.update_customer(cid, _stable_ui_kv(fields), sess.get("userid", "GUEST")); msg = f"DFHCU0003 CUSTOMER {cid} UPDATED"
+    if not rec and cid:
+        rec = svc.get_customer(cid)
+    if not rec:
+        rec = {"CUSTOMER_ID": cid, "SURNAME": "", "FORENAME": "", "DATE_OF_BIRTH": "", "SORT_CODE": "", "ADDRESS_LINE_1": "", "TOWN": "", "STATUS": "", "KYC_STATUS": ""}
+        if cid and not msg: msg = f"DFHCU0044 CUSTOMER {cid} NOT FOUND"
+    rows = [_text(1, 1, "CUST                 FIBS CUSTOMER MASTER FILE", "blue"), _text(3, 5, "CUSTOMER ID . . . .", "cyan"), _text(4, 5, "SURNAME . . . . . .", "cyan"), _text(5, 5, "FORENAME . . . . .", "cyan"), _text(6, 5, "DATE OF BIRTH . . .", "cyan"), _text(7, 5, "SORT CODE . . . . .", "cyan"), _text(8, 5, "ADDRESS . . . . . .", "cyan"), _text(9, 5, "TOWN . . . . . . .", "cyan"), _text(11, 5, "STATUS/KYC . . . .", "cyan"), _text(11, 28, f"{rec.get('STATUS','')} / {rec.get('KYC_STATUS','')}", "white"), _text(18, 5, msg or "ACTION: INQ ADD UPD DEL   PF3=MENU PF5=REFRESH PF8=INQUIRE", "yellow")]
+    return _screen("CUST", "FIBS CUSTOMER MASTER FILE", rows + _stable_screen_tail(), [_field("customer_id", "CUSTOMER ID", 3, 28, 12, cid or rec.get("CUSTOMER_ID", "")), _db_field("surname", "SURNAME", 4, 28, 30, rec.get("SURNAME", ""), source="FIBS.CUSTOMER"), _db_field("forename", "FORENAME", 5, 28, 20, rec.get("FORENAME", ""), source="FIBS.CUSTOMER"), _db_field("dob", "DATE OF BIRTH", 6, 28, 12, rec.get("DATE_OF_BIRTH", ""), source="FIBS.CUSTOMER"), _db_field("sortcode", "SORT CODE", 7, 28, 6, rec.get("SORT_CODE", ""), numeric=True, source="FIBS.CUSTOMER"), _db_field("address", "ADDRESS", 8, 28, 45, rec.get("ADDRESS_LINE_1", ""), source="FIBS.CUSTOMER"), _db_field("town", "TOWN", 9, 28, 20, rec.get("TOWN", ""), source="FIBS.CUSTOMER"), _field("cust_action", "ACTION", 18, 13, 6, action)], msg)
+
+
+def _stable_ui_acct(state: Any, sess: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; fields = payload.get("fields") or {}; svc = get_fibs_service(state)
+    action = str(fields.get("acct_action") or payload.get("action") or "INQ").strip().upper() or "INQ"
+    acct = str(fields.get("account") or payload.get("account") or sess.get("field_values", {}).get("account") or "").strip()
+    msg = str(payload.get("message") or "")
+    rec = None
+    if payload.get("submit"):
+        if action in {"ADD", "A"}:
+            rec = svc.create_account({"CUSTOMER_ID": fields.get("acct_customer") or fields.get("customer_id") or "10000002", "ACCOUNT_TYPE": fields.get("acct_type") or "CUR", "BALANCE": fields.get("balance") or "0.00"}, sess.get("userid", "GUEST")); acct = rec["ACCOUNT_NUMBER"]; msg = f"DFHAC0001 ACCOUNT {acct} ADDED"
+        elif action in {"DEL", "DELETE", "D"} and acct:
+            svc.delete_account(acct, sess.get("userid", "GUEST")); msg = f"DFHAC0002 ACCOUNT {acct} DELETED"
+        elif action in {"UPD", "UPDATE", "U"} and acct:
+            rec = svc.update_account(acct, _stable_ui_kv(fields), sess.get("userid", "GUEST")); msg = f"DFHAC0003 ACCOUNT {acct} UPDATED"
+    if not rec and acct:
+        rec = svc.get_account(acct)
+    if not rec:
+        rec = {"ACCOUNT_NUMBER": acct, "CUSTOMER_ID": "", "ACCOUNT_TYPE": "", "SORT_CODE": "", "ACTUAL_BALANCE": "", "AVAILABLE_BALANCE": "", "OVERDRAFT_LIMIT": "", "STATUS": ""}
+        if acct and not msg: msg = f"DFHAC0044 ACCOUNT {acct} NOT FOUND"
+    rows = [_text(1, 1, "ACCT                 FIBS ACCOUNT MASTER FILE", "blue"), _text(3, 5, "ACCOUNT NUMBER . .", "cyan"), _text(4, 5, "CUSTOMER ID . . .", "cyan"), _text(5, 5, "ACCOUNT TYPE . . .", "cyan"), _text(6, 5, "SORT CODE . . . .", "cyan"), _text(7, 5, "ACTUAL BALANCE . .", "cyan"), _text(8, 5, "AVAILABLE . . . .", "cyan"), _text(9, 5, "OVERDRAFT LIMIT .", "cyan"), _text(10, 5, "STATUS . . . . . .", "cyan"), _text(18, 5, msg or "ACTION: INQ ADD UPD DEL   PF3=MENU PF5=REFRESH PF8=INQUIRE", "yellow")]
+    return _screen("ACCT", "FIBS ACCOUNT MASTER FILE", rows + _stable_screen_tail(), [_field("account", "ACCOUNT", 3, 28, 13, acct or rec.get("ACCOUNT_NUMBER", "")), _db_field("acct_customer", "CUSTOMER ID", 4, 28, 12, rec.get("CUSTOMER_ID", ""), source="FIBS.ACCOUNT"), _db_field("acct_type", "ACCOUNT TYPE", 5, 28, 3, rec.get("ACCOUNT_TYPE", ""), source="FIBS.ACCOUNT"), _db_field("acct_sortcode", "SORT CODE", 6, 28, 6, rec.get("SORT_CODE", ""), numeric=True, source="FIBS.ACCOUNT"), _db_field("balance", "ACTUAL BALANCE", 7, 28, 14, rec.get("ACTUAL_BALANCE", ""), numeric=True, source="FIBS.ACCOUNT"), _db_field("available", "AVAILABLE", 8, 28, 14, rec.get("AVAILABLE_BALANCE", ""), numeric=True, source="FIBS.ACCOUNT"), _db_field("limit", "OVERDRAFT LIMIT", 9, 28, 14, rec.get("OVERDRAFT_LIMIT", ""), numeric=True, source="FIBS.ACCOUNT"), _db_field("status", "STATUS", 10, 28, 1, rec.get("STATUS", ""), source="FIBS.ACCOUNT"), _field("acct_action", "ACTION", 18, 13, 6, action)], msg)
+
+
+def _stable_ui_terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; screen = _FIBS_ALIASES.get((screen or sess.get("screen") or "FIBS").upper(), (screen or sess.get("screen") or "FIBS").upper())
+    if screen == "FIBS": return _stable_fibs_menu_screen(str(payload.get("message") or ""))
+    if screen == "CUST": return _stable_ui_cust(state, sess, payload)
+    if screen == "ACCT": return _stable_ui_acct(state, sess, payload)
+    if screen == "CUSA": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "ADD"}})
+    if screen == "CUSU": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "UPD"}})
+    if screen == "CUSD": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "DEL"}})
+    if screen == "ACCA": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "ADD"}})
+    if screen == "ACCU": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "UPD"}})
+    if screen == "ACCD": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "DEL"}})
+    return _FIBS_STABLE_OLD_TERMINAL_SCREEN(state, sess, lab, screen, payload)
+
+
+def _terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _stable_ui_terminal_screen(state, sess, lab, screen, payload)
+
+
+def _route_terminal(state: Any, lab: Any, p: str, method: str, data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if not p.startswith("/api/v1/ui8999/terminal") and not p.startswith("/api/v1/ui8999/fibs"):
+        return _FIBS_STABLE_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+    sess = _session(sid)
+    if p in {"/api/v1/ui8999/terminal/start", "/api/v1/ui8999/fibs/session/start"} and method == "POST":
+        sess["logged_on"] = True; sess["userid"] = str(data.get("userid") or "GUEST").upper(); sess["screen"] = "FIBS"
+        return 200, ui_response(_screen_response(state, sess, lab, _stable_ui_terminal_screen(state, sess, lab, "FIBS", {"message": "FIBS READY"})))
+    if p in {"/api/v1/ui8999/terminal/config", "/api/v1/ui8999/fibs/config"}:
+        return 200, ui_response({"application":"FIBS - Gibson Banking Application", "transactions":_FIBS_TRANS})
+    if p.endswith("/aid") and method == "POST":
+        aid = str(data.get("aid") or "ENTER").upper()
+        if aid in {"PF3", "F3", "CLEAR"}: sess["screen"] = "FIBS"
+        if aid in {"PF5", "F5"}: pass
+        if sess.get("screen") == "COBL":
+            if aid in {"PF8", "F8"}: sess["cobl_offset"] = int(sess.get("cobl_offset") or 0) + 10
+            if aid in {"PF7", "F7"}: sess["cobl_offset"] = max(0, int(sess.get("cobl_offset") or 0) - 10)
+        return 200, ui_response(_screen_response(state, sess, lab, _stable_ui_terminal_screen(state, sess, lab), messages=[f"AID {aid} SENT"]))
+    if p.startswith("/api/v1/ui8999/fibs/session/") and p.endswith("/input"):
+        p = f"/api/v1/ui8999/terminal/session/{sid}/command"
+    if p.startswith("/api/v1/ui8999/terminal/session/"):
+        if method == "GET":
+            return 200, ui_response(_screen_response(state, sess, lab, _stable_ui_terminal_screen(state, sess, lab)))
+        if p.endswith("/command") and method == "POST":
+            fields = dict(data.get("fields") or {}); raw_cmd = str(data.get("command") or data.get("input") or "").strip(); current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper(); cmd_up = raw_cmd.upper(); first = cmd_up.split()[0] if cmd_up else ""
+            menu_map = {"1":"CUST", "2":"ACCT", "A":"CUSTA", "3":"CUSA", "4":"ACCA", "5":"ACCU", "6":"DBCR", "7":"XFER", "B":"BATCH", "S":"SWFT", "K":"CHAP", "H":"HACK3270", "C":"COBL", "X":"CESF"}
+            screen = None; payload = {**data, "fields": fields}
+            if first in {"FIBS", "GMVB", "OMEN", "CBSA", "MENU"}: screen = "FIBS"
+            elif first in _FIBS_TRANS: screen = first; payload["command_arg"] = raw_cmd[len(first):].strip()
+            elif current == "FIBS" and first in menu_map: screen = menu_map[first]
+            elif first in {"PF3", "F3"}: screen = "FIBS"
+            elif not raw_cmd or first in {"ENTER", "SUBMIT", "PF5", "F5", "PF8", "F8", "INQ", "INQUIRE"}: screen = current; payload["submit"] = True
+            elif current == "CUST": screen = "CUST"; fields.setdefault("customer_id", raw_cmd)
+            elif current == "ACCT": screen = "ACCT"; fields.setdefault("account", raw_cmd)
+            elif current == "CUSTA": screen = "CUSTA"; fields.setdefault("customer_id", raw_cmd or fields.get("customer_id") or "10000002")
+            elif current == "COBL":
+                screen = "COBL"
+                if cmd_up == "TOP": sess["cobl_offset"] = 0
+                elif cmd_up == "BOTTOM": sess["cobl_offset"] = max(0, len(_fibs_source_lines()) - 13)
+                elif cmd_up.startswith("FIND "):
+                    needle = cmd_up[5:].strip(); lines = [l.upper() for l in _fibs_source_lines()]; start = int(sess.get("cobl_offset") or 0) + 1; found = next((i for i,l in enumerate(lines[start:], start) if needle in l), -1)
+                    if found >= 0: sess["cobl_offset"] = found; payload["message"] = f"FOUND {needle} AT LINE {found+1}"
+                    else: payload["message"] = f"NOT FOUND {needle}"
+            else: screen = current
+            sess["screen"] = screen or "FIBS"; sess.setdefault("field_values", {}).update(fields); sess.setdefault("logs", []).append({"event":"COMMAND", "command": raw_cmd or "ENTER", "screen": sess["screen"]})
+            return 200, ui_response(_screen_response(state, sess, lab, _stable_ui_terminal_screen(state, sess, lab, sess["screen"], payload)))
+    return _FIBS_STABLE_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+
+# Preserve Hack3270 SQLTRACE/hidden-field contract after the FIBS stability UI.
+_STABLE_UI_CUST_BASE = _stable_ui_cust
+_STABLE_UI_ACCT_BASE = _stable_ui_acct
+
+
+def _stable_ui_cust(state: Any, sess: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; fields = payload.get("fields") or {}; hack_on = bool(sess.get("hack", {}).get("enabled"))
+    supplied_sqltrace = str(fields.get("SQLTRACE") or "")
+    msg = str(payload.get("message") or "")
+    if supplied_sqltrace and not hack_on:
+        msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+    elif supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace):
+        msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+    scr = _STABLE_UI_CUST_BASE(state, sess, {**payload, "message": msg})
+    sql = supplied_sqltrace if supplied_sqltrace and hack_on else "SELECT * FROM FIBS.CUSTOMER WHERE CUSTOMER_ID = ?"
+    scr["fields"] = list(scr.get("fields", [])) + _base_hidden("CUST", sql)
+    if supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace):
+        rows = list(scr.get("rows", []))
+        rows.append(_text(15, 5, "CONTROLLED SQLI RESULT - TRAINING MODE ONLY", "red"))
+        rows.append(_text(16, 5, "ROWS RETURNED FROM FIBS.CUSTOMER COMPATIBILITY VIEW", "yellow"))
+        scr["rows"] = rows
+    return scr
+
+
+def _stable_ui_acct(state: Any, sess: dict[str, Any], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; fields = payload.get("fields") or {}; hack_on = bool(sess.get("hack", {}).get("enabled"))
+    supplied_sqltrace = str(fields.get("SQLTRACE") or "")
+    msg = str(payload.get("message") or "")
+    if supplied_sqltrace and not hack_on:
+        msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+    elif supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace):
+        msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+    scr = _STABLE_UI_ACCT_BASE(state, sess, {**payload, "message": msg})
+    sql = supplied_sqltrace if supplied_sqltrace and hack_on else "SELECT * FROM FIBS.ACCOUNT WHERE ACCOUNT_NUMBER = ?"
+    scr["fields"] = list(scr.get("fields", [])) + _base_hidden("ACCT", sql)
+    if supplied_sqltrace and hack_on and _is_sqli(supplied_sqltrace):
+        svc = get_fibs_service(state)
+        rows = list(scr.get("rows", []))
+        rows.append(_text(15, 5, "CONTROLLED SQLI RESULT - TRAINING MODE ONLY", "red"))
+        rows.append(_text(16, 5, "ACCOUNT       CUSTOMER   TYPE BALANCE     STATUS", "yellow"))
+        for i, r in enumerate(svc.catalog().get("FIBS.ACCOUNT", [])[:4], start=17):
+            rows.append(_text(i, 5, f"{r.get('ACCOUNT_NUMBER',''):<13} {r.get('CUSTOMER_ID',''):<10} {r.get('ACCOUNT_TYPE',''):<4} {r.get('ACTUAL_BALANCE',''):<11} {r.get('STATUS','')}", "green"))
+        scr["rows"] = rows
+    return scr
+
+
+def _stable_ui_terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}; screen = _FIBS_ALIASES.get((screen or sess.get("screen") or "FIBS").upper(), (screen or sess.get("screen") or "FIBS").upper())
+    if screen == "FIBS": return _stable_fibs_menu_screen(str(payload.get("message") or ""))
+    if screen == "CUST": return _stable_ui_cust(state, sess, payload)
+    if screen == "ACCT": return _stable_ui_acct(state, sess, payload)
+    if screen == "CUSA": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "ADD"}})
+    if screen == "CUSU": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "UPD"}})
+    if screen == "CUSD": return _stable_ui_cust(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "cust_action": "DEL"}})
+    if screen == "ACCA": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "ADD"}})
+    if screen == "ACCU": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "UPD"}})
+    if screen == "ACCD": return _stable_ui_acct(state, sess, {**payload, "fields": {**(payload.get("fields") or {}), "acct_action": "DEL"}})
+    return _FIBS_STABLE_OLD_TERMINAL_SCREEN(state, sess, lab, screen, payload)
+
+
+def _terminal_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _stable_ui_terminal_screen(state, sess, lab, screen, payload)
+
+# ---------------------------------------------------------------------------
+# Production-grade FIBS backend-map route authority.
+# ---------------------------------------------------------------------------
+try:
+    from gibson.apps.fibs_kernel import FibsApplicationController, get_fibs_session
+except Exception:  # pragma: no cover
+    FibsApplicationController = None  # type: ignore
+    get_fibs_session = None  # type: ignore
+
+_PROD_OLD_ROUTE_TERMINAL = _route_terminal
+
+
+def _prod_fibs_screen_response(state: Any, sess: dict[str, Any], fmap: dict[str, Any], messages: list[str] | None = None) -> dict[str, Any]:
+    out = dict(fmap)
+    # Preserve legacy React screen names while the backend map remains FIBS*.
+    alias_names = {"FIBSMENU":"FIBS","FIBSCUST":"CUST","FIBSACCT":"ACCT","FIBSCUSA":"CUSA","FIBSCUSU":"CUSU","FIBSCUSD":"CUSD","FIBSCUSTA":"CUSTA","FIBSACCA":"ACCA","FIBSACCU":"ACCU","FIBSACCD":"ACCD","FIBSDBCR":"DBCR","FIBSXFER":"XFER","FIBSBATCH":"BATCH","FIBSSWFT":"SWFT","FIBSCOBL":"COBL"}
+    out["name"] = alias_names.get(str(out.get("name", "")).upper(), out.get("name"))
+    out.setdefault("commandLine", True)
+    out.setdefault("cursor", {"row":22,"col":15})
+    out.setdefault("pfkeys", [{"key":"PF1","label":"HELP"},{"key":"PF3","label":"MENU"},{"key":"PF5","label":"REFRESH"},{"key":"PF7","label":"UP"},{"key":"PF8","label":"DOWN"},{"key":"PF12","label":"SIGNOFF"},{"key":"ENTER","label":"EXECUTE"}])
+    return {
+        "sid": sess.get("sid"),
+        "userid": sess.get("userid"),
+        "logged_on": True,
+        "screen": out,
+        "messages": messages or ([out.get("message")] if out.get("message") else []),
+        "audit": sess.get("logs", [])[-10:],
+        "hack3270": {**sess.get("hack", _hack_state(False)), "training_only": True},
+    }
+
+
+def _prod_route_terminal(state: Any, lab: Any, p: str, method: str, data: dict[str, Any], query: dict[str, str]) -> tuple[int, dict[str, Any]] | None:
+    if FibsApplicationController is None or get_fibs_session is None:
+        return _PROD_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+    if not (p.startswith("/api/v1/ui8999/fibs") or p.startswith("/api/v1/ui8999/terminal")):
+        return _PROD_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+    sid = str(data.get("sid") or query.get("sid") or "UI8999")
+    ui_sess = _session(sid)
+    ui_sess["logged_on"] = True
+    ui_sess["userid"] = str(data.get("userid") or ui_sess.get("userid") or "GUEST").upper()
+    ctrl = FibsApplicationController(state)
+    fsess = get_fibs_session(state, f"UI8999-{sid}", ui_sess["userid"])
+    if p.endswith("/config") or p in {"/api/v1/ui8999/terminal/config", "/api/v1/ui8999/fibs/config"}:
+        return 200, ui_response({"application":"FIBS - Gibson Banking Application", "backend_maps": True, "transactions":["FIBS","CUST","ACCT","CUSA","ACCA","DBCR","XFER","BATCH","SWFT","COBL"]})
+    if p in {"/api/v1/ui8999/terminal/start", "/api/v1/ui8999/fibs/session/start"} and method == "POST":
+        fmap = ctrl.handle_json(fsess, "FIBS")
+        ui_sess["screen"] = fmap.get("name", "FIBSMENU")
+        return 200, ui_response(_prod_fibs_screen_response(state, ui_sess, fmap))
+    if p.startswith("/api/v1/ui8999/fibs/session/") or p.startswith("/api/v1/ui8999/terminal/session/"):
+        if method == "GET":
+            fmap = ctrl.handle_json(fsess, "PF5")
+            ui_sess["screen"] = {"FIBSMENU":"FIBS","FIBSCUST":"CUST","FIBSACCT":"ACCT","FIBSCOBL":"COBL","FIBSBATCH":"BATCH","FIBSSWFT":"SWFT"}.get(str(fmap.get("name", "FIBSMENU")).upper(), str(fmap.get("name", "FIBSMENU")).replace("FIBS",""))
+            return 200, ui_response(_prod_fibs_screen_response(state, ui_sess, fmap))
+        if p.endswith("/aid") and method == "POST":
+            aid = str(data.get("aid") or "ENTER").upper()
+            fmap = ctrl.handle_json(fsess, "", data.get("fields") or {}, aid)
+            ui_sess["screen"] = {"FIBSMENU":"FIBS","FIBSCUST":"CUST","FIBSACCT":"ACCT","FIBSCOBL":"COBL","FIBSBATCH":"BATCH","FIBSSWFT":"SWFT"}.get(str(fmap.get("name", "FIBSMENU")).upper(), str(fmap.get("name", "FIBSMENU")).replace("FIBS",""))
+            ui_sess.setdefault("logs", []).append({"event":"AID", "aid":aid, "screen":ui_sess["screen"]})
+            return 200, ui_response(_prod_fibs_screen_response(state, ui_sess, fmap))
+        if (p.endswith("/command") or p.endswith("/input")) and method == "POST":
+            raw = str(data.get("command") or data.get("input") or "").strip()
+            fields = data.get("fields") or {}
+            aid = str(data.get("aid") or "").strip() or None
+            if fields and 'SQLTRACE' in {str(k).upper() for k in fields.keys()}:
+                msg = 'DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF'
+                if ui_sess.get('hack', {}).get('enabled'):
+                    msg = 'DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT'
+                scr = _stable_ui_acct(state, ui_sess, {'fields': fields, 'message': msg})
+                ui_sess['screen'] = 'ACCT'
+                return 200, ui_response(_screen_response(state, ui_sess, lab, scr, messages=[msg]))
+            fmap = ctrl.handle_json(fsess, raw, fields, aid)
+            ui_sess["screen"] = {"FIBSMENU":"FIBS","FIBSCUST":"CUST","FIBSACCT":"ACCT","FIBSCOBL":"COBL","FIBSBATCH":"BATCH","FIBSSWFT":"SWFT"}.get(str(fmap.get("name", "FIBSMENU")).upper(), str(fmap.get("name", "FIBSMENU")).replace("FIBS",""))
+            ui_sess.setdefault("logs", []).append({"event":"COMMAND", "command":raw or aid or "ENTER", "screen":ui_sess["screen"]})
+            return 200, ui_response(_prod_fibs_screen_response(state, ui_sess, fmap))
+    return _PROD_OLD_ROUTE_TERMINAL(state, lab, p, method, data, query)
+
+_route_terminal = _prod_route_terminal
+
+
+# ---------------------------------------------------------------------------
+# Full integration fix: unsafe-query returns and renders data rows, not only
+# metadata.  This outer handle_ui8999 wrapper runs before legacy handlers.
+# ---------------------------------------------------------------------------
+_FULL_INT_OLD_HANDLE_UI8999 = handle_ui8999
+
+def _full_int_api_result_screen(state: Any, sess: dict[str, Any], q: str, rows: list[dict[str, Any]], p: str) -> dict[str, Any]:
+    columns = ['CUSTOMER_ID','NAME','ACCOUNT','BALANCE','STATUS']
+    svc = None
+    try:
+        from gibson.apps.fibs_service import get_fibs_service
+        svc = get_fibs_service(state)
+    except Exception:
+        pass
+    display_rows: list[dict[str, Any]] = []
+    if svc is not None:
+        accts = {str(a.get('CUSTOMER_ID','')): a for a in svc.catalog().get('FIBS.ACCOUNT', [])}
+        for r in rows:
+            cid = str(r.get('CUSTOMER_ID') or r.get('CUSTOMER_NUMBER') or r.get('ID') or '')
+            acct = accts.get(cid, {})
+            name = str(r.get('FULL_NAME') or (str(r.get('FORENAME','')) + ' ' + str(r.get('SURNAME',''))).strip() or r.get('NAME') or '')
+            display_rows.append({'CUSTOMER_ID': cid, 'NAME': name[:20], 'ACCOUNT': str(acct.get('ACCOUNT_NUMBER','')), 'BALANCE': str(acct.get('ACTUAL_BALANCE','')), 'STATUS': str(r.get('STATUS','A'))})
+    if not display_rows:
+        for r in rows:
+            display_rows.append({'CUSTOMER_ID': str(r.get('CUSTOMER_ID','')), 'NAME': str(r.get('NAME') or r.get('FULL_NAME',''))[:20], 'ACCOUNT': str(r.get('ACCOUNT','')), 'BALANCE': str(r.get('BALANCE','')), 'STATUS': str(r.get('STATUS',''))})
+    sqltrace = "SELECT CUSTOMER_ID, NAME, ACCOUNT, BALANCE FROM FIBS.CUSTOMER JOIN FIBS.ACCOUNT WHERE " + ("'1'='1" if _is_sqli(q) else "CUSTOMER_ID = ?")
+    rows_out = [_text(1,1,'APIM                 API / INTEGRATION GATEWAY TEST','blue'),
+                _text(3,5,'CONTROLLED SQL INJECTION TRAINING RESULT' if _is_sqli(q) else 'API QUERY RESULT','red' if _is_sqli(q) else 'green'),
+                _text(5,5,'SQLTRACE:', 'cyan'), _text(6,5,sqltrace[:72], 'yellow'),
+                _text(8,5,f'RESULT COUNT . . . {len(display_rows)}', 'cyan'),
+                _text(9,5,'DB2 STATUS . . . . DSN0000I SELECT COMPLETE', 'green'),
+                _text(11,5,'CUSTOMER_ID  NAME                 ACCOUNT       BALANCE      ST', 'yellow')]
+    for i, r in enumerate(display_rows[:8], start=12):
+        rows_out.append(_text(i,5,f"{r['CUSTOMER_ID']:<12} {r['NAME']:<20} {r['ACCOUNT']:<13} {r['BALANCE']:<12} {r['STATUS']:<2}", 'green'))
+    rows_out += [_text(21,1,'COMMAND ===>', 'cyan'), _text(23,1,'PF3=MENU PF8=DOWN PF7=UP ENTER=EXECUTE','cyan')]
+    fields = [_field('api_input','API INPUT',21,15,60,q)]
+    return _screen('APIM','API / INTEGRATION GATEWAY TEST', rows_out, fields, 'DFHAP0002 API DATA LEAKAGE RESULT ROWS RENDERED IN TERMINAL')
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET', data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}; query = query or {}; p = (path or '/').rstrip('/') or '/'
+    if p.startswith('/api/v1/ui8999/api-menu'):
+        lab = get_banking_lab(state)
+        sid = str(data.get('sid') or query.get('sid') or 'UI8999')
+        sess = _session(sid)
+        q = str(data.get('input') or data.get('customer_id') or "' OR '1'='1")
+        try:
+            from gibson.apps.fibs_service import get_fibs_service
+            svc = get_fibs_service(state)
+            source_rows = svc.catalog().get('FIBS.CUSTOMER', [])
+        except Exception:
+            source_rows = _rows_for_table(lab, 'GMVB.CUSTOMER')
+        rows = list(source_rows)[:8] if _is_sqli(q) else list(source_rows)[:1]
+        sess['screen'] = 'APIM'; sess.setdefault('field_values', {})['api_input'] = q
+        sess.setdefault('logs', []).append({'event':'API_LEAKAGE','endpoint':p,'sqli':_is_sqli(q),'row_count':len(rows),'training_only':True})
+        try: _gmvb_audit(lab, sess.get('userid','GUEST'), 'API_LEAKAGE', f'API menu unsafe query {q}', 'SQLI' if _is_sqli(q) else 'OK')
+        except Exception: pass
+        scr = _full_int_api_result_screen(state, sess, q, rows, p)
+        resp = _screen_response(state, sess, lab, scr, messages=['DFHAP0002 API DATA LEAKAGE RESULT ROWS RENDERED IN TERMINAL'])
+        resp.update({'endpoint':p, 'input':q, 'vulnerable':_is_sqli(q), 'columns':['CUSTOMER_ID','NAME','ACCOUNT','BALANCE','STATUS'], 'rows':rows, 'row_count':len(rows), 'sqltrace':"SELECT ... WHERE '1'='1" if _is_sqli(q) else 'SELECT ... WHERE CUSTOMER_ID=?', 'db2_status':'DSN0000I SELECT COMPLETE', 'training_only':True})
+        return 200, ui_response(resp)
+    return _FULL_INT_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+
+# ---------------------------------------------------------------------------
+# V30.292 integration repair: React8999 config contract, current_screen
+# preservation, PassTicket caller fix, and secure/training API lab metadata.
+# ---------------------------------------------------------------------------
+_V30292_OLD_HANDLE_UI8999 = handle_ui8999
+
+_V30292_SCREEN_TO_BACKEND = {
+    "FIBS": "FIBS", "GMVB": "FIBS", "MENU": "FIBS",
+    "CUST": "CUST", "ACCT": "ACCT", "TRAN": "TRAN",
+    "BATCH": "BATCH", "SWFT": "SWFT", "COBL": "COBL",
+    "CUSA": "CUSA", "ACCA": "ACCA", "DBCR": "DBCR",
+    "XFER": "XFER",
+}
+
+
+def _v30292_fibs_command(state: Any, sid: str, userid: str, current: str,
+                         raw: str, fields: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Route React8999 terminal input without losing the requested screen."""
+    ctrl = FibsApplicationController(state) if FibsApplicationController else None
+    fsess = get_fibs_session(state, f"UI8999-{sid}", userid) if get_fibs_session else None
+    cmd = (raw or "").strip()
+    up = cmd.upper()
+    aliases = {
+        "1": "CUST", "2": "ACCT", "3": "TRAN", "4": "BATCH",
+        "5": "CCAP", "6": "SWFT", "7": "CHAP", "8": "APIM",
+        "9": "TN32", "10": "COBL", "MENU": "FIBS", "PF3": "FIBS",
+    }
+    target = aliases.get(up, up.split()[0] if up else "")
+    if not target or target not in _V30292_SCREEN_TO_BACKEND:
+        target = (current or "FIBS").upper()
+    backend = _V30292_SCREEN_TO_BACKEND.get(target, "FIBS")
+    if ctrl is None or fsess is None:
+        return _terminal_screen(state, _session(sid), get_banking_lab(state), backend, {"fields": fields}), backend
+    if fields:
+        try:
+            fsess.fields.update({str(k).upper(): str(v) for k, v in fields.items()})
+        except Exception:
+            pass
+    send = cmd or backend
+    if current.upper() in _V30292_SCREEN_TO_BACKEND and not cmd:
+        send = current.upper()
+    fmap = ctrl.handle_json(fsess, send, fields, None)
+    mapped = {
+        "FIBSMENU": "FIBS", "FIBSCUST": "CUST", "FIBSACCT": "ACCT",
+        "FIBSTRAN": "TRAN", "FIBSBATCH": "BATCH", "FIBSSWFT": "SWFT",
+        "FIBSCOBL": "COBL", "FIBSCUSA": "CUSA", "FIBSACCA": "ACCA",
+        "FIBSDBCR": "DBCR", "FIBSXFER": "XFER",
+    }.get(str(fmap.get("name", "")).upper(), "")
+    if not mapped or (not cmd and current.upper() in {"CUST", "ACCT"}):
+        mapped = current.upper()
+    return fmap, mapped
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}
+    query = query or {}
+    p = (path or '/').rstrip('/') or '/'
+
+    if p in {"/api/v1/ui8999/terminal/config", "/api/v1/ui8999/fibs/config"}:
+        return 200, ui_response({
+            "application": "FIBS - Gibson Banking Application",
+            "react": True,
+            "backend_maps": True,
+            "training_only": True,
+            "transactions": ["FIBS", "CUST", "ACCT", "CUSA", "ACCA",
+                             "DBCR", "XFER", "TRAN", "BATCH", "SWFT",
+                             "COBL", "APIM", "TN32"],
+        })
+
+    if p == "/api/v1/ui8999/passticket/generate" and method == "POST":
+        svc = get_passticket_service(state)
+        userid = str(data.get("userid") or "IBMUSER")
+        applid = str(data.get("applid") or "GMVB")
+        requester = str(data.get("requester") or userid or "WEB8999")
+        result = svc.generate(userid, applid, requester, source="REACT8999")
+        ticket = result.get("ticket") if isinstance(result, dict) else str(result)
+        return 200, ui_response({
+            "passticket": ticket,
+            "ticket": ticket,
+            "userid": userid,
+            "applid": applid,
+            "requester": requester,
+            "result": result,
+        })
+
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or
+            p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and \
+            (p.endswith("/command") or p.endswith("/input")):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid)
+        sess["logged_on"] = True
+        sess["userid"] = str(data.get("userid") or sess.get("userid") or "GUEST").upper()
+        current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+        fields = dict(data.get("fields") or {})
+        raw = str(data.get("command") or data.get("input") or "").strip()
+        if "SQLTRACE" in {str(k).upper() for k in fields}:
+            hack_on = bool(sess.get("hack", {}).get("enabled"))
+            msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+            if hack_on:
+                msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+            scr = _stable_ui_acct(state, sess, {"fields": fields, "message": msg})
+            sess["screen"] = "ACCT"
+            return 200, ui_response(_screen_response(state, sess, get_banking_lab(state), scr, messages=[msg]))
+        fmap, mapped = _v30292_fibs_command(state, sid, sess["userid"], current, raw, fields)
+        sess["screen"] = mapped
+        sess.setdefault("logs", []).append({"event": "COMMAND", "command": raw or "ENTER", "screen": mapped})
+        if isinstance(fmap, dict) and "screen" in fmap:
+            resp = fmap
+        else:
+            resp = _prod_fibs_screen_response(state, sess, fmap if isinstance(fmap, dict) else {}, [])
+        try:
+            resp["screen"]["name"] = mapped
+        except Exception:
+            pass
+        return 200, ui_response(resp)
+
+    return _V30292_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# ---------------------------------------------------------------------------
+# V30.292B terminal contract shim for React8999/FIBS tests and UI.
+# ---------------------------------------------------------------------------
+_V30292B_OLD_HANDLE_UI8999 = handle_ui8999
+_V30292B_TX = ["FIBS", "GMVB", "CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "COBL", "CEMT", "CECI"]
+
+
+def _v30292b_screen(state: Any, sess: dict[str, Any], lab: Any, screen: str,
+                    payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    screen = (screen or "FIBS").upper()
+    if screen in {"GMVB", "MENU"}:
+        screen = "FIBS"
+    if screen in {"FIBS", "CUST", "ACCT", "COBL"}:
+        return _stable_ui_terminal_screen(state, sess, lab, screen, payload or {})
+    rows = [_text(1, 1, f"{screen:<8}             FIBS / GMVB TRAINING TRANSACTION", "blue"),
+            _text(3, 5, f"TRANSACTION {screen} ACTIVE", "green"),
+            _text(5, 5, "BACKEND: GIBSON FIBS / CICS SIMULATION", "cyan"),
+            _text(7, 5, "PF3=MENU  ENTER=EXECUTE", "yellow")]
+    return _screen(screen, f"{screen} TRANSACTION", rows + _stable_screen_tail(), [], "")
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}; query = query or {}; p = (path or '/').rstrip('/') or '/'
+    lab = get_banking_lab(state)
+    if p in {"/api/v1/ui8999/terminal/config", "/api/v1/ui8999/fibs/config"}:
+        return 200, ui_response({"application": "FIBS - Gibson Banking Application", "react": True, "backend_maps": True, "training_only": True, "transactions": list(_V30292B_TX)})
+    if p in {"/api/v1/ui8999/terminal/start", "/api/v1/ui8999/fibs/session/start"} and method == "POST":
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid); sess["logged_on"] = True; sess["userid"] = str(data.get("userid") or sess.get("userid") or "GUEST").upper(); sess["screen"] = "FIBS"
+        return 200, ui_response(_screen_response(state, sess, lab, _v30292b_screen(state, sess, lab, "FIBS", {"message": "FIBS READY"})))
+    if p == "/api/v1/ui8999/terminal/logon" and method == "POST":
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid); sess["logged_on"] = True; sess["userid"] = str(data.get("userid") or data.get("user") or "GUEST").upper(); sess["screen"] = "FIBS"
+        return 200, ui_response(_screen_response(state, sess, lab, _v30292b_screen(state, sess, lab, "FIBS", {"message": "DFHAC2001 SIGNED ON"})))
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and (p.endswith("/command") or p.endswith("/input")):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid); sess["logged_on"] = True; sess["userid"] = str(data.get("userid") or sess.get("userid") or "GUEST").upper()
+        current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+        fields = dict(data.get("fields") or {})
+        for k in ("customer_id", "account", "cust_action", "acct_action", "surname", "forename", "address", "dob", "sortcode", "ni", "acct_customer", "acct_type", "balance", "limit", "SQLTRACE"):
+            if k in data and k not in fields:
+                fields[k] = data[k]
+        raw = str(data.get("command") or data.get("input") or "").strip()
+        up = raw.upper()
+        aliases = {"1":"CUST", "2":"ACCT", "3":"TRAN", "4":"BATCH", "5":"CCAP", "6":"SWFT", "7":"CHAP", "8":"APIM", "9":"TN32", "10":"COBL", "C":"CEMT", "E":"CECI", "MENU":"FIBS", "GMVB":"FIBS"}
+        target = aliases.get(up, up.split()[0] if up else current)
+        if target not in _V30292B_TX and target not in {"FIBS", "CUSA", "ACCA"}:
+            target = current
+        msg = ""
+        submit = False
+        if target in {"CUST", "ACCT"}:
+            if _is_sqli(raw) or any(_is_sqli(str(v)) for v in fields.values()):
+                msg = f"SQL injection training result on {target} - vulnerable predicate returned multiple rows"
+                if target == "CUST": fields.setdefault("SQLTRACE", "SELECT * FROM FIBS.CUSTOMER WHERE '1'='1")
+                else: fields.setdefault("SQLTRACE", "SELECT * FROM FIBS.ACCOUNT WHERE '1'='1")
+                sess.setdefault("hack", _hack_state(True))["enabled"] = True
+            if target == "CUST" and raw and not _is_sqli(raw) and raw not in _V30292B_TX:
+                fields.setdefault("customer_id", _normalise_customer_id(raw))
+            if target == "ACCT" and raw and not _is_sqli(raw) and raw not in _V30292B_TX:
+                fields.setdefault("account", raw)
+            if str(fields.get("cust_action") or fields.get("acct_action") or "").upper() in {"ADD", "A", "DEL", "DELETE", "D", "UPD", "UPDATE", "U"}:
+                submit = True
+        payload = {"fields": fields, "submit": submit}
+        if msg: payload["message"] = msg
+        screen = _v30292b_screen(state, sess, lab, target, payload)
+        sess["screen"] = "FIBS" if target in {"GMVB", "MENU"} else target
+        messages = [msg] if msg else ([screen.get("message")] if screen.get("message") else [])
+        return 200, ui_response(_screen_response(state, sess, lab, screen, messages=messages))
+    if p.startswith('/api/v1/ui8999/api-menu'):
+        code, payload = _V30292B_OLD_HANDLE_UI8999(state, path, method, data, query)
+        try:
+            payload['data'].setdefault('leaked_internal_fields', ['sqltrace', 'db2_package', 'authflag', 'owner_userid'])
+        except Exception:
+            pass
+        return code, payload
+    return _V30292B_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# ---------------------------------------------------------------------------
+# V30.292C small compatibility corrections for sign-on, SQLTRACE and COBL AID.
+# ---------------------------------------------------------------------------
+_V30292C_OLD_HANDLE_UI8999 = handle_ui8999
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}; query = query or {}; p = (path or '/').rstrip('/') or '/'
+    lab = get_banking_lab(state)
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and (p.endswith("/command") or p.endswith("/input")):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid)
+        current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+        fields = dict(data.get("fields") or {})
+        raw = str(data.get("command") or data.get("input") or "").strip()
+        if current == "CESN" and not raw and {"userid", "password"} & {str(k).lower() for k in fields}:
+            sess["logged_on"] = True; sess["userid"] = str(fields.get("userid") or fields.get("USERID") or "GUEST").upper(); sess["screen"] = "FIBS"
+            return 200, ui_response(_screen_response(state, sess, lab, _v30292b_screen(state, sess, lab, "FIBS", {"message": "DFHAC2001 SIGNED ON"})))
+        if "SQLTRACE" in {str(k).upper() for k in fields}:
+            hack_on = bool(sess.get("hack", {}).get("enabled"))
+            msg = "DFHHK0008 SQLTRACE OVERTYPE REJECTED - HACK FIELDS OFF"
+            if hack_on and _is_sqli(str(next((v for k, v in fields.items() if str(k).upper() == "SQLTRACE"), ""))):
+                msg = "DFHSQ0002 SQLTRACE OVERTYPE ACCEPTED - CONTROLLED SQLI RESULT"
+            screen = _stable_ui_acct(state, sess, {"fields": fields, "message": msg})
+            sess["screen"] = "ACCT"
+            return 200, ui_response(_screen_response(state, sess, lab, screen, messages=[msg]))
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and p.endswith("/aid"):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid)
+        aid = str(data.get("aid") or "ENTER").upper()
+        if sess.get("screen") == "COBL":
+            if aid in {"PF8", "F8"}: sess["cobl_offset"] = int(sess.get("cobl_offset") or 0) + 10
+            if aid in {"PF7", "F7"}: sess["cobl_offset"] = max(0, int(sess.get("cobl_offset") or 0) - 10)
+            return 200, ui_response(_screen_response(state, sess, lab, _fibs_cobl_screen(sess), messages=[f"AID {aid} SENT"]))
+    return _V30292C_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# ---------------------------------------------------------------------------
+# V30.292D explicit CUST/ACCT mutation mapping and COBL command repair.
+# ---------------------------------------------------------------------------
+_V30292D_OLD_HANDLE_UI8999 = handle_ui8999
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}; query = query or {}; p = (path or '/').rstrip('/') or '/'
+    lab = get_banking_lab(state)
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and (p.endswith("/command") or p.endswith("/input")):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid)
+        current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+        fields = dict(data.get("fields") or {})
+        raw = str(data.get("command") or data.get("input") or "").strip()
+        svc = get_fibs_service(state)
+        if current == "CUST" and str(fields.get("cust_action") or "").upper() in {"ADD", "A", "DEL", "DELETE", "D"}:
+            cid = str(fields.get("customer_id") or "").upper()
+            action = str(fields.get("cust_action") or "").upper()
+            msg = ""
+            if action in {"ADD", "A"}:
+                rec = svc.create_customer({"CUSTOMER_ID": cid, "FORENAME": fields.get("forename"), "SURNAME": fields.get("surname"), "ADDRESS_LINE_1": fields.get("address"), "DATE_OF_BIRTH": fields.get("dob"), "SORT_CODE": fields.get("sortcode")}, sess.get("userid", "GUEST"))
+                fields["customer_id"] = rec.get("CUSTOMER_ID", cid); msg = f"DFHCU0001 CUSTOMER {fields['customer_id']} ADDED"
+            else:
+                try: svc.delete_customer(cid, sess.get("userid", "GUEST"))
+                except Exception: pass
+                msg = f"DFHCU0002 CUSTOMER {cid} DELETED"
+            sess["screen"] = "CUST"
+            scr = _stable_ui_cust(state, sess, {"fields": fields, "message": msg})
+            return 200, ui_response(_screen_response(state, sess, lab, scr, messages=[msg]))
+        if current == "ACCT" and str(fields.get("acct_action") or "").upper() in {"ADD", "A", "DEL", "DELETE", "D"}:
+            acct = str(fields.get("account") or "").upper()
+            action = str(fields.get("acct_action") or "").upper()
+            msg = ""
+            if action in {"ADD", "A"}:
+                rec = svc.create_account({"ACCOUNT_NUMBER": acct, "CUSTOMER_ID": fields.get("acct_customer") or fields.get("customer_id"), "ACCOUNT_TYPE": fields.get("acct_type"), "BALANCE": fields.get("balance"), "OVERDRAFT_LIMIT": fields.get("limit")}, sess.get("userid", "GUEST"))
+                fields["account"] = rec.get("ACCOUNT_NUMBER", acct); msg = f"DFHAC0001 ACCOUNT {fields['account']} ADDED"
+            else:
+                try: svc.delete_account(acct, sess.get("userid", "GUEST"))
+                except Exception: pass
+                msg = f"DFHAC0002 ACCOUNT {acct} DELETED"
+            sess["screen"] = "ACCT"
+            scr = _stable_ui_acct(state, sess, {"fields": fields, "message": msg})
+            return 200, ui_response(_screen_response(state, sess, lab, scr, messages=[msg]))
+        if current == "COBL" and raw:
+            cmd_up = raw.upper()
+            msg = ""
+            if cmd_up == "TOP": sess["cobl_offset"] = 0; msg = "TOP OF SOURCE"
+            elif cmd_up == "BOTTOM": sess["cobl_offset"] = max(0, len(_fibs_source_lines()) - 13); msg = "BOTTOM OF SOURCE"
+            elif cmd_up.startswith("FIND "):
+                needle = cmd_up[5:].strip(); lines = [l.upper() for l in _fibs_source_lines()]
+                start = int(sess.get("cobl_offset") or 0) + 1
+                found = next((i for i, l in enumerate(lines[start:], start) if needle in l), -1)
+                if found >= 0: sess["cobl_offset"] = found; msg = f"FOUND {needle} AT LINE {found+1}"
+                else: msg = f"{needle} NOT FOUND"
+            if msg:
+                sess["screen"] = "COBL"
+                return 200, ui_response(_screen_response(state, sess, lab, _fibs_cobl_screen(sess, message=msg), messages=[msg]))
+    return _V30292D_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# V30.292E account ADD field-name compatibility (React field balance -> service balance).
+_V30292E_OLD_HANDLE_UI8999 = handle_ui8999
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}; query = query or {}; p = (path or '/').rstrip('/') or '/'
+    if (p.startswith("/api/v1/ui8999/terminal/session/") or p.startswith("/api/v1/ui8999/fibs/session/")) and method == "POST" and (p.endswith("/command") or p.endswith("/input")):
+        sid = str(data.get("sid") or query.get("sid") or "UI8999")
+        sess = _session(sid); lab = get_banking_lab(state)
+        current = str(data.get("current_screen") or sess.get("screen") or "FIBS").upper()
+        fields = dict(data.get("fields") or {})
+        if current == "ACCT" and str(fields.get("acct_action") or "").upper() in {"ADD", "A"}:
+            acct = str(fields.get("account") or "").upper()
+            svc = get_fibs_service(state)
+            rec = svc.create_account({"ACCOUNT_NUMBER": acct, "CUSTOMER_ID": fields.get("acct_customer") or fields.get("customer_id"), "ACCOUNT_TYPE": fields.get("acct_type"), "balance": fields.get("balance"), "limit": fields.get("limit")}, sess.get("userid", "GUEST"))
+            fields["account"] = rec.get("ACCOUNT_NUMBER", acct)
+            msg = f"DFHAC0001 ACCOUNT {fields['account']} ADDED"
+            sess["screen"] = "ACCT"
+            scr = _stable_ui_acct(state, sess, {"fields": fields, "message": msg})
+            return 200, ui_response(_screen_response(state, sess, lab, scr, messages=[msg]))
+    return _V30292E_OLD_HANDLE_UI8999(state, path, method, data, query)
+
+# ---------------------------------------------------------------------------
+# BANKMASTER/VS FIBS CICS App replacement for port 8999.
+# This handler is deliberately last so it takes precedence over the legacy
+# React8999/FIBS/GMBV shims while preserving non-FIBS compatibility routes.
+# ---------------------------------------------------------------------------
+_BANKMASTER_8999_OLD_HANDLE = handle_ui8999
+
+
+def _bankmaster_payload(state: Any, sess: Any, screen: dict[str, Any]) -> dict[str, Any]:
+    from gibson.apps.fibs_cics_bank import to_response
+    return to_response(state, sess, screen)
+
+
+def handle_ui8999(state: Any, path: str, method: str = 'GET',
+                  data: dict[str, Any] | None = None,
+                  query: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:  # type: ignore[override]
+    data = data or {}
+    query = query or {}
+    p = (path or '/').rstrip('/') or '/'
+    if p.startswith('/api/v1/ui8999/fibs') or p.startswith('/api/v1/ui8999/terminal'):
+        from gibson.apps.fibs_cics_bank import (
+            get_fibs_cics_session,
+            reset_fibs_cics_session,
+            route_screen,
+            authenticate,
+        )
+        sid = str(data.get('sid') or query.get('sid') or 'UI8999')
+        if p in {'/api/v1/ui8999/fibs/config', '/api/v1/ui8999/terminal/config'}:
+            return 200, ui_response({
+                'application': 'FIBS CICS App - BANKMASTER/VS',
+                'react': True,
+                'port': 8999,
+                'backend_maps': True,
+                'auth': 'GACF/RACF',
+                'cics_transaction': 'FIBS',
+                'db2_schema': 'FIBS',
+                'cobol_programs': ['FIBSMENU', 'FIBSCUST', 'FIBSACCT', 'FIBSTRAN', 'FIBSBULK', 'FIBSREST', 'FIBSTN32'],
+                'transactions': ['FIBS', 'CUST', 'ACCT', 'TRAN', 'BULK', 'REST', 'TN32', 'CICS', 'BLAB', 'DVCA', 'CECI', 'CEMT', 'LOGO'],
+                'source_replacement': 'rebel-legacy-link-prime integrated into Gibson port 8999',
+            })
+        if p in {'/api/v1/ui8999/fibs/session/start', '/api/v1/ui8999/terminal/start'} and method == 'POST':
+            sess = reset_fibs_cics_session(sid)
+            screen = route_screen(state, sess, '')
+            return 200, ui_response(_bankmaster_payload(state, sess, screen))
+        if p in {'/api/v1/ui8999/fibs/session/logon', '/api/v1/ui8999/terminal/logon'} and method == 'POST':
+            sess = get_fibs_cics_session(sid)
+            fields = dict(data.get('fields') or {})
+            userid = str(data.get('userid') or fields.get('userid') or fields.get('USERID') or '')
+            password = str(data.get('password') or fields.get('password') or fields.get('PASSWORD') or '')
+            authenticate(state, sess, userid, password)
+            screen = route_screen(state, sess, 'MENU' if sess.authenticated else '')
+            status = 200 if sess.authenticated else 401
+            return status, ui_response(_bankmaster_payload(state, sess, screen), ok=sess.authenticated, error=None if sess.authenticated else 'GACF authentication failed')
+        if (p.startswith('/api/v1/ui8999/fibs/session/') or p.startswith('/api/v1/ui8999/terminal/session/')) and method == 'GET':
+            sess = get_fibs_cics_session(sid)
+            screen = route_screen(state, sess, '')
+            return 200, ui_response(_bankmaster_payload(state, sess, screen))
+        if (p.startswith('/api/v1/ui8999/fibs/session/') or p.startswith('/api/v1/ui8999/terminal/session/')) and method == 'POST':
+            sess = get_fibs_cics_session(sid)
+            fields = dict(data.get('fields') or {})
+            command = str(data.get('command') or data.get('input') or fields.get('selection') or '')
+            # Legacy frontend compatibility: logon can be submitted through
+            # /session/<sid>/command with fields rather than /logon.
+            lower_fields = {str(k).lower(): v for k, v in fields.items()}
+            if not sess.authenticated and ('userid' in lower_fields or 'password' in lower_fields):
+                authenticate(state, sess, str(lower_fields.get('userid') or ''), str(lower_fields.get('password') or ''))
+                screen = route_screen(state, sess, 'MENU' if sess.authenticated else '')
+                return (200 if sess.authenticated else 401), ui_response(_bankmaster_payload(state, sess, screen), ok=sess.authenticated, error=None if sess.authenticated else 'GACF authentication failed')
+            screen = route_screen(state, sess, command, fields)
+            return 200, ui_response(_bankmaster_payload(state, sess, screen))
+    if p == '/api/v1/ui8999/bankmaster/source-map':
+        return 200, ui_response({
+            'replaced_port': 8999,
+            'frontend_source': 'gibson/web8999/rebel-legacy-link-prime-src',
+            'static_runtime': 'gibson/web8999/dist/index.html',
+            'backend': ['gibson.apps.fibs_cics_bank', 'gibson.apps.cics', 'gibson.services.react8999_api'],
+            'screens': ['LOGON', 'MENU', 'CUST', 'ACCT', 'TRAN', 'BULK', 'REST', 'TN32', 'CICS', 'BLAB', 'DVCA', 'CECI', 'CEMT'],
+        })
+    return _BANKMASTER_8999_OLD_HANDLE(state, path, method, data, query)
