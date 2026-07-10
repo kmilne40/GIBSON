@@ -1,3 +1,5 @@
+NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo. 
+
 # Gibson Mainframe Simulator
 
 **Gibson** is a local mainframe security training simulator for learning mainframe operations, mainframe security, red-team techniques, blue-team investigation, and modern mainframe integration in a safe lab environment.
