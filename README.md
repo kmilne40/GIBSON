@@ -1,4 +1,37 @@
-NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo. 
+Installation
+Let's get the installation started and then we can start discussing Gibson in greater depth. First of all, head over to this site and look for GIBSON on the navbar. From there download the Gibson and the latest version of this document (you may already be reading it). Ensure you read the simple download instructions to ensure you place the Gibson Package in the correct place.
+
+> Download and unzip the gibson-mainframe-latest.zip file in your Linux home directory.
+> It will create /gibson_mainframe directory.
+> chmod +x *.sh
+>
+> NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.
+> cd scripts
+> sudo ./GIBSON_PORT_CAPABILITIES.sh
+> cd ..
+> ./install_gibson.sh --venv
+> ./gibsonctl.sh start
+Once in the simulator it will look for you to IPL -
+
+r 01,CLPA
+r 02,U
+r 03,Y
+r 04,1234
+r 05,HOSTNAME (the name of your new mainframe e.g. MYLPAR)
+r 06,DVCAPIN=1337
+You'll be in the master console - but then it will be time to use the client. 
+Start a new terminal for your client.
+
+c3270 (sudo apt install it if it is not there)
+
+c3270 ipaddress 23
+
+Connection port is 23 for TSO etc. Type L TSO when you see the GIBSON welcome screen.
+
+Users and passwords that work straight away: IBMUSER/SYS1 (SPECIAL) and GUEST/GUEST (NONE)
+
+I've tested this on Ubuntu, Kali, Pi OS, Linux Mint, and Kali on Pi. It is written in Python and will run from Python 3.10.12 and up.
+
 
 # Gibson Mainframe Simulator
 
