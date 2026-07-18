@@ -6,12 +6,13 @@ It will create /gibson_mainframe directory.
 chmod +x *.sh
 
 NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.  Make sure you also pay attention to your IP Address - On Linux or WSL ip r.
-.
-FIRST THE INSTALL
+>
 
-./install_gibson.sh --venv
+> FIRST THE INSTALL
 
-NOW LET'S GET THE PORT CAPABILITIES SORTED.
+> ./install_gibson.sh --venv
+
+>NOW LET'S GET THE PORT CAPABILITIES SORTED.
 
  cd scripts
  sudo ./GIBSON_PORT_CAPABILITIES.sh
