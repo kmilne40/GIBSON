@@ -1,25 +1,25 @@
 Installation
 Let's get the installation started and then we can start discussing Gibson in greater depth. First of all, head over to this site and look for GIBSON on the navbar. From there download the Gibson and the latest version of this document (you may already be reading it). Ensure you read the simple download instructions to ensure you place the Gibson Package in the correct place.
 
-> Download and unzip the gibson-mainframe-latest.zip file in your Linux home directory.
-> It will create /gibson_mainframe directory.
-> chmod +x *.sh
->
-> NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.  Make sure you also pay attention to your IP Address - On Linux or WSL ip r.
+Download and unzip the gibson-mainframe-latest.zip file in your Linux home directory.
+It will create /gibson_mainframe directory.
+chmod +x *.sh
+
+NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.  Make sure you also pay attention to your IP Address - On Linux or WSL ip r.
 .
-> FIRST THE INSTALL
-> 
-> ./install_gibson.sh --venv
->
-> NOW LET'S GET THE PORT CAPABILITIES SORTED.
->
-> > cd scripts
-> sudo ./GIBSON_PORT_CAPABILITIES.sh
-> cd ..
->
-> NOW START
-> 
-> ./gibsonctl.sh start
+FIRST THE INSTALL
+
+./install_gibson.sh --venv
+
+NOW LET'S GET THE PORT CAPABILITIES SORTED.
+
+ cd scripts
+ sudo ./GIBSON_PORT_CAPABILITIES.sh
+cd ..
+
+NOW START
+
+./gibsonctl.sh start
 Once in the simulator it will look for you to IPL -
 
 r 01,CLPA
