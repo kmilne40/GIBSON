@@ -5,32 +5,47 @@ Download and unzip the gibson-mainframe-latest.zip file in your Linux home direc
 It will create /gibson_mainframe directory.
 chmod +x *.sh
 
-NOTE: to run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.  Make sure you also pay attention to your IP Address - On Linux or WSL ip r.
+> [!IMPORTANT] 
+To run GIBSON in port 23 and 21 without SUDO, you need to give it the port capabilites. Following the install, go to the /scripts directory and run the Gibson_port_Capabilities.sh with sudo.  Make sure you also pay attention to your IP Address - On Linux or WSL ip r.
+> 
+> FIRST THE INSTALL
+> 
+> ./install_gibson.sh --venv
+> 
+> NOW LET'S GET THE PORT CAPABILITIES SORTED.
+> 
+> cd scripts
+> 
+> sudo ./GIBSON_PORT_CAPABILITIES.sh
+> 
+> cd ..
+>
+> NOW START
+>
+> ./gibsonctl.sh start
+
+> [!TIP]
+> Once in the simulator it will look for you to IPL -
+>
+> r 01,CLPA
+> 
+> r 02,U
+> 
+> r 03,Y
+> 
+> r 04,1234
+> 
+> r 05,HOSTNAME (the name of your new mainframe e.g. MYLPAR)
+>
+> r 06,DVCAPIN=1337
+> 
+> You'll be in the master console - but then it will be time to use the client. 
 >
 
-> FIRST THE INSTALL
-
-> ./install_gibson.sh --venv
-
->NOW LET'S GET THE PORT CAPABILITIES SORTED.
-
- cd scripts
- sudo ./GIBSON_PORT_CAPABILITIES.sh
-cd ..
-
-NOW START
-
-./gibsonctl.sh start
-Once in the simulator it will look for you to IPL -
-
-r 01,CLPA
-r 02,U
-r 03,Y
-r 04,1234
-r 05,HOSTNAME (the name of your new mainframe e.g. MYLPAR)
-r 06,DVCAPIN=1337
-You'll be in the master console - but then it will be time to use the client. 
 Start a new terminal for your client.
+> [!NOTE]
+> If you would rather use a more fully featured client (terminal emulator) you can get PHOSPHOR from this repo.
+>
 
 c3270 (sudo apt install it if it is not there)
 
