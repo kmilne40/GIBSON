@@ -100,6 +100,21 @@ MAINT/SYSADMIN holding ABCDEFG is expected; any general-purpose or application
 guest holding class A, B, C or D is a finding. The privileged-command attempt
 (authorized or not) is recorded as a security event.
 
+The same class-B boundary governs real device custody. `ATTACH rdev userid`
+hands a real I/O device from the system pool to a guest's virtual
+configuration — whichever guest holds it can read it, so handing one to the
+wrong guest is a real exposure, not just a config error:
+
+```text
+(as MAINT)  ATTACH 0500 DEMO
+→  0500 ATTACHED TO DEMO
+   *** Offsite backup tape - RACF database export is now reachable from DEMO ***
+```
+
+A device already attached elsewhere is denied (`HCPATT046E ... is attached to
+<userid>`), and `DETACH rdev` releases it — your own device is always
+releasable, but detaching one attached to someone else also requires class B.
+
 ---
 
 ## 5. Finding 4 — service-machine authority

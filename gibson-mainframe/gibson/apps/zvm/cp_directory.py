@@ -14,7 +14,7 @@ to the class that authorizes them.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 # CP privilege classes and what they govern (IBM z/VM CP Planning & Admin).
@@ -73,6 +73,18 @@ class Minidisk:
     read_pw: str = ""
     write_pw: str = ""
     cyls: int = 100
+
+
+@dataclass
+class RealDevice:
+    """A real I/O device in the CP device pool (the ATTACH/DETACH surface,
+    class B).  Unlike a minidisk (a slice of a guest's own DASD), a real device
+    is system hardware that CP hands out whole - whichever guest holds it can
+    read it, so handing one to the wrong guest is a real exposure."""
+    addr: str
+    devclass: str        # DASD | TAPE | OSA | CTC
+    label: str
+    attached_to: Optional[str] = None
 
 
 @dataclass
@@ -151,6 +163,15 @@ _SPOOL_SEED = [
     SpoolFile("0102", "PRT", "OPERATOR", "DEMO", "REPORT", "LISTING", 512),
 ]
 
+# Real device pool (ATTACH/DETACH, class B).  Unowned until a class-B guest
+# attaches one - deliberately includes a sensitive tape to show the blast
+# radius of handing a real device to the wrong guest.
+_RDEV_SEED = [
+    RealDevice("0500", "TAPE", "Offsite backup tape - RACF database export"),
+    RealDevice("0600", "OSA", "Production OSA-Express adapter (external network)"),
+    RealDevice("0700", "DASD", "Spare 3390 volume - unformatted"),
+]
+
 
 class CpDirectory:
     """In-memory CP directory with logged-on state, minidisks and spool."""
@@ -164,6 +185,7 @@ class CpDirectory:
         self.vswitches: Dict[str, dict] = {
             "VSW1": {"owner": "SYSTEM", "grants": {"TCPIP", "MAINT"}},
         }
+        self.real_devices: Dict[str, RealDevice] = {d.addr: replace(d) for d in _RDEV_SEED}
 
     # -- lookup ---------------------------------------------------------------
     def exists(self, userid: str) -> bool:
@@ -183,6 +205,33 @@ class CpDirectory:
     def minidisk(self, userid: str, addr: str) -> Optional[Minidisk]:
         g = self.get(userid)
         return g.minidisks.get((addr or "").upper()) if g else None
+
+    # -- real device pool (ATTACH/DETACH, class B) -----------------------------
+    def real_device(self, addr: str) -> Optional[RealDevice]:
+        return self.real_devices.get((addr or "").upper())
+
+    def attach_device(self, addr: str, userid: str) -> Tuple[bool, str]:
+        """Attach a real device to a guest's virtual configuration.  Returns
+        (ok, status) where status is one of ``ok`` / ``notfound`` / ``inuse``
+        (already attached to a *different* guest; re-attaching to the same
+        guest is idempotent)."""
+        dev = self.real_device(addr)
+        if dev is None:
+            return False, "notfound"
+        if dev.attached_to and dev.attached_to != (userid or "").upper():
+            return False, "inuse"
+        dev.attached_to = (userid or "").upper()
+        return True, "ok"
+
+    def detach_device(self, addr: str) -> Optional[str]:
+        """Release a real device back to the pool.  Returns the userid that
+        held it, or None if the device doesn't exist or wasn't attached."""
+        dev = self.real_device(addr)
+        if dev is None or dev.attached_to is None:
+            return None
+        holder = dev.attached_to
+        dev.attached_to = None
+        return holder
 
     # -- spool (z5) -----------------------------------------------------------
     def reader_files(self, userid: str) -> List[SpoolFile]:

@@ -383,6 +383,8 @@ class ZvmSession:
             return self._cp_display_host(cmd)
         if verb == "LINK":
             return self._cp_link(cmd)
+        if verb == "ATTACH":
+            return self._cp_attach(cmd)
         if verb == "DETACH":
             return self._cp_detach(cmd)
         if verb in ("DEFINE VSWITCH", "SET VSWITCH"):
@@ -535,15 +537,56 @@ class ZvmSession:
             f"{owner} {oaddr} LINKED AS {myaddr} {mode}{warn}\n"
             f"Ready; T=0.01/0.01 {_time_str()}")
 
+    # ---- z8: real device ATTACH/DETACH (class B) -------------------------
+    def _cp_attach(self, cmd: str) -> ScreenBuffer:
+        """ATTACH rdev [userid] - attach a real device to a guest's virtual
+        configuration.  The class-B check has already passed; the lab shows
+        which guest ends up holding a sensitive real device (e.g. a backup
+        tape) when it's attached to someone other than its intended owner."""
+        parts = cmd.split()
+        rdev = parts[1].upper() if len(parts) > 1 else ""
+        target = parts[2].upper() if len(parts) > 2 else self._userid
+        if not rdev:
+            return self._cp_out(f"HCPATT040E Device address missing\nReady(00040); T=0.01/0.01 {_time_str()}")
+        if not self._dir.exists(target):
+            return self._cp_out(f"HCPATT361E {target} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        ok, status = self._dir.attach_device(rdev, target)
+        if not ok:
+            if status == "notfound":
+                return self._cp_out(f"HCPATT042E Device {rdev} does not exist\nReady(00042); T=0.01/0.01 {_time_str()}")
+            holder = self._dir.real_device(rdev).attached_to
+            return self._cp_out(f"HCPATT046E Device {rdev} is attached to {holder}\nReady(00046); T=0.01/0.01 {_time_str()}")
+        dev = self._dir.real_device(rdev)
+        cross = target != self._userid
+        self._emit_priv_event("ATTACH", "B", authorized=True,
+                              target=f"{rdev}->{target}" + (" CROSS-GUEST" if cross else ""))
+        warn = f"\n*** {dev.label} is now reachable from {target} ***" if cross else ""
+        return self._cp_out(f"{rdev} ATTACHED TO {target}{warn}\nReady; T=0.01/0.01 {_time_str()}")
+
     def _cp_detach(self, cmd: str) -> ScreenBuffer:
+        """DETACH addr - release a minidisk link (universal, own links only) or
+        a real device (class B if it belongs to someone else)."""
         parts = cmd.split()
         addr = (parts[1].upper() if len(parts) > 1 else "")
+        if not addr:
+            return self._cp_out(f"HCPDET040E Device address missing\nReady(00040); T=0.01/0.01 {_time_str()}")
         g = self._dir.get(self._userid)
         before = len(g.links)
         g.links = [l for l in g.links if l[2] != addr]
         if len(g.links) < before:
             return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
-        return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
+        dev = self._dir.real_device(addr)
+        if dev is not None and dev.attached_to:
+            if dev.attached_to != self._userid and "B" not in (self._classes or ""):
+                self._emit_priv_event(f"DETACH (device of {dev.attached_to})", "B", authorized=False)
+                return self._cp_out(
+                    f"HCPDET045E You are not authorized to DETACH {addr} from {dev.attached_to}\n"
+                    f"   (requires privilege class B; you hold class {self._classes or 'G'}.)\n"
+                    f"Ready(00045); T=0.01/0.01 {_time_str()}")
+            holder = self._dir.detach_device(addr)
+            self._emit_priv_event("DETACH", "B", authorized=True, target=f"{addr}<-{holder}")
+            return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
+        return self._cp_out(f"HCPDET045E Device {addr} not linked or attached\nReady(00045); T=0.01/0.01 {_time_str()}")
 
     def _emit_link_event(self, owner: str, addr: str, mode: str, authorized: bool) -> None:
         try:
