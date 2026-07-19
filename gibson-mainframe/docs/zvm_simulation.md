@@ -119,10 +119,29 @@ HELP
 | `Q MDISK` / `Q LINK` | Your minidisks / current minidisk links |
 | `Q VSWITCH` | Virtual switches and their GRANTed users |
 | `Q RDR` / `Q SPOOL` | Your reader/spool files |
+| `Q SECUSER` | Guests with a secondary-user (SET SECUSER) appointment |
 | `HELP` | CP command reference listing |
 
 Unrecognised CP commands return a `HCPCMD003E` error message, matching real
 z/VM CP error formatting.
+
+### Privileged CP commands
+
+| Command | Class | Effect |
+|---------|-------|--------|
+| `FORCE userid` | A | Log another guest off |
+| `SHUTDOWN` | A | Shut the system down |
+| `SET PRIVCLASS FOR userid TO classes` | A | Grant/revoke another guest's privilege classes live (`+`/`-` prefix adds/removes) |
+| `SET SECUSER userid secuserid\|OFF` | A | Appoint (or clear) a secondary user who receives a copy of `userid`'s terminal I/O |
+| `ATTACH rdev userid` | B | Attach a real device to a guest |
+| `DETACH rdev` | B (for another guest's device; your own is always releasable) | Release a real device |
+| `DEFINE VSWITCH` / `SET VSWITCH ... GRANT\|REVOKE` | B | Create a vswitch / manage its access list |
+| `STORE HOST` | C | Alter host real storage |
+| `DISPLAY HOST` / `DUMP HOST` | E | Examine host real storage |
+| `MSG` / `MSGNOH` / `MESSAGE userid text` | universal | Send a one-line message to another logged-on guest |
+
+Unauthorized attempts return `HCPCMD003E` naming the required class and are
+recorded as a security event regardless of outcome.
 
 ### Disconnect
 
@@ -140,13 +159,14 @@ PF3 from the CP Logon or CP Ready screen also disconnects.
 
 ### FILELIST (FL)
 
-Displays a simulated CMS minidisk file listing in standard FILELIST format:
+Displays the logged-on guest's real per-user CMS minidisk file listing (seeded
+with PROFILE EXEC, HELLO REXX, etc., plus anything since created via XEDIT)
+in standard FILELIST format:
 
 ```text
 Cmd   Filename  Filetype  Fm  Format  Lrecl  Records  Blocks  Date      Time
       PROFILE   EXEC      A1  V        80       42       1  2024-01-15 09:12:44
-      DEMO      REXX      A1  V        80      123       2  2024-03-10 14:22:01
-      MYJOB     JCL       A1  V        80       18       1  2024-04-01 11:05:33
+      HELLO     REXX      A1  V        80        6       1  2024-03-10 14:22:01
       ...
 ```
 
@@ -154,16 +174,17 @@ PF3, ENTER, or CLEAR returns to CMS Ready.
 
 ### RDRLIST (RL)
 
-Displays a simulated virtual reader queue in standard RDRLIST format:
+Displays the guest's real virtual reader queue (from the shared CP directory
+spool) in standard RDRLIST format:
 
 ```text
 Cmd   Filename  Filetype  Fm  Origid   Date      Time     Recs  Class Pri Hold
       MYJOB     JOB       RDR  <userid>  04/27/24 09:14:02  250  A    1
       REPORT    DATA      RDR  SYSTEM    04/26/24 22:00:11  512  A    2
-      SYSLOG    OUTPUT    RDR  SYSTEM    04/26/24 23:59:59 1024  A    5
 ```
 
-PF3, ENTER, or CLEAR returns to CMS Ready.
+An empty queue shows `NO RDR FILES FOR <userid>`. PF3, ENTER, or CLEAR returns
+to CMS Ready.
 
 ### XEDIT
 
@@ -173,10 +194,19 @@ XEDIT MYJOB JCL A
 X PROFILE EXEC A
 ```
 
-Opens the named file in a simulated XEDIT session. Any filename is accepted.
-The screen displays a static REXX EXEC as content for demonstration. PF3 saves
-and returns to CMS Ready. ENTER re-renders the same screen (useful for testing
-macro or key behaviour).
+Opens the named file from the guest's real per-user CMS disk. An existing file
+loads its actual saved lines; a filename that doesn't exist yet opens empty,
+tagged `(NEW FILE)`. On the XEDIT command line:
+
+```text
+INPUT text     appends a line to the buffer
+FILE           (also SAVE, FFILE) saves and returns to CMS Ready
+QUIT           discards changes and returns to CMS Ready
+```
+
+PF3 also saves and returns to CMS Ready. Saved content persists on the
+per-user `CmsDisk` for the rest of the session (and is what FILELIST /
+`TYPE` see afterward).
 
 ### Return to CP
 
@@ -241,6 +271,14 @@ but-bounded mechanisms currently modelled are:
   discoverable directory passwords (default-credential attacks).
 - **Privilege classes** — class-G denial of privileged CP commands; class A–F
   authority required for FORCE / SHUTDOWN / ATTACH / STORE / DISPLAY.
+- **Live privilege escalation** — `SET PRIVCLASS` (class A) grants or revokes
+  another guest's classes at runtime — the general mechanism behind the JEA
+  lab's vulnerable/fixed seed toggle, reachable live by anyone who is or
+  becomes class A.
+- **Surveillance** — `SET SECUSER` (class A) appoints a secondary user who
+  receives a copy of another guest's terminal I/O; `Q SECUSER` / the security
+  dashboard surface current appointments so the question "who is secuser of
+  whom, and why" is auditable.
 - **Minidisk LINK passwords** — `LINK` enforces read/write link passwords;
   `MAINT 191` is deliberately readable by `ALL` (a classic exposure), while
   RACFVM/DIRMAINT disks are protected. Wrong link passwords are denied.
@@ -258,12 +296,17 @@ authentic denials and audit records rather than full emulation.
 Gibson z/VM is a training simulator. It does not implement:
 
 - Real CP hypervisor operations or guest virtual-machine control
-- Real CMS file I/O, minidisk formatting, or SFS
-- Real XEDIT editing (content is static)
+- Real minidisk formatting, CMS file system semantics, or SFS (files are an
+  in-memory per-user store, not a real DASD/ECKD layout)
+- Full XEDIT (only INPUT/FILE/SAVE/QUIT are modelled; no PREFIX area, macros,
+  or subcommand set)
 - Real RACFVM integration or VM directory management (DIRMAINT)
-- Real spool operations (RDRLIST entries are static)
+- Real spool/RSCS transport (RDRLIST reflects the shared in-memory spool, not
+  a real reader/punch/print subsystem)
 - Real TCP/IP stack management via TCPIP virtual machine
-- IUCV, APPC, or inter-virtual-machine communication
+- IUCV, APPC, or inter-virtual-machine communication (`MSG`/`MSGNOH` record a
+  security event and check the target is logged on, but do not deliver text
+  into another live TN3270 session)
 
 It reproduces the TN3270 screen flow, CP/CMS command syntax, error message
 formats, and PF key conventions for training purposes only.

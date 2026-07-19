@@ -17,7 +17,7 @@ class (A–G) held by a virtual machine in the CP directory:
 
 | Class | Role | Example commands |
 |-------|------|------------------|
-| A | Primary system operator | FORCE, SHUTDOWN |
+| A | Primary system operator | FORCE, SHUTDOWN, SET PRIVCLASS, SET SECUSER |
 | B | Real resource control | ATTACH, VARY, DEFINE VSWITCH |
 | C | System programmer — **alter host storage** | **STORE HOST** |
 | D | Spooling control | manage other users' spool |
