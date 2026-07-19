@@ -32,6 +32,12 @@ CP_CLASS_DESC = {
 # listed here are "universal" (any logged-on guest may issue them for its own
 # virtual machine: QUERY, IPL, LOGOFF, DISCONNECT, DEFINE, LINK, SPOOL, SET,
 # TERMINAL, MESSAGE, HELP, CLOSE).
+#
+# Every entry here has a real execution handler in zvm_session.py - the table
+# only lists commands the class check actually gates something for.  Real
+# z/VM also gates VARY (B), INDICATE/MONITOR (E) and RDEVICE (F), but those
+# have no teaching value for this lab and no handler, so they're deliberately
+# left out rather than kept as class checks that lead nowhere.
 CP_PRIVILEGE = {
     "FORCE": "A",        # log another user off
     "SHUTDOWN": "A",     # shut the system down
@@ -40,13 +46,9 @@ CP_PRIVILEGE = {
     "DEFINE VSWITCH": "B",   # create a virtual switch
     "SET VSWITCH": "B",      # grant/revoke vswitch access
     "ATTACH": "B",       # attach a real device to a guest
-    "VARY": "B",         # vary a real device online/offline
     "STORE": "C",        # alter host real storage
     "DISPLAY": "E",      # examine host real storage
     "DUMP": "E",
-    "INDICATE": "E",     # system-wide performance counters
-    "MONITOR": "E",
-    "RDEVICE": "F",
 }
 # PURGE / TRANSFER / ORDER are class G for one's own spool but class D for
 # another guest's - enforced by ownership in the spool handler, not here.
@@ -113,6 +115,7 @@ class VmGuest:
     minidisks: Dict[str, "Minidisk"] = field(default_factory=dict)
     links: List[tuple] = field(default_factory=list)  # (owner, owner_addr, my_addr, mode)
     password: str = "ACCESS"     # CP directory logon password (weak by design for the lab)
+    secuser: Optional[str] = None   # SET SECUSER: who receives a copy of this guest's I/O
 
     def has_class(self, cls: str) -> bool:
         return cls.upper() in self.classes.upper()
