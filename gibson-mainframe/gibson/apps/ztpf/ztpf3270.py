@@ -30,7 +30,7 @@ class Ztpf3270Session(PanelSession):
             _BANNER,
             f"CPU-{st.cpu} SS-BSS  SYSTEM STATE {st.sys_state}  ONLINE {'YES' if st.online else 'NO'}",
             "CSMP0097I PRIME CRAS READY - ENTER Z-MESSAGE OR TRANSACTION",
-            "          (ZSTAT ZDLOK ZDPGM ZACES ZTPTRACE; ZDORD CC01 1; ZLAB lab; AVL DFWLAX; AUTH pan amt; OFF)",
+            "          (ZSTAT ZDLOK ZDPGM ZACES ZTPTRACE ZLINE ZNETW ZPERF; ZDORD CC01 1; ZLAB lab; AVL DFWLAX; AUTH pan amt; OFF)",
         ]
         self._scroll = ScrollList(list(self._lines), height=_BODY)
 

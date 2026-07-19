@@ -10,6 +10,7 @@ authorisation, each with a full ECB trace.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -62,6 +63,40 @@ class CardRecord:
 
 
 @dataclass
+class LineRecord:
+    """A teleprocessing line (SNA/TCPIP circuit) into the z/TPF SSU."""
+    line: str
+    ltype: str           # SNA | TCPIP | X25
+    state: str            # ACTIVE | INACTIVE | OOS
+    remote: str
+    msgs_in: int = 0
+    msgs_out: int = 0
+
+
+@dataclass
+class NetNode:
+    """A network node reachable over a line - host, gateway, or peer SSU."""
+    node: str
+    ntype: str            # SSU | HOST | GATEWAY
+    state: str             # ACTIVE | INACTIVE
+    line: str
+    sessions: int = 0
+
+
+@dataclass
+class PerfStat:
+    """Running per-trancode performance counters (feeds ZPERF)."""
+    trancode: str
+    count: int = 0
+    total_ms: float = 0.0
+    max_ms: float = 0.0
+
+    @property
+    def avg_ms(self) -> float:
+        return (self.total_ms / self.count) if self.count else 0.0
+
+
+@dataclass
 class TpfRecord:
     """A TPFDF record addressed by record TYPE + ORDINAL (no per-record ACL -
     knowing the type+ordinal is enough to read it: the core z/TPF exposure)."""
@@ -104,6 +139,9 @@ class ZtpfState:
     secure_mode: bool = False       # False = authentic default-weak TPF posture
     terminals: Dict[str, Terminal] = field(default_factory=dict)
     records: Dict[str, TpfRecord] = field(default_factory=dict)   # key "TYPE-ORD"
+    lines: Dict[str, LineRecord] = field(default_factory=dict)     # key line id
+    nodes: Dict[str, NetNode] = field(default_factory=dict)        # key node id
+    perf: Dict[str, PerfStat] = field(default_factory=dict)        # key trancode
     memory: Dict[str, str] = field(default_factory=dict)          # patchable control bytes
     pubkeys: Dict[str, str] = field(default_factory=dict)
     audit: List[str] = field(default_factory=list)
@@ -166,6 +204,25 @@ def _seed(st: ZtpfState) -> None:
     st.pubkeys = {
         "CCAUTH01": "RSA-2048 ACTIVE  (card-auth signing key)",
         "TLSHOST1": "RSA-2048 ACTIVE  (host TLS key)",
+    }
+    # Teleprocessing lines (ZLINE) and the nodes reached over them (ZNETW).
+    st.lines = {
+        "L001": LineRecord("L001", "SNA", "ACTIVE", "ARINC-GATEWAY-1", msgs_in=1245, msgs_out=1198),
+        "L002": LineRecord("L002", "TCPIP", "ACTIVE", "RES-AGENT-POOL", msgs_in=389, msgs_out=401),
+        "L003": LineRecord("L003", "SNA", "OOS", "BACKUP-LINK-2"),
+    }
+    st.nodes = {
+        "HPN": NetNode("HPN", "SSU", "ACTIVE", "LOCAL", sessions=4),
+        "SABRE1": NetNode("SABRE1", "HOST", "ACTIVE", "L001", sessions=2),
+        "ARINC1": NetNode("ARINC1", "GATEWAY", "ACTIVE", "L001", sessions=1),
+        "BKUP2": NetNode("BKUP2", "GATEWAY", "INACTIVE", "L003", sessions=0),
+    }
+    # Baseline transaction volume/latency so ZPERF has real numbers before any
+    # demo transaction is run in this session (the format matches the running
+    # counters run_transaction() updates as AVL/AUTH traffic is entered).
+    st.perf = {
+        "AVL": PerfStat("AVL", count=142, total_ms=142 * 2.1, max_ms=4.8),
+        "AUTH": PerfStat("AUTH", count=58, total_ms=58 * 3.4, max_ms=6.2),
     }
 
 
@@ -295,6 +352,22 @@ def _txn_card_auth(st: ZtpfState, ecb: Ecb) -> None:
     ecb.trace("ENTNC    format ISO response -> output message")
 
 
+def _record_perf(st: ZtpfState, code: str, base_ms: float) -> None:
+    """Update running ZPERF counters and the line/node it rode in on - TPF
+    transactions are wire-speed, so latency is simulated as small jitter around
+    a per-trancode baseline rather than measured wall-clock time."""
+    ms = max(0.1, base_ms + random.uniform(-0.6, 1.2))
+    stat = st.perf.setdefault(code, PerfStat(code))
+    stat.count += 1
+    stat.total_ms += ms
+    stat.max_ms = max(stat.max_ms, ms)
+    if st.lines:
+        line = list(st.lines.values())[st.ecb_seq % len(st.lines)]
+        if line.state == "ACTIVE":
+            line.msgs_in += 1
+            line.msgs_out += 1
+
+
 def run_transaction(state: Any, trancode: str, data: str) -> Ecb:
     """Create and dispatch an ECB for an input message; return the completed ECB."""
     st = get_ztpf_state(state)
@@ -303,8 +376,10 @@ def run_transaction(state: Any, trancode: str, data: str) -> Ecb:
     code = trancode.upper()
     if code in _AVAIL_PREFIXES:
         _txn_availability(st, ecb)
+        _record_perf(st, "AVL", 2.1)
     elif code in _CARD_PREFIXES:
         _txn_card_auth(st, ecb)
+        _record_perf(st, "AUTH", 3.4)
     else:
         ecb.response.append(f"CPST0001 TRANSACTION {code} NOT DEFINED - INPUT REJECTED")
         ecb.trace(f"ENTNC    no application for {code} -> reject")
@@ -442,6 +517,44 @@ def z_message(state: Any, raw: str, *, lniata: str = "CRAS", authority: Optional
                           "   02  C002  ONLINE  PNR-OVERFLOW", _stamp()])
     if verb == "ZDNUM":
         return f"{pfx}\nCDMP0001I DUMP NUMBERS: 0001 0002 (SOFT)  NO HARD DUMPS\n{_stamp()}"
+    if verb == "ZLINE":
+        a = arg.upper().split()
+        want = a[0] if a else ""
+        lines = [l for l in st.lines.values() if not want or l.line == want]
+        if want and not lines:
+            return f"{pfx}\nCLNE0009E LINE {want} NOT FOUND"
+        out = [f"{pfx}", "CLNE0001I TELEPROCESSING LINE STATUS",
+               "   LINE  TYPE   STATE     REMOTE                MSGS-IN  MSGS-OUT"]
+        for l in lines:
+            out.append(f"   {l.line:<5} {l.ltype:<6} {l.state:<9} {l.remote:<20}  {l.msgs_in:>7}  {l.msgs_out:>8}")
+        out.append(_stamp())
+        return "\n".join(out)
+    if verb == "ZNETW":
+        a = arg.upper().split()
+        want = a[0] if a else ""
+        nodes = [n for n in st.nodes.values() if not want or n.node == want]
+        if want and not nodes:
+            return f"{pfx}\nCNET0009E NODE {want} NOT FOUND"
+        out = [f"{pfx}", "CNET0001I NETWORK NODE STATUS",
+               "   NODE    TYPE     STATE     LINE   SESSIONS"]
+        for n in nodes:
+            out.append(f"   {n.node:<7} {n.ntype:<8} {n.state:<9} {n.line:<6} {n.sessions:>8}")
+        out.append(_stamp())
+        return "\n".join(out)
+    if verb == "ZPERF":
+        a = arg.upper().split()
+        want = a[0] if a else ""
+        stats = [s for s in st.perf.values() if not want or s.trancode == want]
+        if want and not stats:
+            return f"{pfx}\nCPRF0009E NO PERFORMANCE DATA FOR TRANCODE {want}"
+        out = [f"{pfx}", "CPRF0001I z/TPF PERFORMANCE MONITOR",
+               "   TRANCODE  COUNT     AVG-MS   MAX-MS"]
+        for s in stats:
+            out.append(f"   {s.trancode:<8}  {s.count:>5}     {s.avg_ms:>6.2f}   {s.max_ms:>6.2f}")
+        if not want:
+            out.append(f"   ECBS DISPATCHED: {len(st.ecbs)}   I-STREAMS: {st.istreams}   CPU UTIL: {st.util:02d}%")
+        out.append(_stamp())
+        return "\n".join(out)
     if verb == "ZPUBK":
         sub = (arg.split()[0].upper() if arg else "DISPLAY")
         if sub in ("DISPLAY", "DISP", ""):
@@ -550,7 +663,7 @@ def z_message(state: Any, raw: str, *, lniata: str = "CRAS", authority: Optional
     if verb in ("ZHELP", "ZHLP", "HELP", "?"):
         return ("z/TPF has no online HELP facility (use the Operations Guide). "
                 "Z-messages: ZSTAT ZDPGM ZDPAT ZDLOK ZDRCT ZDMOD ZDNUM ZACES ZDLOD ZTPLD "
-                "ZDREC ZDORD ZRECW ZCYCL ZPTCH ZPUBK ZPVFS ZAUDIT ZTPTRACE.")
+                "ZDREC ZDORD ZRECW ZCYCL ZPTCH ZPUBK ZPVFS ZAUDIT ZTPTRACE ZLINE ZNETW ZPERF.")
     if verb.startswith("Z"):
         return f"{pfx}\nCSMP0101E FUNCTIONAL MESSAGE {verb} NOT DEFINED"
     return ""
