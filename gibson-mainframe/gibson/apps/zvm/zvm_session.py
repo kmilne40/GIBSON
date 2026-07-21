@@ -32,7 +32,7 @@ from typing import Optional, TYPE_CHECKING
 
 from gibson.render.screen3270 import ScreenBuffer
 from gibson.render import colors
-from gibson.apps.zvm.cms import cms_command
+from gibson.apps.zvm.cms import cms_command, get_cms_disk, format_listing, CmsFile
 from gibson.apps.zvm.cp_directory import (
     CpDirectory, CP_CLASS_DESC, parse_cp_command, is_authorized,
 )
@@ -66,36 +66,7 @@ SYSLVL  = "2501"     # CP service level (RSU), for QUERY CPLEVEL
 # Sample virtual-machine directory (shown by Q NAMES / Q USERS)
 _VM_USERS = ["MAINT", "TCPIP", "OPERATOR", "RACFVM", "DIRMAINT", "SYSADMIN"]
 
-# Sample CMS minidisk file listing
-_FILELIST_ROWS = [
-    "      PROFILE   EXEC      A1  V        80       42       1  2024-01-15 09:12:44",
-    "      DEMO      REXX      A1  V        80      123       2  2024-03-10 14:22:01",
-    "      MYJOB     JCL       A1  V        80       18       1  2024-04-01 11:05:33",
-    "      NOTES     MEMO      A1  V        80       55       1  2024-04-20 08:44:17",
-    "      CMSLIB    MACLIB    A1  F       400      200      50  2023-12-01 00:00:00",
-    "      USER      DIRECT    A2  V        80       10       1  2024-02-14 16:30:00",
-    "      BACKUP    EXEC      A1  V        80       30       1  2024-03-28 10:10:10",
-    "      AUTOEXEC  EXEC      A1  V        80       15       1  2024-01-01 00:00:00",
-]
-
-_RDRLIST_ROWS_TMPL = [
-    "      MYJOB     JOB       RDR  {uid:<8}  04/27/24 09:14:02  250  A    1",
-    "      REPORT    DATA      RDR  SYSTEM    04/26/24 22:00:11  512  A    2",
-    "      SYSLOG    OUTPUT    RDR  SYSTEM    04/26/24 23:59:59 1024  A    5",
-]
-
-_XEDIT_CONTENT = [
-    "       |...+....1....+....2....+....3....+....4....+....5....+....6....+....7...|",
-    "00000 * * * Top of File * * *",
-    "00001 /* DEMO REXX EXEC */",
-    "00002 say 'Hello from z/VM CMS!'",
-    f"00003 say 'Running on {SYSNAME}'",
-    "00004 do i = 1 to 5",
-    "00005   say 'Iteration' i",
-    "00006 end",
-    "00007 exit 0",
-    "00000 * * * End of File * * *",
-]
+_XEDIT_RULER = "       |...+....1....+....2....+....3....+....4....+....5....+....6....+....7...|"
 
 
 def _now() -> datetime.datetime:
@@ -130,6 +101,9 @@ class ZvmSession:
         self._pending  = ""      # userid waiting for password
         self._last_msg = ""      # last CP/CMS output line
         self._xedit_file = "DEMO REXX A"
+        self._xedit_fn, self._xedit_ft = "DEMO", "REXX"
+        self._xedit_lines: list = []
+        self._xedit_new = True
         # z/VM CP directory is shared on the GibsonState so Q NAMES reflects
         # every logged-on guest across connections.
         self._dir: CpDirectory = getattr(self.state, "cp_directory", None) or CpDirectory()
@@ -229,14 +203,17 @@ class ZvmSession:
                 elif cmd in ("FILELIST", "FL"):
                     send("Cmd   Filename  Filetype  Fm  Format  Lrecl  Records  Blocks  Date      Time\n")
                     send("-" * 79 + "\n")
-                    for row in _FILELIST_ROWS:
-                        send(row + "\n")
+                    disk = get_cms_disk(self.state, userid)
+                    files = sorted(disk.files.values(), key=lambda f: (f.fn, f.ft))
+                    for row in format_listing(files, with_header=False, dateopt=True):
+                        send("      " + row + "\n")
                     send(f"\nReady; T=0.01/0.01 {_time_str()}\n\n")
                 elif cmd in ("RDRLIST", "RL"):
                     send("Cmd   Filename  Filetype  Fm  Origid   Date      Time     Recs  Class Pri Hold\n")
                     send("-" * 79 + "\n")
-                    for tmpl in _RDRLIST_ROWS_TMPL:
-                        send(tmpl.format(uid=userid) + "\n")
+                    for sf in self._dir.reader_files(userid):
+                        send(f"      {sf.name:<9} {sf.ftype:<9} {sf.queue:<4} {sf.origin:<8}  "
+                             f"{sf.date} 00:00:00  {sf.records:>4}  A    1\n")
                     send(f"\nReady; T=0.01/0.01 {_time_str()}\n\n")
                 elif cmd.startswith("XEDIT ") or cmd.startswith("X "):
                     send("Full-screen XEDIT requires TN3270 mode.\n\n")
@@ -270,7 +247,7 @@ class ZvmSession:
         if self._screen in (_FILELIST, _RDRLIST):
             return self._handle_list(aid)
         if self._screen == _XEDIT:
-            return self._handle_xedit(aid)
+            return self._handle_xedit(aid, text)
         return self._screen_logon()
 
     # ── Logon flow ────────────────────────────────────────────────────────────
@@ -383,10 +360,18 @@ class ZvmSession:
             return self._cp_display_host(cmd)
         if verb == "LINK":
             return self._cp_link(cmd)
+        if verb == "ATTACH":
+            return self._cp_attach(cmd)
         if verb == "DETACH":
             return self._cp_detach(cmd)
         if verb in ("DEFINE VSWITCH", "SET VSWITCH"):
             return self._cp_vswitch(verb, cmd)
+        if verb == "SET PRIVCLASS":
+            return self._cp_set_privclass(cmd)
+        if verb == "SET SECUSER":
+            return self._cp_set_secuser(cmd)
+        if verb in ("MSG", "MSGNOH", "MESSAGE"):
+            return self._cp_msg(verb, cmd)
         if verb in ("DIRMAINT", "DIRM"):
             return self._cp_dirmaint(cmd)
         if verb in ("XAUTOLOG", "AUTOLOG", "XAUTO"):
@@ -535,15 +520,56 @@ class ZvmSession:
             f"{owner} {oaddr} LINKED AS {myaddr} {mode}{warn}\n"
             f"Ready; T=0.01/0.01 {_time_str()}")
 
+    # ---- z8: real device ATTACH/DETACH (class B) -------------------------
+    def _cp_attach(self, cmd: str) -> ScreenBuffer:
+        """ATTACH rdev [userid] - attach a real device to a guest's virtual
+        configuration.  The class-B check has already passed; the lab shows
+        which guest ends up holding a sensitive real device (e.g. a backup
+        tape) when it's attached to someone other than its intended owner."""
+        parts = cmd.split()
+        rdev = parts[1].upper() if len(parts) > 1 else ""
+        target = parts[2].upper() if len(parts) > 2 else self._userid
+        if not rdev:
+            return self._cp_out(f"HCPATT040E Device address missing\nReady(00040); T=0.01/0.01 {_time_str()}")
+        if not self._dir.exists(target):
+            return self._cp_out(f"HCPATT361E {target} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        ok, status = self._dir.attach_device(rdev, target)
+        if not ok:
+            if status == "notfound":
+                return self._cp_out(f"HCPATT042E Device {rdev} does not exist\nReady(00042); T=0.01/0.01 {_time_str()}")
+            holder = self._dir.real_device(rdev).attached_to
+            return self._cp_out(f"HCPATT046E Device {rdev} is attached to {holder}\nReady(00046); T=0.01/0.01 {_time_str()}")
+        dev = self._dir.real_device(rdev)
+        cross = target != self._userid
+        self._emit_priv_event("ATTACH", "B", authorized=True,
+                              target=f"{rdev}->{target}" + (" CROSS-GUEST" if cross else ""))
+        warn = f"\n*** {dev.label} is now reachable from {target} ***" if cross else ""
+        return self._cp_out(f"{rdev} ATTACHED TO {target}{warn}\nReady; T=0.01/0.01 {_time_str()}")
+
     def _cp_detach(self, cmd: str) -> ScreenBuffer:
+        """DETACH addr - release a minidisk link (universal, own links only) or
+        a real device (class B if it belongs to someone else)."""
         parts = cmd.split()
         addr = (parts[1].upper() if len(parts) > 1 else "")
+        if not addr:
+            return self._cp_out(f"HCPDET040E Device address missing\nReady(00040); T=0.01/0.01 {_time_str()}")
         g = self._dir.get(self._userid)
         before = len(g.links)
         g.links = [l for l in g.links if l[2] != addr]
         if len(g.links) < before:
             return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
-        return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
+        dev = self._dir.real_device(addr)
+        if dev is not None and dev.attached_to:
+            if dev.attached_to != self._userid and "B" not in (self._classes or ""):
+                self._emit_priv_event(f"DETACH (device of {dev.attached_to})", "B", authorized=False)
+                return self._cp_out(
+                    f"HCPDET045E You are not authorized to DETACH {addr} from {dev.attached_to}\n"
+                    f"   (requires privilege class B; you hold class {self._classes or 'G'}.)\n"
+                    f"Ready(00045); T=0.01/0.01 {_time_str()}")
+            holder = self._dir.detach_device(addr)
+            self._emit_priv_event("DETACH", "B", authorized=True, target=f"{addr}<-{holder}")
+            return self._cp_out(f"{addr} DETACHED\nReady; T=0.01/0.01 {_time_str()}")
+        return self._cp_out(f"HCPDET045E Device {addr} not linked or attached\nReady(00045); T=0.01/0.01 {_time_str()}")
 
     def _emit_link_event(self, owner: str, addr: str, mode: str, authorized: bool) -> None:
         try:
@@ -750,12 +776,101 @@ class ZvmSession:
         self._emit_priv_event(f"SET VSWITCH {name} {action} {who}", "B", authorized=True)
         return self._cp_out(f"VSWITCH {name} {action} {who} COMPLETE\nReady; T=0.01/0.01 {_time_str()}")
 
+    # ---- z9: live privilege escalation + surveillance (class A) ----------
+    def _cp_set_privclass(self, cmd: str) -> ScreenBuffer:
+        """SET PRIVCLASS [FOR] userid TO classes|+classes|-classes - grant or
+        revoke another guest's privilege classes live (class A).  This is the
+        actual escalation mechanism behind the JEA lab's vulnerable/fixed
+        toggle: an operator (or an attacker who reached class A) re-grants
+        classes here rather than the classes only ever being fixed at seed."""
+        toks = cmd.split()
+        rest = toks[2:]
+        if rest and rest[0] == "FOR":
+            rest = rest[1:]
+        if len(rest) < 3 or rest[1] != "TO":
+            return self._cp_out(
+                f"HCPSPC040E SYNTAX: SET PRIVCLASS FOR userid TO classes|+classes|-classes\n"
+                f"Ready(00040); T=0.01/0.01 {_time_str()}")
+        target, spec = rest[0], rest[2]
+        g = self._dir.get(target)
+        if g is None:
+            return self._cp_out(f"HCPSPC361E {target} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        before = g.classes or "G"
+        if spec.startswith("+"):
+            g.classes = "".join(sorted(set(before) | set(spec[1:])))
+        elif spec.startswith("-"):
+            g.classes = "".join(c for c in before if c not in spec[1:]) or "G"
+        else:
+            g.classes = "".join(sorted(set(spec))) or "G"
+        self._emit_priv_event("SET PRIVCLASS", "A", authorized=True,
+                              target=f"{target} {before}->{g.classes}")
+        return self._cp_out(
+            f"HCPSPC040I {target} PRIVILEGE CLASSES CHANGED: {before} -> {g.classes}\n"
+            f"Ready; T=0.01/0.01 {_time_str()}")
+
+    def _cp_set_secuser(self, cmd: str) -> ScreenBuffer:
+        """SET SECUSER userid secuserid|OFF - appoint a secondary user who
+        receives a copy of userid's terminal I/O (class A).  A real z/VM
+        automation hook, and a real surveillance primitive if misused - the
+        security question is always "who is secuser of whom, and why.\""""
+        toks = cmd.split()
+        args = toks[2:]
+        if len(args) < 2:
+            return self._cp_out(
+                f"HCPSEC040E SYNTAX: SET SECUSER userid secuserid|OFF\n"
+                f"Ready(00040); T=0.01/0.01 {_time_str()}")
+        target, secuser = args[0], args[1]
+        g = self._dir.get(target)
+        if g is None:
+            return self._cp_out(f"HCPSEC361E {target} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        if secuser == "OFF":
+            old = g.secuser
+            g.secuser = None
+            self._emit_priv_event("SET SECUSER", "A", authorized=True, target=f"{target} OFF (was {old or 'none'})")
+            return self._cp_out(f"SECUSER FOR {target} RESET\nReady; T=0.01/0.01 {_time_str()}")
+        if not self._dir.exists(secuser):
+            return self._cp_out(f"HCPSEC361E {secuser} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        g.secuser = secuser
+        self._emit_priv_event("SET SECUSER", "A", authorized=True, target=f"{target} -> {secuser}")
+        return self._cp_out(
+            f"SECUSER OF {target} SET TO {secuser}\n"
+            f"*** {secuser} now receives a copy of {target}'s terminal I/O ***\n"
+            f"Ready; T=0.01/0.01 {_time_str()}")
+
+    def _cp_msg(self, verb: str, cmd: str) -> ScreenBuffer:
+        """MSG/MSGNOH/MESSAGE userid text - send a one-line message to another
+        guest (universal, no privilege class required in real z/VM).  A real
+        automation hook and a real social-engineering vector: nothing stops
+        one guest from sending text that impersonates an operator, so this
+        models exactly the recon question - is the target logged on to
+        receive it - without claiming to deliver text into a different live
+        TN3270 session, which this simulator does not model."""
+        parts = cmd.split(None, 2)
+        target = parts[1].upper() if len(parts) > 1 else ""
+        text = parts[2] if len(parts) > 2 else ""
+        if not target or not text:
+            return self._cp_out(f"HCPMSG040E SYNTAX: {verb} userid text\nReady(00040); T=0.01/0.01 {_time_str()}")
+        if not self._dir.exists(target):
+            return self._cp_out(f"HCPMSG361E {target} not in CP directory\nReady(00361); T=0.01/0.01 {_time_str()}")
+        g = self._dir.get(target)
+        if not g.logged_on:
+            return self._cp_out(f"HCPMSG053E {target} not logged on; message not delivered\nReady(00053); T=0.01/0.01 {_time_str()}")
+        try:
+            self.state.record_security_event(
+                self._userid, "CP MSG", f"TO={target} TEXT={text[:60]}",
+                service="TN3270/ZVM", addr=self.peer_addr, terminal="3270")
+        except Exception:
+            pass
+        return self._cp_out(f"MSG SENT TO {target}\nReady; T=0.01/0.01 {_time_str()}")
+
     def _security_dashboard(self) -> str:
         d = self._dir
         priv = [f"{u}({g.classes})" for u, g in sorted(d.guests.items()) if g.classes != "G"]
         exposed = [f"{u} {a}" for u, g in sorted(d.guests.items())
                    for a, md in g.minidisks.items() if md.read_pw == "ALL"]
         grants = [f"{n}->{','.join(sorted(v['grants'])) or 'none'}" for n, v in sorted(d.vswitches.items())]
+        secusers = [f"{u}->{g.secuser}" for u, g in sorted(d.guests.items()) if g.secuser]
+        devices = [f"{a}->{dv.attached_to}" for a, dv in sorted(d.real_devices.items()) if dv.attached_to]
         return "\n".join([
             f"z/VM SECURITY POSTURE  {SYSNAME}",
             "-" * 60,
@@ -763,6 +878,8 @@ class ZvmSession:
             f"MINIDISKS LINKABLE BY ALL ({len(exposed)}): " + ", ".join(exposed),
             f"SPOOL FILES IN SYSTEM     : {len(d.spool)}",
             f"VSWITCH GRANTS            : " + "; ".join(grants),
+            f"SECUSER APPOINTMENTS      : " + ("; ".join(secusers) or "none"),
+            f"REAL DEVICES ATTACHED     : " + ("; ".join(devices) or "none"),
             f"LOGGED ON                 : " + ", ".join(d.logged_on_users()),
         ])
 
@@ -806,6 +923,9 @@ class ZvmSession:
             return "\n".join(lines)
         if "SECURITY" in uc or "POSTURE" in uc:
             return self._security_dashboard()
+        if "SECUSER" in uc:
+            rows = [f"{u} SECUSER {g.secuser}" for u, g in sorted(self._dir.guests.items()) if g.secuser]
+            return "\n".join(rows) if rows else "NO SECUSER APPOINTMENTS"
         if "LINK" in uc:
             g = self._dir.get(self._userid)
             if not g or not g.links:
@@ -891,6 +1011,7 @@ class ZvmSession:
         if cmd.startswith("XEDIT ") or cmd.startswith("X "):
             parts = raw.strip().split(None, 1)
             self._xedit_file = (parts[1] if len(parts) > 1 else "DEMO REXX A").upper()
+            self._load_xedit_buffer()
             self._screen = _XEDIT
             return self._screen_xedit()
 
@@ -926,11 +1047,51 @@ class ZvmSession:
 
     # ── XEDIT navigation ──────────────────────────────────────────────────────
 
-    def _handle_xedit(self, aid: int) -> ScreenBuffer:
+    def _load_xedit_buffer(self) -> None:
+        """Load the real per-user CMS file (if any) named by self._xedit_file
+        into the edit buffer.  A filename that doesn't exist yet opens as a new
+        (empty) file, matching real XEDIT."""
+        toks = self._xedit_file.split()
+        self._xedit_fn = toks[0] if toks else "DEMO"
+        self._xedit_ft = toks[1] if len(toks) > 1 else "REXX"
+        disk = get_cms_disk(self.state, self._userid)
+        f = disk.files.get((self._xedit_fn, self._xedit_ft))
+        self._xedit_lines = list(f.records) if f else []
+        self._xedit_new = f is None
+
+    def _save_xedit_buffer(self) -> None:
+        """Persist the edit buffer back to the real per-user CmsDisk store."""
+        disk = get_cms_disk(self.state, self._userid)
+        key = (self._xedit_fn, self._xedit_ft)
+        existing = disk.files.get(key)
+        if existing is not None:
+            existing.records = list(self._xedit_lines)
+        else:
+            disk.files[key] = CmsFile(self._xedit_fn, self._xedit_ft, "A1", records=list(self._xedit_lines))
+        self._xedit_new = False
+
+    def _handle_xedit(self, aid: int, text: str = "") -> Optional[ScreenBuffer]:
         if aid == AID_PF3:
+            self._save_xedit_buffer()
             self._screen = _CMS
             self._last_msg = f"File saved: {self._xedit_file}\nReady; T=0.01/0.01 {_time_str()}"
             return self._screen_cms(self._last_msg)
+        if aid == AID_ENTER:
+            cmdline = (text or "").strip()
+            toks = cmdline.split(None, 1)
+            verb = toks[0].upper() if toks else ""
+            arg = toks[1] if len(toks) > 1 else ""
+            if verb == "INPUT" and arg:
+                self._xedit_lines.append(arg)
+            elif verb in ("FILE", "SAVE", "FFILE"):
+                self._save_xedit_buffer()
+                self._screen = _CMS
+                self._last_msg = f"File saved: {self._xedit_file}\nReady; T=0.01/0.01 {_time_str()}"
+                return self._screen_cms(self._last_msg)
+            elif verb == "QUIT":
+                self._screen = _CMS
+                self._last_msg = f"File not changed: {self._xedit_file}\nReady; T=0.01/0.01 {_time_str()}"
+                return self._screen_cms(self._last_msg)
         return self._screen_xedit()
 
     # ── Screen builders ───────────────────────────────────────────────────────
@@ -1046,10 +1207,13 @@ class ZvmSession:
         s = ScreenBuffer()
         s.extended_attributes = True
         uid = self._userid
-        s.put(1, 1, "FILELIST  A0  V 169  Trunc=169 Size=8  Line=1 Col=1 Alt=0", colors.WHITE)
+        disk = get_cms_disk(self.state, uid)
+        files = sorted(disk.files.values(), key=lambda f: (f.fn, f.ft))
+        rows = ["      " + r for r in format_listing(files, with_header=False, dateopt=True)]
+        s.put(1, 1, f"FILELIST  A0  V 169  Trunc=169 Size={len(files)}  Line=1 Col=1 Alt=0", colors.WHITE)
         s.put(2, 1, "Cmd   Filename  Filetype  Fm  Format  Lrecl  Records  Blocks  Date      Time", colors.GREEN)
         s.put(3, 1, "-" * 79, colors.BLUE)
-        for i, row in enumerate(_FILELIST_ROWS, start=4):
+        for i, row in enumerate(rows[:16], start=4):
             s.put(i, 1, row[:79], colors.GREEN)
         s.put(20, 1, "1= Help  2= Refresh  3= Quit  4= Sort(type)  5= Sort(date)  6= Sort(size)", colors.BLUE)
         s.put(21, 1, "-" * 79, colors.BLUE)
@@ -1064,11 +1228,16 @@ class ZvmSession:
         s = ScreenBuffer()
         s.extended_attributes = True
         uid = self._userid
-        s.put(1, 1, "RDRLIST   A0  V 108  Trunc=108 Size=3  Line=1 Col=1 Alt=0", colors.WHITE)
+        files = self._dir.reader_files(uid)
+        rows = [f"      {sf.name:<9} {sf.ftype:<9} {sf.queue:<4} {sf.origin:<8}  {sf.date} 00:00:00  "
+                f"{sf.records:>4}  A    1" for sf in files]
+        s.put(1, 1, f"RDRLIST   A0  V 108  Trunc=108 Size={len(files)}  Line=1 Col=1 Alt=0", colors.WHITE)
         s.put(2, 1, "Cmd   Filename  Filetype  Fm  Origid   Date      Time     Recs  Class Pri Hold", colors.GREEN)
         s.put(3, 1, "-" * 79, colors.BLUE)
-        for i, tmpl in enumerate(_RDRLIST_ROWS_TMPL, start=4):
-            s.put(i, 1, tmpl.format(uid=uid)[:79], colors.GREEN)
+        for i, row in enumerate(rows[:16], start=4):
+            s.put(i, 1, row[:79], colors.GREEN)
+        if not rows:
+            s.put(4, 1, f"      NO RDR FILES FOR {uid}", colors.GREEN)
         s.put(20, 1, "1= Help  2= Refresh  3= Quit  4= View  5= Print  6= Receive  9= Purge", colors.BLUE)
         s.put(21, 1, "-" * 79, colors.BLUE)
         s.put(22, 2, uid, colors.WHITE)
@@ -1082,14 +1251,20 @@ class ZvmSession:
         s = ScreenBuffer()
         s.extended_attributes = True
         fname = self._xedit_file
-        s.put(1, 1, f"{fname:<24} V 80  Trunc=80 Size=10 Line=0 Col=1 Alt=0", colors.WHITE)
+        tag = " (NEW FILE)" if self._xedit_new else ""
+        body = [_XEDIT_RULER, "00000 * * * Top of File * * *"]
+        for i, ln in enumerate(self._xedit_lines, start=1):
+            body.append(f"{i:05d} {ln}")
+        body.append("00000 * * * End of File * * *")
+        s.put(1, 1, (f"{fname:<24} V 80  Trunc=80 Size={len(self._xedit_lines)} "
+                     f"Line=0 Col=1 Alt=0{tag}")[:79], colors.WHITE)
         s.put(2, 1, "====>", colors.GREEN)
         s.add_field("CMDLINE", 2, 7, 66, protected=False, role="command")
-        for i, line in enumerate(_XEDIT_CONTENT, start=3):
+        for i, line in enumerate(body[:18], start=3):
             s.put(i, 2, line[:77], colors.GREEN)
         s.put(21, 1, "1= Help  2= Add  3= Quit  4= Tab  5= Cchar  6= ?  7= Bkwd  8= Fwd  9= Repeat", colors.BLUE)
         s.put(22, 1, "10= Rgtleft  11= Spltjoin  12= Power input", colors.BLUE)
         s.put(23, 1, f"XEDIT     {SYSNAME}", colors.WHITE)
-        s.put(23, 20, "PF3=Quit  PF7=Bkwd  PF8=Fwd", colors.GREEN)
+        s.put(23, 20, "PF3=Save+Quit  Cmd: INPUT text|FILE|QUIT", colors.GREEN)
         s.set_cursor(2, 7)
         return s

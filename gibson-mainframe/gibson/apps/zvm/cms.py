@@ -81,7 +81,7 @@ def _resolve(disk: CmsDisk, fn: str, ft: str) -> Optional[CmsFile]:
     return disk.files.get((fn.upper(), ft.upper()))
 
 
-def _fmt_listing(files: List[CmsFile], with_header: bool, dateopt: bool) -> List[str]:
+def format_listing(files: List[CmsFile], with_header: bool, dateopt: bool) -> List[str]:
     out: List[str] = []
     if with_header:
         out.append("FILENAME FILETYPE FM   FORMAT LRECL  RECS BLOCKS DATE       TIME")
@@ -126,7 +126,7 @@ def cms_command(state: Any, userid: str, line: str) -> Optional[str]:
         if not hits:
             return "DMSLST002E FILE NOT FOUND.\n" + _ready(28)
         header = "FILELIST" in opts or "ALLOC" in opts or "DATE" in opts or "LABEL" in opts
-        body = _fmt_listing(hits, header, "DATE" in opts)
+        body = format_listing(hits, header, "DATE" in opts)
         return "\n".join(body) + "\n" + _ready()
 
     if verb in ("TYPE", "T"):
