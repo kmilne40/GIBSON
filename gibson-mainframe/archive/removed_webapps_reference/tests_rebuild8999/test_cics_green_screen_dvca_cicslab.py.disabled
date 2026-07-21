@@ -1,0 +1,34 @@
+from gibson.core.state import GibsonState
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.db2_sim import Db2Simulator
+
+
+def test_cics_direct_dvca_and_transactions():
+    st = GibsonState.create()
+    c = CicsSimulator(st, 'IBMUSER')
+    out = c.execute('DVCA')
+    assert 'DAMN VULNERABLE CICS APPLICATION' in out
+    assert "Mel's Cargo" in out
+    for tx in ['MCMM','MCOR','MCAD','MCHI']:
+        assert tx in c.execute(tx)
+    assert 'SECRET CICS SCREEN' in c.execute('SCRT')
+
+
+def test_cics_direct_cicslab_and_help():
+    st = GibsonState.create()
+    c = CicsSimulator(st, 'IBMUSER')
+    out = c.execute('BLAB')
+    assert 'BANKING LAB - CICSLAB1' in out
+    assert 'REST API VULNERABILITY TESTER' in out
+    help_out = c.execute('HELP')
+    assert 'DVCA' in help_out and 'CICSLAB1' in help_out and 'BLAB' in help_out
+
+
+def test_cics_dvca_events_are_db2_visible():
+    st = GibsonState.create()
+    c = CicsSimulator(st, 'IBMUSER')
+    c.execute('DVCA')
+    c.execute('MCOR')
+    rows = Db2Simulator(st).run_sql('SELECT * FROM FIBS.HACK3270_EVENT', 'IBMUSER')
+    assert rows
+    assert any('DVCA' in str(r).upper() or 'MCOR' in str(r).upper() for r in rows)

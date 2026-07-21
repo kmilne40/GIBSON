@@ -1,0 +1,9 @@
+# s3270 command-mode IND$FILE roundtrip validation for Gibson
+Connect(127.0.0.1:2023)
+String("IND$FILE PUT LOCAL(test-in.txt) DSN(IBMUSER.TEST.TEXT) MODE(ASCII) EXIST(REPLACE)")
+Enter
+Wait(Output)
+String("IND$FILE GET DSN(IBMUSER.TEST.TEXT) LOCAL(test-out.txt) MODE(ASCII) EXIST(REPLACE)")
+Enter
+Wait(Output)
+Disconnect

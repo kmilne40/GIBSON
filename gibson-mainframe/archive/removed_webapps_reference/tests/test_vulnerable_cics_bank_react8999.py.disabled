@@ -1,0 +1,91 @@
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+
+
+def state():
+    return GibsonState.create()
+
+
+def post(st, path, data=None):
+    code, payload = handle_ui8999(st, path, method="POST", data=data or {}, query={})
+    assert code < 500, payload
+    return code, payload["data"]
+
+
+def get(st, path):
+    code, payload = handle_ui8999(st, path, method="GET", data={}, query={})
+    assert code < 500, payload
+    return code, payload["data"]
+
+
+def test_terminal_config_and_transactions_include_new_bank_flows():
+    st = state()
+    code, data = get(st, "/api/v1/ui8999/terminal/config")
+    assert code == 200
+    assert data["react"] is True
+    for tx in ["FIBS", "GMVB", "CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "COBL"]:
+        assert tx in data["transactions"]
+
+
+def test_logon_and_gmvb_menu():
+    st = state()
+    code, data = post(st, "/api/v1/ui8999/terminal/start", {"sid":"T1"})
+    assert data["screen"]["name"] == "FIBS"
+    code, data = post(st, "/api/v1/ui8999/terminal/logon", {"sid":"T1", "userid":"GUEST", "password":"GUEST"})
+    assert code == 200
+    assert data["screen"]["name"] == "FIBS"
+    screen_text = " ".join(r["text"] for r in data["screen"]["rows"])
+    assert "BATCH PROCESSING" in screen_text
+    assert "SWIFT" in screen_text
+    assert "CHAPS" in screen_text
+
+
+def test_core_terminal_transactions_render():
+    st = state(); post(st, "/api/v1/ui8999/terminal/start", {"sid":"T2"}); post(st, "/api/v1/ui8999/terminal/logon", {"sid":"T2", "userid":"GUEST", "password":"GUEST"})
+    for tx in ["CUST", "ACCT", "TRAN", "BATCH", "CCAP", "SWFT", "CHAP", "APIM", "TN32", "COBL", "CEMT", "CECI"]:
+        code, data = post(st, "/api/v1/ui8999/terminal/session/T2/command", {"sid":"T2", "command":tx})
+        assert code == 200
+        assert data["screen"]["name"] == tx
+
+
+def test_sqli_training_paths_for_cust_acct_and_api_menu():
+    st = state(); post(st, "/api/v1/ui8999/terminal/start", {"sid":"T3"}); post(st, "/api/v1/ui8999/terminal/logon", {"sid":"T3", "userid":"GUEST", "password":"GUEST"})
+    for tx, key in [("CUST", "customer_id"), ("ACCT", "account")]:
+        code, data = post(st, "/api/v1/ui8999/terminal/session/T3/command", {"sid":"T3", "command":tx, key:"10001' OR '1'='1"})
+        text = " ".join(r["text"] for r in data["screen"]["rows"])
+        assert "SQL" in text or "SQLI" in text
+    code, data = post(st, "/api/v1/ui8999/api-menu/unsafe-query", {"sid":"T3", "input":"' OR '1'='1"})
+    assert data["vulnerable"] is True
+    assert "sqltrace" in data["leaked_internal_fields"]
+
+
+def test_hack3270_hidden_fields_field_inject_and_batch_pin_bruteforce():
+    st = state(); post(st, "/api/v1/ui8999/terminal/start", {"sid":"T4"}); post(st, "/api/v1/ui8999/terminal/logon", {"sid":"T4", "userid":"GUEST", "password":"GUEST"})
+    post(st, "/api/v1/ui8999/terminal/session/T4/command", {"sid":"T4", "command":"BATCH"})
+    code, data = post(st, "/api/v1/ui8999/hack3270/session/T4/toggle", {"sid":"T4", "action":"on", "hidden_fields_revealed":True, "disable_protection":True, "numeric_bypass":True})
+    assert data["hack3270"]["hidden_fields_revealed"] is True
+    assert any(f["id"] == "AUTHFLAG" for f in data["screen"]["fields"])
+    code, data = post(st, "/api/v1/ui8999/hack3270/session/T4/field-inject", {"sid":"T4", "field":"AUTHFLAG", "value":"Y"})
+    assert data["result"] == "INJECTED"
+    assert data["screen"]["name"] == "BATCH"
+    code, data = post(st, "/api/v1/ui8999/hack3270/session/T4/batch-pin-bruteforce", {"sid":"T4", "pins":["0000", "1111", "1337"]})
+    assert data["found"] == "1337"
+    assert "BATCH" in data["message"]
+    assert data["screen"]["name"] == "BATCH"
+
+
+def test_tn3270_buffer_and_cobol_source():
+    st = state(); post(st, "/api/v1/ui8999/terminal/start", {"sid":"T5"})
+    code, data = get(st, "/api/v1/ui8999/hack3270/session/T5/buffer")
+    assert data["training_only"] is True
+    assert any("AUTHFLAG" in line for line in data["buffer"])
+    code, data = get(st, "/api/v1/ui8999/terminal/cobol/vulnerable-bank-update")
+    assert "VULNERABLE-BANK-UPDATE" in data["source"]
+    assert "VULN-10" in data["markers"]
+
+
+def test_legacy_labs_route_still_available():
+    st = state()
+    code, data = get(st, "/api/v1/ui8999/labs")
+    assert code == 200
+    assert data["count"] >= 1

@@ -1,0 +1,14 @@
+VTAM LIVE R05 BINKY PROOF
+==========================
+Command sequence: R 01,CLPA -> R 02,U -> R 03,Y -> R 04,<PIN> -> R 05,BINKY
+Selected state hostname: BINKY
+Live ASCII renderer function: gibson.services.telnet_server.TelnetSession._display_login_screen -> coloured_ascii_vtam_screen(... system_name=state.get_system_hostname())
+Live TN3270 renderer function: gibson.services.tn3270_server.Tn3270Session.vtam_screen -> tn3270_vtam_screen(... system_name=state.get_system_hostname())
+ASCII proof: BINKY PRODUCTION LPAR present = True
+ASCII proof: GIBSON PRODUCTION LPAR absent = True
+TN3270 proof: BINKY PRODUCTION LPAR present = True
+TN3270 proof: GIBSON PRODUCTION LPAR absent = True
+
+Rendered ASCII excerpt:
+[34m                          * BINKY PRODUCTION LPAR   *[0m
+[32m             LU NAME:  LU320     CLIENT IP: 192.168.0.97     CLIENT PORT: 10456[0m

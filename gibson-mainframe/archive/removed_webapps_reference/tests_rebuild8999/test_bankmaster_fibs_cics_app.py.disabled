@@ -1,0 +1,66 @@
+from pathlib import Path
+
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+from gibson.apps.cics import CicsSimulator
+
+
+def make_state(tmp_path):
+    cfg = GibsonConfig.from_env()
+    cfg.sim_root = tmp_path / 'sim'
+    cfg.files_root = cfg.sim_root / 'f'
+    cfg.commands_dir = cfg.files_root / 'commands'
+    cfg.transfer_root = cfg.sim_root / 'transfers'
+    cfg.assets_dir = Path('gibson/assets').resolve()
+    cfg.gacf_path = cfg.assets_dir / 'GACF.DB'
+    return GibsonState.create(cfg)
+
+
+def test_8999_starts_with_bankmaster_logon(tmp_path):
+    state = make_state(tmp_path)
+    code, payload = handle_ui8999(state, '/api/v1/ui8999/fibs/session/start', 'POST', {'sid': 'T'}, {})
+    assert code == 200
+    data = payload['data']
+    assert data['screen_name'] == 'LOGON'
+    assert any('BANKMASTER/VS' in line for line in data['lines'])
+    assert any('S I G H B E R B A N K' in line for line in data['lines'])
+
+
+def test_8999_logon_uses_gacf_and_opens_menu(tmp_path):
+    state = make_state(tmp_path)
+    code, payload = handle_ui8999(state, '/api/v1/ui8999/fibs/session/logon', 'POST', {'sid': 'T', 'userid': 'SARCHER', 'password': 'SYSADM'}, {})
+    assert code == 200
+    data = payload['data']
+    assert data['authenticated'] is True
+    assert data['screen_name'] == 'MENU'
+    assert any('BANKMASTER/VS - MAIN TRANSACTION MENU' in line for line in data['lines'])
+
+
+def test_8999_rejects_bad_gacf_password(tmp_path):
+    state = make_state(tmp_path)
+    code, payload = handle_ui8999(state, '/api/v1/ui8999/fibs/session/logon', 'POST', {'sid': 'T', 'userid': 'SARCHER', 'password': 'WRONG'}, {})
+    assert code == 401
+    assert payload['ok'] is False
+    assert payload['data']['screen_name'] == 'LOGON'
+
+
+def test_8999_menu_options_route_to_all_required_screens(tmp_path):
+    state = make_state(tmp_path)
+    handle_ui8999(state, '/api/v1/ui8999/fibs/session/logon', 'POST', {'sid': 'T', 'userid': 'SARCHER', 'password': 'SYSADM'}, {})
+    expected = {
+        '1': 'CUST', '2': 'ACCT', '3': 'TRAN', '4': 'BULK', '6': 'REST',
+        '7': 'TN32', '8': 'CICS', '9': 'BLAB', 'DVCA': 'MCGM',
+        'CECI': 'CECI', 'CEMT': 'CEMT', 'MENU': 'MENU'
+    }
+    for command, screen in expected.items():
+        code, payload = handle_ui8999(state, '/api/v1/ui8999/fibs/session/T/input', 'POST', {'sid': 'T', 'command': command}, {})
+        assert code == 200
+        assert payload['data']['screen_name'] == screen
+
+
+def test_l_cics_fibs_uses_same_bankmaster_app(tmp_path):
+    state = make_state(tmp_path)
+    text = CicsSimulator(state, 'SARCHER').execute('FIBS SARCHER SYSADM')
+    assert 'BANKMASTER/VS - MAIN TRANSACTION MENU' in text
+    assert 'CUST - CUSTOMER MASTER MAINTENANCE' in text

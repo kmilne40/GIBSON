@@ -1,0 +1,1488 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, Iterable, Optional
+import json
+import os
+import fnmatch
+from datetime import datetime
+import posixpath
+import shlex
+import subprocess
+import sys
+
+from gibson.core.state import GibsonState
+from gibson.apps.tso import TsoCommandProcessor
+from gibson.apps.editor import InteractiveEditor
+from gibson.render import colors
+from gibson.apps.uss_network_clients import GibsonFtpClient, GibsonTelnetClient
+from gibson.apps.cti_rss import rss_command
+from gibson.tools.omvs_nmap import run_omvs_nmap
+
+
+@dataclass
+class OmvsIdentity:
+    userid: str
+    uid: int
+    gid: int
+    home: str
+    program: str = "/bin/sh"
+    superuser: bool = False
+
+    @property
+    def prompt_char(self) -> str:
+        return "#" if self.superuser else "$"
+
+
+class ExtAttrStore:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data: Dict[str, str] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            self.data = {}
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        self.data = {str(k): "".join(sorted(set(str(v)))) for k, v in dict(raw).items()}
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True), encoding="utf-8")
+
+    def get(self, relpath: str) -> str:
+        return self.data.get(relpath, "")
+
+    def set(self, relpath: str, flags: str) -> None:
+        flags = "".join(sorted(set(flags)))
+        if flags:
+            self.data[relpath] = flags
+        else:
+            self.data.pop(relpath, None)
+        self.save()
+
+    def update_flags(self, relpath: str, op: str, flags: str) -> str:
+        current = set(self.data.get(relpath, ""))
+        if op == "+":
+            current.update(flags)
+        else:
+            current.difference_update(flags)
+        merged = "".join(sorted(current))
+        self.set(relpath, merged)
+        return merged
+
+
+class OmvsEnvironment:
+    """Compatibility-preserving USS filesystem facade for Gibson."""
+
+    def __init__(self, state: GibsonState):
+        self.state = state
+        self.root = state.config.sim_root / "uss"
+        self.extattrs = ExtAttrStore(state.config.sim_root / "uss_extattrs.json")
+        self._bootstrap_site()
+
+    def _bootstrap_site(self) -> None:
+        for rel in ["u", "tmp", "var/tmp", "etc", "usr/lpp/IBM/zoau/bin", "usr/lpp/IBM/cyp/v3r11/pyz/bin"]:
+            (self.root / rel).mkdir(parents=True, exist_ok=True)
+        self._write_if_missing(
+            self.root / "etc" / "profile",
+            "# Gibson USS global profile\n"
+            "export _BPXK_AUTOCVT=ON\n"
+            "export LANG=C\n"
+            "export PATH=/bin:/usr/sbin:/usr/lpp/IBM/zoau/bin:/usr/lpp/IBM/cyp/v3r11/pyz/bin\n"
+            "export PS1='$LOGNAME:$PWD$ '\n",
+        )
+        self._write_if_missing(
+            self.root / "etc" / "motd",
+            "GIBSON z/OS UNIX System Services\nAuthorized classroom simulation system.\n",
+        )
+
+    def _write_if_missing(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(text, encoding="utf-8")
+
+    def identity_for(self, userid: str, superuser: bool = False) -> OmvsIdentity:
+        userid_u = userid.upper()
+        # Stable deterministic UID/GID values without changing legacy GACF.DB format.
+        base = sum(ord(c) for c in userid_u) % 50000
+        uid = 0 if superuser else 10000 + base
+        gid = 0 if superuser else 200 + (base % 200)
+        home = "/" if superuser else f"/u/{userid_u.lower()}"
+        return OmvsIdentity(userid_u if not superuser else "ROOT", uid, gid, home)
+
+    def ensure_user_profile(self, userid: str) -> Path:
+        home = self.real_path(f"/u/{userid.lower()}")
+        home.mkdir(parents=True, exist_ok=True)
+        self._write_if_missing(
+            home / ".profile",
+            f"# Gibson user profile for {userid.upper()}\n"
+            f"export HOME=/u/{userid.lower()}\n"
+            f"export LOGNAME={userid.upper()}\n"
+            f"export USER={userid.upper()}\n"
+            "export _BPXK_AUTOCVT=ON\n"
+            "export PATH=/bin:/usr/sbin:/usr/lpp/IBM/zoau/bin:/usr/lpp/IBM/cyp/v3r11/pyz/bin\n",
+        )
+        self._write_if_missing(home / "README", "Gibson USS home directory\n")
+        return home
+
+    def real_path(self, virtual_path: str) -> Path:
+        clean = posixpath.normpath(virtual_path)
+        if not clean.startswith("/"):
+            clean = "/" + clean
+        rel = clean.lstrip("/")
+        real = (self.root / rel).resolve()
+        root_resolved = self.root.resolve()
+        if root_resolved not in real.parents and real != root_resolved:
+            raise PermissionError("PATH ESCAPES USS ROOT")
+        return real
+
+    def virtual_path(self, path: Path) -> str:
+        root_resolved = self.root.resolve()
+        real = path.resolve()
+        rel = real.relative_to(root_resolved)
+        return "/" + str(rel).replace(os.sep, "/") if str(rel) != "." else "/"
+
+    def resolve(self, cwd: str, operand: str) -> str:
+        if not operand:
+            return cwd
+        if operand.startswith("/"):
+            return posixpath.normpath(operand)
+        return posixpath.normpath(posixpath.join(cwd, operand))
+
+    def dsfs_exists(self, virtual_path: str) -> bool:
+        try:
+            return self._dsfs_stat(virtual_path) is not None
+        except Exception:
+            return False
+
+    def _dsfs_stat(self, virtual_path: str):
+        p = PurePosixPath(posixpath.normpath(virtual_path))
+        parts = p.parts
+        if parts[:2] == ("/", "dsfs"):
+            if len(parts) == 2:
+                return {"type": "dir", "entries": [u.userid.lower() for u in self.state.racf.users.values()] + ["sysout"]}
+            if len(parts) >= 3 and parts[2] == "sysout":
+                if len(parts) == 3:
+                    jobs = [j.job_id for j in self.state.jes.list_jobs()]
+                    return {"type": "dir", "entries": jobs}
+                jobid = parts[3].upper()
+                for job in self.state.jes.list_jobs():
+                    if job.job_id.upper() == jobid:
+                        return {"type": "file", "text": f"{job.job_id} {job.jobname}\n{job.output}\n"}
+                return None
+            userid = parts[2].upper()
+            if not self.state.racf.exists(userid):
+                return None
+            if len(parts) == 3:
+                prefix = userid + "."
+                entries: set[str] = set()
+                for info in self.state.datasets.listcat(userid):
+                    suffix = info.name[len(prefix):] if info.name.startswith(prefix) else info.name
+                    head = suffix.split(".", 1)[0].lower()
+                    entries.add(head)
+                return {"type": "dir", "entries": sorted(entries)}
+            dsname = userid + "." + ".".join(part.upper() for part in parts[3:])
+            try:
+                text = self.state.datasets.read(userid, dsname)
+                real = self.state.datasets.ds_path(userid, dsname)
+                return {"type": "dir" if real.is_dir() else "file", "text": text if not real.is_dir() else None, "entries": text.splitlines() if real.is_dir() else None}
+            except FileNotFoundError:
+                return None
+        return None
+
+    def exists(self, virtual_path: str) -> bool:
+        if virtual_path.startswith("/dsfs"):
+            return self.dsfs_exists(virtual_path)
+        return self.real_path(virtual_path).exists()
+
+    def is_dir(self, virtual_path: str) -> bool:
+        if virtual_path.startswith("/dsfs"):
+            stat = self._dsfs_stat(virtual_path)
+            return bool(stat and stat.get("type") == "dir")
+        return self.real_path(virtual_path).is_dir()
+
+    def listdir(self, virtual_path: str) -> list[str]:
+        if virtual_path.startswith("/dsfs"):
+            stat = self._dsfs_stat(virtual_path)
+            if not stat or stat.get("type") != "dir":
+                raise FileNotFoundError(virtual_path)
+            entries = stat.get("entries") or []
+            return sorted(entries)
+        real = self.real_path(virtual_path)
+        if not real.is_dir():
+            raise NotADirectoryError(virtual_path)
+        return sorted(p.name for p in real.iterdir())
+
+    def read_text(self, virtual_path: str) -> str:
+        if virtual_path.startswith("/dsfs"):
+            stat = self._dsfs_stat(virtual_path)
+            if not stat:
+                raise FileNotFoundError(virtual_path)
+            if stat.get("type") == "dir":
+                return "\n".join(stat.get("entries") or [])
+            return str(stat.get("text") or "")
+        return self.real_path(virtual_path).read_text(encoding="utf-8", errors="ignore")
+
+    def write_text(self, virtual_path: str, text: str) -> None:
+        if virtual_path.startswith("/dsfs"):
+            raise PermissionError("DSFS view is read-only; use OPUT/OCOPY")
+        real = self.real_path(virtual_path)
+        real.parent.mkdir(parents=True, exist_ok=True)
+        real.write_text(text, encoding="utf-8")
+
+    def rel_for_attr(self, virtual_path: str) -> Optional[str]:
+        if virtual_path.startswith("/dsfs"):
+            return None
+        return self.resolve("/", virtual_path).lstrip("/")
+
+    def attr_string(self, virtual_path: str) -> str:
+        rel = self.rel_for_attr(virtual_path)
+        stored = self.extattrs.get(rel) if rel is not None else ""
+        if "E" not in stored and not virtual_path.startswith("/dsfs"):
+            real = self.real_path(virtual_path)
+            try:
+                text = real.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            if real.suffix in {".sh", ".py", ".rexx"} or text.startswith("#!"):
+                stored = "".join(sorted(set(stored + "E")))
+        return stored
+
+
+class OmvsShellSession:
+    def __init__(self, state: GibsonState, userid: str, processor: Optional[TsoCommandProcessor] = None, mode: str = "OMVS"):
+        self.state = state
+        self.env = OmvsEnvironment(state)
+        self.real_userid = userid.upper()
+        self.mode = mode.upper()
+        self.processor = processor or TsoCommandProcessor(state, self.real_userid)
+        self.identity = self.env.identity_for(self.real_userid)
+        self.cwd = self.identity.home
+        self.history: list[str] = []
+        self.file_meta: Dict[str, Dict[str, str]] = {}
+        self.ftp_client = GibsonFtpClient()
+        self.telnet_client = GibsonTelnetClient()
+        self.environment: Dict[str, str] = {
+            "HOME": self.identity.home,
+            "LOGNAME": self.real_userid,
+            "USER": self.real_userid,
+            "PWD": self.cwd,
+            "HOSTNAME": state.network.hostname,
+            "SHELL": self.identity.program,
+            "TERM": "xterm-3270" if self.mode == "OMVS3270" else "xterm",
+            "LANG": "C",
+            "_BPXK_AUTOCVT": "ON",
+            "PATH": "/bin:/usr/sbin:/usr/lpp/IBM/zoau/bin:/usr/lpp/IBM/cyp/v3r11/pyz/bin",
+        }
+        self.env.ensure_user_profile(self.real_userid)
+
+    def banner(self) -> str:
+        profile = self.env.read_text("/etc/motd").rstrip("\n")
+        mode = "OMVS/3270" if self.mode == "OMVS3270" else "USS/TTY"
+        return colors.CLEAR + colors.BLUE + profile + colors.RESET + f"\nSession type: {mode}\n"
+
+    def prompt(self) -> str:
+        path = self.environment.get("PWD", self.cwd)
+        return colors.WHITE + f"{self.environment.get('LOGNAME', self.real_userid)}:{path}{self.identity.prompt_char} " + colors.RESET
+
+    def pf6_ready(self) -> bool:
+        return self.mode == "OMVS3270"
+
+    def _read_line_result(self, io_or_reader, prompt: str, hidden: bool = False):
+        if hasattr(io_or_reader, "read_line"):
+            return io_or_reader.read_line(prompt, hidden=hidden, mask=hidden)
+        return io_or_reader(prompt, hidden)
+
+    def run_interactive(self, io_or_reader, writer: Callable[[str], None]) -> None:
+        self._interactive_io = io_or_reader if hasattr(io_or_reader, "read_key") else None
+        writer(self.banner())
+        while True:
+            result = self._read_line_result(io_or_reader, self.prompt(), False)
+            key = getattr(result, "key", "")
+            text = getattr(result, "text", "")
+            if key == "EOF":
+                return
+            if key and key.upper() in {"PF6", "F6"} and self.pf6_ready():
+                writer(colors.BLUE + "Returning to TSO READY.\n" + colors.RESET)
+                return
+            cmd = text.strip()
+            if not cmd:
+                continue
+            if self._handle_interactive_command(cmd, io_or_reader, writer):
+                continue
+            outcome = self.execute(cmd)
+            if outcome is None:
+                return
+            if outcome:
+                writer(outcome.rstrip("\n") + "\n")
+
+    def execute(self, raw: str) -> Optional[str]:
+        self.history.append(raw)
+        try:
+            argv = shlex.split(raw)
+        except ValueError as exc:
+            return f"FSUM7332 syntax error: {exc}"
+        if not argv:
+            return ""
+        cmd = argv[0]
+        lower = cmd.lower()
+        if self._is_help_request(argv):
+            return self._command_help(lower)
+        if lower in {"exit", "logout", "quit"}:
+            return None
+        if lower in {"pf6", "f6"} and self.pf6_ready():
+            return None
+        if lower == "help":
+            return self._help()
+        if lower == "ftp":
+            return self.ftp_client.run_one(argv[1:])
+        if lower == "telnet":
+            return self.telnet_client.run_one(argv[1:])
+        if lower == "nmap":
+            return run_omvs_nmap(argv[1:], self.env, self.cwd)
+        if lower == "rss":
+            return rss_command(self.state, self.real_userid, "RSS " + " ".join(argv[1:]))
+        if lower == "pwd":
+            return self.cwd
+        if lower == "cd":
+            return self._cd(argv[1] if len(argv) > 1 else self.identity.home)
+        if lower == "ls":
+            return self._ls(argv[1:])
+        if lower == "cat":
+            return self._cat(argv[1:])
+        if lower == "echo":
+            return " ".join(argv[1:])
+        if lower == "touch":
+            return self._touch(argv[1:])
+        if lower == "mkdir":
+            return self._mkdir(argv[1:])
+        if lower == "rmdir":
+            return self._rmdir(argv[1:])
+        if lower in {"more", "head", "tail"}:
+            return self._display_text_command(lower, argv[1:])
+        if lower in {"chmod", "chown", "chgrp"}:
+            return self._metadata_cmd(lower, argv[1:])
+        if lower == "date":
+            return datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y").replace("  ", " ")
+        if lower == "grep":
+            return self._grep(argv[1:])
+        if lower == "find":
+            return self._find(argv[1:])
+        if lower == "wc":
+            return self._wc(argv[1:])
+        if lower in {"sort", "uniq", "cut", "tr"}:
+            return self._text_filter(lower, argv[1:])
+        if lower == "du":
+            return self._du(argv[1:])
+        if lower == "kill":
+            return self._kill(argv[1:])
+        if lower in {"set", "umask"}:
+            return self._set_umask(lower, argv[1:])
+        if lower == "ln":
+            return self._ln(argv[1:])
+        if lower == "tar":
+            return self._tar(argv[1:])
+        if lower in {"gzip", "gunzip"}:
+            return self._gzip_cmd(lower, argv[1:])
+        if lower in {"od", "hexdump"}:
+            return self._hex_dump(argv[1:])
+        if lower == "iconv":
+            return self._iconv(argv[1:])
+        if lower == "chtag":
+            return self._chtag(argv[1:])
+        if lower == "man":
+            return self._man(argv[1:])
+        if lower == "rm":
+            return self._rm(argv[1:])
+        if lower == "cp":
+            return self._cp(argv[1:])
+        if lower == "mv":
+            return self._mv(argv[1:])
+        if lower == "id":
+            return self._id()
+        if lower == "whoami":
+            return self.environment.get("LOGNAME", self.real_userid)
+        if lower == "hostname":
+            return self.state.network.hostname
+        if lower == "uname":
+            return self._uname(argv[1:])
+        if lower in {"env", "printenv"}:
+            return self._env(argv[1:])
+        if lower == "export":
+            return self._export(argv[1:])
+        if lower == "extattr":
+            return self._extattr(argv[1:])
+        if lower in {"vi", "view", "ex", "edit"}:
+            return "vi: available in interactive OMVS/USS sessions"
+        if lower == "oedit":
+            return "oedit: available in interactive OMVS/USS sessions"
+        if lower in {"tso", "tsocmd"}:
+            return self._tso(argv[1:])
+        if lower in {"oget", "oput", "ocopy"}:
+            return self._mvs_copy(lower, argv[1:])
+        if lower in {"netstat", "onetstat"}:
+            return self._netstat(argv[1:])
+        if lower in {"ping", "oping"}:
+            return self._ping(argv[1:])
+        if lower in {"traceroute", "otracert", "tracerte"}:
+            return self._traceroute(argv[1:])
+        if lower == "su":
+            return self._su(argv[1:])
+        if lower == "sudo":
+            return self._sudo(argv[1:])
+        if lower in {"python", "python3"}:
+            return self._python(argv)
+        if lower == "df":
+            return self._df()
+        if lower == "ps":
+            return self._ps()
+        if lower == "clear":
+            return colors.CLEAR
+        return f"FSUM7351 {cmd}: not found"
+
+    @staticmethod
+    def supported_commands() -> list[str]:
+        return [
+            "pwd", "ls", "cd", "mkdir", "rmdir", "touch", "cat", "more",
+            "head", "tail", "cp", "mv", "rm", "chmod", "chown", "chgrp",
+            "id", "whoami", "hostname", "uname", "date", "echo", "grep",
+            "find", "wc", "sort", "uniq", "cut", "tr", "df", "du", "ps",
+            "nmap",
+            "kill", "env", "export", "set", "umask", "ln", "tar", "gzip",
+            "gunzip", "od", "hexdump", "iconv", "chtag", "man", "help",
+            "OPUT", "OGET", "OCOPY", "extattr", "tso", "tsocmd", "vi",
+            "oedit", "su", "sudo", "python", "python3", "netstat", "ping",
+            "traceroute", "ftp", "telnet", "rss", "clear",
+        ]
+
+    def _is_help_request(self, argv: list[str]) -> bool:
+        if not argv:
+            return False
+        if len(argv) >= 2 and argv[1].upper() in {"HELP", "?", "-H", "--HELP"}:
+            return True
+        if argv[0].lower() == "help" and len(argv) >= 2:
+            return True
+        return False
+
+    def _command_help(self, command: str) -> str:
+        cmd = command.lower()
+        if cmd == "help" and len(self.history) >= 1:
+            try:
+                parts = shlex.split(self.history[-1])
+                if len(parts) > 1:
+                    cmd = parts[1].lower()
+            except Exception:
+                pass
+        usage = {
+            "ls": "ls [-l] [-a] [-E] [path] - list USS files and tags",
+            "cp": "cp source target - copy USS files or //MVS.DATA.SET operands",
+            "OPUT": "OPUT dataset path [-t|-b] - copy MVS dataset to USS file",
+            "OGET": "OGET path dataset [-t|-b] - copy USS file to MVS dataset",
+            "OCOPY": "OCOPY source target | INDATASET(...) OUTPATH(...) | INPATH(...) OUTDATASET(...)",
+            "find": "find [path] [-name pattern] [-type f|d] - search simulated USS tree",
+            "grep": "grep [-i] [-n] pattern file... - search file text",
+            "tar": "tar -cf archive files | tar -tf archive | tar -xf archive - simulated archive",
+            "iconv": "iconv [-f from] [-t to] file - simulate ASCII/EBCDIC conversion labels",
+            "chtag": "chtag [-t text|-b binary|-c ccsid] file - set/display simulated file tag",
+            "man": "man command - display Gibson USS command help",
+            "ftp": "ftp [host [port]] - prompts for Name and Password before ftp>; use ftp HELP",
+            "telnet": "telnet [host [port]] - remote login/password flow appears before telnet>; use telnet HELP",
+            "rss": "rss list|fetch|show|add|delete|export - FIBS CTI/RSS feed reader",
+            "nmap": "nmap [options] 127.0.0.1|mainframe - Gibson NSE training simulator. Allowed targets: 127.0.0.1, mainframe",
+        }
+        key = command if command in {"OPUT", "OGET", "OCOPY"} else cmd
+        if key in usage:
+            return usage[key]
+        if cmd in [c.lower() for c in self.supported_commands()]:
+            return f"{cmd}: Gibson USS simulated command. Use {cmd} HELP or man {cmd} for examples."
+        return self._help()
+
+    def _help(self) -> str:
+        cmds = " ".join(self.supported_commands())
+        return (
+            "Gibson USS commands:\n"
+            f"  {cmds}\n"
+            "Dataset operands: //\'HLQ.DATA.SET\' or \"//\'HLQ.DATA.SET\'\"\n"
+            "Transfer examples:\n"
+            "  cp \"//\'IBMUSER.TEST.DATA\'\" /u/ibmuser/data.txt\n"
+            "  OPUT IBMUSER.TEST.DATA /u/ibmuser/data.txt\n"
+            "  OGET /u/ibmuser/data.txt IBMUSER.TEST.COPY\n"
+        )
+
+    def _resolved(self, operand: str) -> str:
+        return self.env.resolve(self.cwd, operand)
+
+    def _cd(self, operand: str) -> str:
+        target = self._resolved(operand)
+        if not self.env.exists(target) or not self.env.is_dir(target):
+            return f"FSUM7351 cd: {operand}: No such directory"
+        self.cwd = target
+        self.environment["PWD"] = self.cwd
+        return ""
+
+    def _format_mode(self, virtual_path: str) -> str:
+        if self.env.is_dir(virtual_path):
+            prefix = "d"
+        else:
+            prefix = "-"
+        attrs = self.env.attr_string(virtual_path)
+        return prefix + "rwxr-xr-x" + (f" +{attrs}" if attrs else "")
+
+    def _ls(self, args: list[str]) -> str:
+        flags = "".join(a[1:] for a in args if a.startswith("-"))
+        show_long = "l" in flags or "E" in flags
+        show_all = "a" in flags
+        targets = [a for a in args if not a.startswith("-")] or [self.cwd]
+        blocks: list[str] = []
+        for target in targets:
+            vp = self._resolved(target)
+            if not self.env.exists(vp):
+                blocks.append(f"ls: {target}: No such file or directory")
+                continue
+            if self.env.is_dir(vp):
+                entries = self.env.listdir(vp)
+                if show_all:
+                    entries = [".", ".."] + entries
+                else:
+                    entries = [e for e in entries if not e.startswith(".")]
+                if not show_long:
+                    blocks.append("  ".join(entries))
+                else:
+                    rows = []
+                    for name in entries:
+                        child = vp if name == "." else self.env.resolve(vp, ".." if name == ".." else name)
+                        rows.append(f"{self._format_mode(child):<16} {self._display_name(child)}")
+                    blocks.append("\n".join(rows))
+            else:
+                blocks.append(self._format_mode(vp) if show_long else self._display_name(vp))
+        return "\n\n".join(blocks)
+
+    def _display_name(self, virtual_path: str) -> str:
+        p = PurePosixPath(virtual_path)
+        return p.name or "/"
+
+    def _handle_interactive_command(self, raw: str, reader: Callable[[str, bool], object], writer: Callable[[str], None]) -> bool:
+        try:
+            argv = shlex.split(raw)
+        except ValueError as exc:
+            writer(f"FSUM7332 syntax error: {exc}\n")
+            return True
+        if not argv:
+            return False
+        if argv[0].lower() in {"vi", "view", "ex", "edit"}:
+            self._vi_interactive(argv[1:], reader, writer, readonly=(argv[0].lower()=="view"))
+            return True
+        if argv[0].lower() != "oedit":
+            return False
+        self._oedit_interactive(argv[1:], reader, writer)
+        return True
+
+    def _vi_interactive(self, args: list[str], io_or_reader, writer: Callable[[str], None], readonly: bool = False) -> None:
+        path = args[0] if args else getattr(self._read_line_result(io_or_reader, "vi file: ", False), "text", "").strip()
+        if not path:
+            writer("vi: missing file operand\n"); return
+        vp = self._resolved(path.strip().strip("'\""))
+        if vp.startswith("/dsfs"):
+            writer("vi: /dsfs is read-only\n"); return
+        try:
+            text = self.env.read_text(vp)
+        except Exception:
+            text = ""
+        lines = text.splitlines()
+        modified = False; number = False; yank = ""; cur = 0
+        writer(f'"{vp}" {len(lines)} lines\n')
+        writer("Gibson vi simulation. Commands: i/a/o, dd, yy, p, j/k, :w, :q, :q!, :wq, :set number, :set nonumber, :help\n")
+        while True:
+            display = []
+            window = lines[max(0, cur-5):cur+10]
+            base = max(0, cur-5)
+            for off, line in enumerate(window):
+                prefix = f"{base+off+1:4d} " if number else ""
+                mark = ">" if base+off == cur else " "
+                display.append(f"{mark}{prefix}{line}")
+            writer("\n".join(display or [">~"]) + f"\n\"{vp}\" {'[Modified]' if modified else ''} line {cur+1 if lines else 0} of {len(lines)}\nvi> ")
+            res = self._read_line_result(io_or_reader, "", False)
+            if getattr(res, "key", "") == "EOF": return
+            cmd = (getattr(res, "text", "") or "").rstrip("\n")
+            if cmd in {"i", "a", "o"}:
+                if readonly: writer("E45: 'readonly' option is set\n"); continue
+                insert_at = cur if cmd in {"i","a"} else cur+1
+                writer("-- INSERT -- enter a single dot '.' on a line to finish\n")
+                new=[]
+                while True:
+                    r=self._read_line_result(io_or_reader, "", False)
+                    if getattr(r,"key","")=="EOF": return
+                    t=getattr(r,"text","")
+                    if t == ".": break
+                    new.append(t)
+                for n,line in enumerate(new): lines.insert(insert_at+n, line)
+                cur = max(0, insert_at); modified = True; continue
+            if cmd == "j": cur=min(cur+1, max(0,len(lines)-1)); continue
+            if cmd == "k": cur=max(cur-1,0); continue
+            if cmd == "dd":
+                if readonly: writer("E45: 'readonly' option is set\n"); continue
+                if lines: yank=lines.pop(cur); cur=min(cur, max(0,len(lines)-1)); modified=True
+                continue
+            if cmd == "yy": yank = lines[cur] if lines else ""; writer("1 line yanked\n"); continue
+            if cmd == "p":
+                if readonly: writer("E45: 'readonly' option is set\n"); continue
+                lines.insert(cur+1, yank); cur += 1; modified=True; continue
+            if cmd == "x":
+                if readonly: writer("E45: 'readonly' option is set\n"); continue
+                if lines and lines[cur]: lines[cur]=lines[cur][1:]; modified=True
+                continue
+            if cmd.startswith(":"):
+                c=cmd[1:].strip()
+                if c == "help": writer("vi help: i a o Esc simulated by '.' end insert; :w :q :q! :wq :x :set number/nonumber dd yy p j k\n"); continue
+                if c == "set number": number=True; continue
+                if c == "set nonumber": number=False; continue
+                if c in {"w", "wq", "x"}:
+                    if readonly: writer("E45: 'readonly' option is set\n"); continue
+                    try:
+                        self.env.write_text(vp, "\n".join(lines) + ("\n" if lines else "")); modified=False; writer(f'"{vp}" {len(lines)} lines written\n')
+                    except Exception as exc:
+                        writer(f"vi: write failed: {exc}\n"); continue
+                    if c in {"wq", "x"}: return
+                    continue
+                if c == "q":
+                    if modified: writer("E37: No write since last change (add ! to override)\n"); continue
+                    return
+                if c == "q!": return
+            writer("?\n")
+
+    def _oedit_interactive(self, args: list[str], io_or_reader, writer: Callable[[str], None]) -> None:
+        recfm = "VB"
+        lrecl = 255
+        tail = list(args)
+        if len(tail) >= 2 and tail[0] == "-r":
+            try:
+                lrecl = int(tail[1])
+            except ValueError:
+                writer("OEDIT: invalid record length\n")
+                return
+            recfm = "FB"
+            tail = tail[2:]
+        pathname = tail[0] if tail else getattr(self._read_line_result(io_or_reader, "Pathname ===> ", False), "text", "").strip()
+        if not pathname:
+            writer("OEDIT: missing pathname\n")
+            return
+        vp = self._resolved(pathname.strip().strip("'").strip('"'))
+        if vp.startswith("/dsfs"):
+            writer("OEDIT: /dsfs is read-only; copy the data set with OPUT/OGET first\n")
+            return
+        real = self.env.real_path(vp)
+        real.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            text = self.env.read_text(vp)
+        except Exception:
+            text = ""
+        driver = io_or_reader if hasattr(io_or_reader, "read_key") else getattr(self, "_interactive_io", None)
+        if driver is None:
+            writer("OEDIT: interactive editor unavailable in this session\n")
+            return
+        InteractiveEditor(vp, text, mode="EDIT", recfm=recfm, lrecl=lrecl, save_callback=lambda new_text, target=vp: self.env.write_text(target, new_text)).run(driver, writer)
+        self.environment["PWD"] = self.cwd
+
+    def _shell_path_operand(self, operand: str) -> str:
+        return operand.strip().strip("'").strip('"')
+
+    def _parse_dataset_operand(self, operand: str) -> Optional[str]:
+        raw = (operand or "").strip()
+        if not raw.startswith("//"):
+            return None
+        value = raw[2:].strip()
+        if len(value) >= 2 and ((value[0] == "'" and value[-1] == "'") or (value[0] == '"' and value[-1] == '"')):
+            value = value[1:-1]
+        value = value.strip()
+        return value.upper() if value else None
+
+    def _dataset_operand(self, operand: str) -> str:
+        parsed = self._parse_dataset_operand(operand)
+        if parsed is not None:
+            return parsed
+        return self._shell_path_operand(operand).upper()
+
+    def _is_dataset_operand(self, operand: str) -> bool:
+        return self._parse_dataset_operand(operand) is not None
+
+    def _is_path_operand(self, operand: str) -> bool:
+        if self._is_dataset_operand(operand):
+            return False
+        value = self._shell_path_operand(operand)
+        return value.startswith("/") or value.startswith("./") or value.startswith("../")
+
+    def _cat(self, args: list[str]) -> str:
+        if not args:
+            return "cat: missing operand"
+        chunks = []
+        for item in args:
+            dsn = self._parse_dataset_operand(item)
+            if dsn is not None:
+                try:
+                    chunks.append(self.state.datasets.read(self.real_userid, dsn))
+                except FileNotFoundError:
+                    chunks.append(f"cat: {item}: data set not found")
+                except PermissionError:
+                    chunks.append(f"cat: {item}: permission denied")
+                continue
+            vp = self._resolved(item)
+            try:
+                chunks.append(self.env.read_text(vp))
+            except Exception:
+                chunks.append(f"cat: {item}: No such file or directory")
+        return "\n".join(chunk.rstrip("\n") for chunk in chunks)
+
+    def _touch(self, args: list[str]) -> str:
+        if not args:
+            return "touch: missing operand"
+        for item in args:
+            vp = self._resolved(item)
+            if vp.startswith("/dsfs"):
+                return "touch: /dsfs is read-only"
+            real = self.env.real_path(vp)
+            real.parent.mkdir(parents=True, exist_ok=True)
+            real.touch(exist_ok=True)
+        return ""
+
+    def _mkdir(self, args: list[str]) -> str:
+        if not args:
+            return "mkdir: missing operand"
+        for item in args:
+            vp = self._resolved(item)
+            if vp.startswith("/dsfs"):
+                return "mkdir: /dsfs is read-only"
+            self.env.real_path(vp).mkdir(parents=True, exist_ok=True)
+        return ""
+
+    def _rm(self, args: list[str]) -> str:
+        if not args:
+            return "rm: missing operand"
+        recursive = False
+        targets: list[str] = []
+        for arg in args:
+            if arg == "-r":
+                recursive = True
+            else:
+                targets.append(arg)
+        for item in targets:
+            vp = self._resolved(item)
+            if vp.startswith("/dsfs"):
+                return "rm: /dsfs is read-only"
+            real = self.env.real_path(vp)
+            if real.is_dir():
+                if not recursive:
+                    return f"rm: {item}: is a directory"
+                for child in sorted(real.rglob("*"), reverse=True):
+                    if child.is_file() or child.is_symlink():
+                        child.unlink(missing_ok=True)
+                    elif child.is_dir():
+                        child.rmdir()
+                real.rmdir()
+            elif real.exists():
+                real.unlink()
+        return ""
+
+    def _cp(self, args: list[str]) -> str:
+        if len(args) != 2:
+            return "cp: usage cp source target"
+        src_arg, dst_arg = args
+        src_dsn = self._parse_dataset_operand(src_arg)
+        dst_dsn = self._parse_dataset_operand(dst_arg)
+        try:
+            if src_dsn is not None and dst_dsn is not None:
+                text = self.state.datasets.read(self.real_userid, src_dsn)
+                self.state.datasets.write(self.real_userid, dst_dsn, text)
+                return ""
+            if src_dsn is not None:
+                text = self.state.datasets.read(self.real_userid, src_dsn)
+                dst = self._resolved(dst_arg)
+                self.env.write_text(dst, text)
+                return ""
+            if dst_dsn is not None:
+                src = self._resolved(src_arg)
+                if src.startswith("/dsfs"):
+                    text = self.env.read_text(src)
+                else:
+                    real_src = self.env.real_path(src)
+                    if not real_src.exists() or real_src.is_dir():
+                        return f"cp: {src_arg}: unsupported source"
+                    text = real_src.read_text(encoding="utf-8", errors="ignore")
+                self.state.datasets.write(self.real_userid, dst_dsn, text)
+                return ""
+        except FileNotFoundError:
+            return f"cp: {src_arg}: data set not found"
+        except PermissionError:
+            return "cp: permission denied"
+
+        src, dst = (self._resolved(a) for a in args)
+        if src.startswith("/dsfs"):
+            text = self.env.read_text(src)
+            self.env.write_text(dst, text)
+            return ""
+        real_src = self.env.real_path(src)
+        if not real_src.exists() or real_src.is_dir():
+            return f"cp: {args[0]}: unsupported source"
+        self.env.write_text(dst, real_src.read_text(encoding="utf-8", errors="ignore"))
+        return ""
+
+    def _mv(self, args: list[str]) -> str:
+        if len(args) != 2:
+            return "mv: usage mv source target"
+        src, dst = (self._resolved(a) for a in args)
+        if src.startswith("/dsfs") or dst.startswith("/dsfs"):
+            return "mv: /dsfs is read-only"
+        real_src = self.env.real_path(src)
+        real_dst = self.env.real_path(dst)
+        real_dst.parent.mkdir(parents=True, exist_ok=True)
+        real_src.replace(real_dst)
+        return ""
+
+    def _id(self) -> str:
+        groups = f"groups={self.identity.gid}({self.environment.get('LOGNAME', self.real_userid)})"
+        return f"uid={self.identity.uid}({self.environment.get('LOGNAME', self.real_userid)}) gid={self.identity.gid}({self.environment.get('LOGNAME', self.real_userid)}) {groups}"
+
+    def _uname(self, args: list[str]) -> str:
+        if args and args[0] == "-a":
+            return "OS/390 GIBSON 03.01 1090 POSIX(ON) ZFS DSFS"
+        return "OS/390"
+
+    def _env(self, args: list[str]) -> str:
+        if args:
+            key = args[0]
+            return self.environment.get(key, "")
+        return "\n".join(f"{k}={v}" for k, v in sorted(self.environment.items()))
+
+    def _export(self, args: list[str]) -> str:
+        if not args:
+            return self._env([])
+        for item in args:
+            if "=" not in item:
+                self.environment[item] = self.environment.get(item, "")
+            else:
+                k, v = item.split("=", 1)
+                self.environment[k] = v
+                if k == "PWD":
+                    self.cwd = v
+        return ""
+
+    def _extattr(self, args: list[str]) -> str:
+        if not args:
+            return "extattr: usage extattr [+flags|-flags] file"
+        if len(args) == 1:
+            vp = self._resolved(args[0])
+            attrs = self.env.attr_string(vp)
+            return f"{self._display_name(vp)} +{attrs}" if attrs else self._display_name(vp)
+        op_flags, target = args[0], args[1]
+        if not op_flags or op_flags[0] not in "+-":
+            return "extattr: invalid flag syntax"
+        vp = self._resolved(target)
+        rel = self.env.rel_for_attr(vp)
+        if rel is None:
+            return "extattr: /dsfs is read-only"
+        self.env.extattrs.update_flags(rel, op_flags[0], op_flags[1:])
+        updated = self.env.attr_string(vp)
+        return f"{self._display_name(vp)} +{updated}" if updated else self._display_name(vp)
+
+    def _rmdir(self, args: list[str]) -> str:
+        if not args:
+            return "rmdir: missing operand"
+        for item in args:
+            vp = self._resolved(item)
+            if vp.startswith("/dsfs"):
+                return "rmdir: /dsfs is read-only"
+            real = self.env.real_path(vp)
+            if not real.exists():
+                return f"rmdir: {item}: No such directory"
+            if not real.is_dir():
+                return f"rmdir: {item}: Not a directory"
+            try:
+                real.rmdir()
+            except OSError:
+                return f"rmdir: {item}: Directory not empty"
+        return ""
+
+    def _read_operand_text(self, item: str) -> tuple[str, str | None]:
+        dsn = self._parse_dataset_operand(item)
+        if dsn is not None:
+            try:
+                return self.state.datasets.read(self.real_userid, dsn), None
+            except FileNotFoundError:
+                return "", f"{item}: data set not found"
+            except PermissionError:
+                return "", f"{item}: permission denied"
+        vp = self._resolved(item)
+        try:
+            return self.env.read_text(vp), None
+        except Exception:
+            return "", f"{item}: No such file or directory"
+
+    def _display_text_command(self, verb: str, args: list[str]) -> str:
+        if not args:
+            return f"{verb}: missing operand"
+        n = 10
+        if len(args) >= 2 and args[0] == "-n":
+            try:
+                n = max(0, int(args[1]))
+                args = args[2:]
+            except ValueError:
+                return f"{verb}: invalid line count"
+        outs = []
+        for item in args:
+            text, err = self._read_operand_text(item)
+            if err:
+                outs.append(f"{verb}: {err}")
+                continue
+            lines = text.splitlines()
+            if verb == "head":
+                outs.append("\n".join(lines[:n]))
+            elif verb == "tail":
+                outs.append("\n".join(lines[-n:]))
+            else:
+                outs.append("\n".join(lines))
+        return "\n".join(o.rstrip("\n") for o in outs)
+
+    def _metadata_cmd(self, verb: str, args: list[str]) -> str:
+        if len(args) < 2:
+            return f"{verb}: usage {verb} value file"
+        value, target = args[0], args[1]
+        vp = self._resolved(target)
+        if not self.env.exists(vp):
+            return f"{verb}: {target}: No such file or directory"
+        meta = self.file_meta.setdefault(vp, {})
+        if verb == "chmod":
+            meta["mode"] = value
+        elif verb == "chown":
+            if not self._can_elevate():
+                return f"{verb}: BPX.SUPERUSER required"
+            meta["owner"] = value.upper()
+        elif verb == "chgrp":
+            meta["group"] = value.upper()
+        return f"{verb}: {target}: attributes updated in simulated USS metadata"
+
+    def _grep(self, args: list[str]) -> str:
+        if len(args) < 2:
+            return "grep: usage grep [-i] [-n] pattern file..."
+        ignore = False; number = False
+        while args and args[0].startswith("-"):
+            ignore |= "i" in args[0]
+            number |= "n" in args[0]
+            args = args[1:]
+        if len(args) < 2:
+            return "grep: usage grep [-i] [-n] pattern file..."
+        pattern, files = args[0], args[1:]
+        out=[]
+        pat = pattern.lower() if ignore else pattern
+        for item in files:
+            text, err = self._read_operand_text(item)
+            if err:
+                out.append(f"grep: {err}"); continue
+            for idx,line in enumerate(text.splitlines(),1):
+                hay=line.lower() if ignore else line
+                if pat in hay:
+                    prefix=f"{idx}:" if number else ""
+                    out.append(prefix+line)
+        return "\n".join(out)
+
+    def _find(self, args: list[str]) -> str:
+        path = args[0] if args and not args[0].startswith("-") else self.cwd
+        rest = args[1:] if args and not args[0].startswith("-") else args
+        name_pat = None; type_filter = None
+        i=0
+        while i < len(rest):
+            if rest[i] == "-name" and i+1 < len(rest):
+                name_pat = rest[i+1]; i += 2; continue
+            if rest[i] == "-type" and i+1 < len(rest):
+                type_filter = rest[i+1]; i += 2; continue
+            i += 1
+        vp=self._resolved(path)
+        if vp.startswith("/dsfs"):
+            return vp if self.env.exists(vp) else f"find: {path}: No such file or directory"
+        root=self.env.real_path(vp)
+        if not root.exists(): return f"find: {path}: No such file or directory"
+        rows=[]
+        for real in [root] + list(root.rglob("*")):
+            rel=self.env.virtual_path(real)
+            if name_pat and not fnmatch.fnmatch(real.name, name_pat):
+                continue
+            if type_filter == "f" and not real.is_file():
+                continue
+            if type_filter == "d" and not real.is_dir():
+                continue
+            rows.append(rel)
+        return "\n".join(rows)
+
+    def _wc(self, args: list[str]) -> str:
+        if not args:
+            return "wc: missing operand"
+        rows=[]
+        for item in args:
+            text, err = self._read_operand_text(item)
+            if err:
+                rows.append(f"wc: {err}"); continue
+            lines=text.splitlines(); words=text.split(); bytes_len=len(text.encode())
+            rows.append(f"{len(lines):7d} {len(words):7d} {bytes_len:7d} {item}")
+        return "\n".join(rows)
+
+    def _text_filter(self, verb: str, args: list[str]) -> str:
+        if verb == "tr":
+            if len(args) < 3:
+                return "tr: usage tr set1 set2 file"
+            src,dst,file=args[0],args[1],args[2]
+            text,err=self._read_operand_text(file)
+            if err: return f"tr: {err}"
+            table=str.maketrans(src,dst)
+            return text.translate(table).rstrip("\n")
+        if verb == "cut":
+            if len(args) < 3 or args[0] != "-c":
+                return "cut: usage cut -c list file"
+            spec=args[1]; file=args[2]
+            text,err=self._read_operand_text(file)
+            if err: return f"cut: {err}"
+            try:
+                if "-" in spec:
+                    a,b=spec.split("-",1); start=int(a or 1)-1; end=int(b or 999999)
+                else:
+                    start=int(spec)-1; end=start+1
+            except Exception:
+                return "cut: invalid character list"
+            return "\n".join(line[start:end] for line in text.splitlines())
+        if not args:
+            return f"{verb}: missing operand"
+        text,err=self._read_operand_text(args[-1])
+        if err: return f"{verb}: {err}"
+        lines=text.splitlines()
+        if verb == "sort": lines=sorted(lines)
+        elif verb == "uniq":
+            out=[]; prev=None
+            for line in lines:
+                if line != prev: out.append(line)
+                prev=line
+            lines=out
+        return "\n".join(lines)
+
+    def _du(self, args: list[str]) -> str:
+        target=self._resolved(args[0] if args else self.cwd)
+        if target.startswith("/dsfs"):
+            return f"4\t{target}"
+        real=self.env.real_path(target)
+        if not real.exists(): return f"du: {args[0] if args else target}: No such file or directory"
+        size=0
+        if real.is_file(): size=real.stat().st_size
+        else:
+            for p in real.rglob("*"):
+                if p.is_file(): size += p.stat().st_size
+        blocks=max(1,(size+511)//512)
+        return f"{blocks}\t{target}"
+
+    def _kill(self, args: list[str]) -> str:
+        if not args:
+            return "kill: usage kill [-signal] pid"
+        pid=args[-1]
+        if pid not in {"100", "101"}:
+            return f"kill: {pid}: no such simulated process"
+        return f"kill: signal sent to simulated process {pid}"
+
+    def _set_umask(self, verb: str, args: list[str]) -> str:
+        if verb == "set":
+            return "\n".join(f"{k}={v}" for k,v in sorted(self.environment.items()))
+        if not args:
+            return self.environment.get("UMASK", "022")
+        self.environment["UMASK"] = args[0]
+        return ""
+
+    def _ln(self, args: list[str]) -> str:
+        symbolic = False
+        if args and args[0] == "-s": symbolic=True; args=args[1:]
+        if len(args) != 2: return "ln: usage ln [-s] source target"
+        src=self._resolved(args[0]); dst=self._resolved(args[1])
+        if dst.startswith("/dsfs"): return "ln: /dsfs is read-only"
+        try:
+            text = self.env.read_text(src) if not symbolic else f"SYMLINK->{src}\n"
+            self.env.write_text(dst, text)
+            return ""
+        except Exception:
+            return f"ln: {args[0]}: No such file or directory"
+
+    def _tar(self, args: list[str]) -> str:
+        if len(args) < 2: return "tar: usage tar -cf archive files | tar -tf archive | tar -xf archive"
+        mode=args[0]; archive=args[1]
+        if mode == "-tf":
+            text,err=self._read_operand_text(archive)
+            if err: return f"tar: {err}"
+            try:
+                data=json.loads(text); return "\n".join(data.keys())
+            except Exception: return "tar: invalid simulated archive"
+        if mode == "-cf":
+            data={}
+            for item in args[2:]:
+                text,err=self._read_operand_text(item)
+                if err: return f"tar: {err}"
+                data[item]=text
+            self.env.write_text(self._resolved(archive), json.dumps(data))
+            return ""
+        if mode == "-xf":
+            text,err=self._read_operand_text(archive)
+            if err: return f"tar: {err}"
+            try: data=json.loads(text)
+            except Exception: return "tar: invalid simulated archive"
+            for name,text in data.items(): self.env.write_text(self._resolved(posixpath.basename(name)), text)
+            return ""
+        return "tar: unsupported option"
+
+    def _gzip_cmd(self, verb: str, args: list[str]) -> str:
+        if not args: return f"{verb}: missing operand"
+        src=self._resolved(args[0])
+        if verb == "gzip":
+            text,err=self._read_operand_text(args[0])
+            if err: return f"gzip: {err}"
+            self.env.write_text(src + ".gz", "GZIP-SIMULATED\n" + text)
+            return f"{args[0]} compressed to {args[0]}.gz"
+        text,err=self._read_operand_text(args[0])
+        if err: return f"gunzip: {err}"
+        out=src[:-3] if src.endswith(".gz") else src + ".out"
+        if text.startswith("GZIP-SIMULATED\n"): text=text.split("\n",1)[1]
+        self.env.write_text(out, text)
+        return f"{args[0]} expanded to {out}"
+
+    def _hex_dump(self, args: list[str]) -> str:
+        if not args: return "hexdump: missing operand"
+        text,err=self._read_operand_text(args[0])
+        if err: return f"hexdump: {err}"
+        b=text.encode()[:256]
+        rows=[]
+        for i in range(0,len(b),16):
+            chunk=b[i:i+16]
+            hx=" ".join(f"{x:02x}" for x in chunk)
+            asc="".join(chr(x) if 32 <= x < 127 else "." for x in chunk)
+            rows.append(f"{i:08x}  {hx:<47}  |{asc}|")
+        return "\n".join(rows)
+
+    def _iconv(self, args: list[str]) -> str:
+        from_code="IBM-1047"; to_code="ISO8859-1"; files=[]; i=0
+        while i < len(args):
+            if args[i] == "-f" and i+1 < len(args): from_code=args[i+1]; i+=2; continue
+            if args[i] == "-t" and i+1 < len(args): to_code=args[i+1]; i+=2; continue
+            files.append(args[i]); i+=1
+        if not files: return "iconv: missing file operand"
+        text,err=self._read_operand_text(files[0])
+        if err: return f"iconv: {err}"
+        return f"# iconv simulated {from_code}->{to_code}\n" + text.rstrip("\n")
+
+    def _chtag(self, args: list[str]) -> str:
+        if not args: return "chtag: usage chtag [-t|-b|-c ccsid] file"
+        tag="text"; files=[]; i=0
+        while i < len(args):
+            if args[i] in {"-t","-b"}: tag="text" if args[i]=="-t" else "binary"; i+=1; continue
+            if args[i] == "-c" and i+1 < len(args): tag=f"ccsid={args[i+1]}"; i+=2; continue
+            files.append(args[i]); i+=1
+        if not files: return "chtag: missing file operand"
+        for f in files:
+            vp=self._resolved(f)
+            if not self.env.exists(vp): return f"chtag: {f}: No such file"
+            rel=self.env.rel_for_attr(vp)
+            if rel: self.env.extattrs.set(rel, self.env.extattrs.get(rel)+"t")
+        return "\n".join(f"{f}: TAG={tag}" for f in files)
+
+    def _man(self, args: list[str]) -> str:
+        if not args: return "What manual page do you want?"
+        return "GIBSON USS MANUAL PAGE\n" + self._command_help(args[0])
+
+    def _tso(self, args: list[str]) -> str:
+        if not args:
+            return "tso: missing TSO command"
+        out = self.processor.run(" ".join(args))
+        if out.startswith("GIBSON-INTERACTIVE:"):
+            return f"{args[0]} requires READY mode; use PF6/EXIT to return to TSO"
+        return out
+
+    def _mvs_copy(self, verb: str, args: list[str]) -> str:
+        if not args or any(a.upper() in {"HELP", "?"} for a in args):
+            return self._command_help(verb.upper())
+        mode = "text"
+        cleaned=[]
+        for a in args:
+            if a in {"-t", "--text"}:
+                mode = "text"; continue
+            if a in {"-b", "--binary"}:
+                mode = "binary"; continue
+            cleaned.append(a)
+        args = cleaned
+        # OCOPY keyword forms used by z/OS UNIX Services examples.
+        if verb == "ocopy" and any("(" in a and a.endswith(")") for a in args):
+            pairs={}
+            for a in args:
+                if "(" in a and a.endswith(")"):
+                    k,v=a.split("(",1); pairs[k.upper()]=v[:-1]
+            if "INDATASET" in pairs and "OUTPATH" in pairs:
+                return self._mvs_copy("oput", [pairs["INDATASET"], pairs["OUTPATH"]])
+            if "INPATH" in pairs and "OUTDATASET" in pairs:
+                return self._mvs_copy("oget", [pairs["INPATH"], pairs["OUTDATASET"]])
+            if "INDD" in pairs and "OUTDD" in pairs:
+                return "OCOPY: DDNAME COPY ACCEPTED IN SIMULATION"
+            return "ocopy: unsupported OCOPY keyword combination"
+        if len(args) != 2:
+            return f"{verb}: requires source and target"
+        src, dst = args
+        src_is_path = self._is_path_operand(src)
+        dst_is_path = self._is_path_operand(dst)
+        if verb == "oget":
+            source = self._resolved(self._shell_path_operand(src))
+            try:
+                text = self.env.read_text(source)
+            except Exception:
+                return f"{verb}: {src}: file not found"
+            dsname = self._dataset_operand(dst)
+            self.state.datasets.write(self.real_userid, dsname, text)
+            return f"{source} copied to {dsname}"
+        if verb == "oput":
+            dsname = self._dataset_operand(src)
+            target = self._resolved(self._shell_path_operand(dst))
+            try:
+                text = self.state.datasets.read(self.real_userid, dsname)
+            except FileNotFoundError:
+                return f"{verb}: {dsname}: data set not found"
+            except PermissionError:
+                return f"{verb}: {dsname}: permission denied"
+            self.env.write_text(target, text)
+            return f"{dsname} copied to {target}"
+        if src_is_path and not dst_is_path:
+            return self._mvs_copy("oget", [src, dst])
+        if not src_is_path and dst_is_path:
+            return self._mvs_copy("oput", [src, dst])
+        if src_is_path and dst_is_path:
+            return self._cp([src, dst])
+        try:
+            text = self.state.datasets.read(self.real_userid, self._dataset_operand(src))
+        except FileNotFoundError:
+            return f"ocopy: {src}: data set not found"
+        self.state.datasets.write(self.real_userid, self._dataset_operand(dst), text)
+        return f"{self._dataset_operand(src)} copied to {self._dataset_operand(dst)}"
+
+    def _can_elevate(self) -> bool:
+        rec = self.state.racf.get(self.real_userid)
+        return bool(rec and rec.special)
+
+    def _become(self, userid: str, superuser: bool = False) -> str:
+        self.identity = self.env.identity_for(userid, superuser=superuser)
+        self.environment["LOGNAME"] = self.identity.userid
+        self.environment["USER"] = self.identity.userid
+        self.environment["HOME"] = self.identity.home
+        self.environment["SHELL"] = self.identity.program
+        self.cwd = self.identity.home
+        self.environment["PWD"] = self.cwd
+        if not superuser:
+            self.env.ensure_user_profile(userid)
+        return ""
+
+    def _su(self, args: list[str]) -> str:
+        target = self.real_userid
+        if args and args[0] == "-":
+            args = args[1:]
+        if args:
+            target = args[0].upper()
+        if target in {"ROOT", "OMVSKERN"}:
+            if not self._can_elevate():
+                return "su: insufficient authority for BPX.SUPERUSER"
+            self._become("ROOT", superuser=True)
+            return ""
+        if target != self.real_userid and not self._can_elevate():
+            return f"su: insufficient authority to switch to {target}"
+        if not self.state.racf.exists(target):
+            return f"su: unknown user {target}"
+        self._become(target)
+        return ""
+
+    def _sudo(self, args: list[str]) -> str:
+        if not args:
+            return "sudo: usage sudo <command>"
+        if args[0] == "-l":
+            if self._can_elevate():
+                return f"User {self.real_userid} may run all commands in Gibson USS via RACF SPECIAL/BPX.SUPERUSER"
+            return f"User {self.real_userid} is not in the sudoers file"
+        if not self._can_elevate():
+            return f"sudo: {self.real_userid} is not permitted to elevate"
+        if args[0] == "su":
+            return self._su(args[1:])
+        old = self.identity
+        old_env = dict(self.environment)
+        self.identity = self.env.identity_for("ROOT", superuser=True)
+        self.environment["LOGNAME"] = self.identity.userid
+        self.environment["USER"] = self.identity.userid
+        self.environment["HOME"] = self.identity.home
+        self.environment["PWD"] = self.cwd
+        out = self.execute(" ".join(args))
+        if out is None:
+            out = ""
+        if self.identity.userid == "ROOT":
+            self.identity = old
+            self.environment = old_env
+        return out
+
+    def _python(self, argv: list[str]) -> str:
+        exe = sys.executable
+        args = list(argv[1:])
+        if args and args[0] in {"-V", "--version"}:
+            cp = subprocess.run([exe, *args], capture_output=True, text=True, cwd=self.env.real_path(self.cwd), timeout=10)
+            return (cp.stdout or cp.stderr).strip()
+        # Validate any path operands after switches.
+        safe_args: list[str] = []
+        skip_next_is_path = False
+        for i, arg in enumerate(args):
+            if skip_next_is_path:
+                skip_next_is_path = False
+                safe_args.append(arg)
+                continue
+            if arg in {"-c", "-m"}:
+                safe_args.append(arg)
+                skip_next_is_path = False
+                continue
+            if arg.startswith("-"):
+                safe_args.append(arg)
+                continue
+            if i == 0 and not arg.startswith("-") and arg not in {"-c", "-m"}:
+                vp = self._resolved(arg)
+                safe_args.append(str(self.env.real_path(vp)))
+            else:
+                safe_args.append(arg)
+        cp = subprocess.run([exe, *safe_args], capture_output=True, text=True, cwd=self.env.real_path(self.cwd), timeout=15)
+        return (cp.stdout + cp.stderr).rstrip("\n")
+
+    def _netstat(self, args: list[str]) -> str:
+        option = args[0] if args else "ALL"
+        return self.state.network.format(option, self.state.sessions.sessions)
+
+    def _ping(self, args: list[str]) -> str:
+        if not args:
+            return "ping: missing host operand"
+        return self.state.network.ping(args[0])
+
+    def _traceroute(self, args: list[str]) -> str:
+        if not args:
+            return "traceroute: missing host operand"
+        return self.state.network.traceroute(args[0])
+
+    def _df(self) -> str:
+        return (
+            "Filesystem   512-blocks      Used Available Capacity Mounted on\n"
+            "OMVSROOT        2097152    65536   2031616     4%   /\n"
+            "USER.ZFS         262144     1024    261120     1%   /u\n"
+            "DSFS             131072     4096    126976     3%   /dsfs"
+        )
+
+    def _ps(self) -> str:
+        user = self.environment.get("LOGNAME", self.real_userid)
+        return (
+            " PID  PPID USER     COMMAND\n"
+            f"   1     0 OMVSKERN BPXOINIT\n"
+            f" 100     1 {user:<8} sh\n"
+            f" 101   100 {user:<8} omvs-shell"
+        )
+
+# Production USS FTP/Telnet sub-session integration.
+try:
+    from gibson.apps.uss_ftp_client import FtpSubsession
+    from gibson.apps.uss_telnet_client import TelnetSubsession
+except Exception:  # pragma: no cover
+    FtpSubsession = None  # type: ignore
+    TelnetSubsession = None  # type: ignore
+
+_OMVS_ORIG_EXECUTE_PROD = OmvsShellSession.execute
+
+def _omvs_prod_execute(self, raw: str):
+    sub = getattr(self, '_network_subsession', None)
+    if sub is not None and not (raw.strip().lower().startswith('ftp') or raw.strip().lower().startswith('telnet')):
+        out = sub.handle(raw)
+        if getattr(sub, 'done', False):
+            self._network_subsession = None
+        return out
+    if sub is not None:
+        self._network_subsession = None
+    try:
+        argv = shlex.split(raw)
+    except Exception:
+        return _OMVS_ORIG_EXECUTE_PROD(self, raw)
+    if argv and argv[0].lower() == 'ftp' and FtpSubsession is not None:
+        sub = FtpSubsession(self.env, lambda: self.cwd, lambda p: setattr(self, 'cwd', self.env.resolve(self.cwd, p)))
+        self._network_subsession = sub
+        if len(argv) >= 2 and argv[1].upper() not in {'HELP','?','-H','--HELP'}:
+            return sub.connect_banner() + '\n' + sub.handle('open ' + ' '.join(argv[1:]))
+        if len(argv) >= 2:
+            self._network_subsession = None
+            return sub.help()
+        return sub.banner()
+    if argv and argv[0].lower() == 'telnet' and TelnetSubsession is not None:
+        sub = TelnetSubsession()
+        self._network_subsession = sub
+        if len(argv) >= 2 and argv[1].upper() not in {'HELP','?','-H','--HELP'}:
+            return sub.connect_banner() + '\n' + sub.handle('open ' + ' '.join(argv[1:]))
+        if len(argv) >= 2:
+            self._network_subsession = None
+            return sub.help()
+        return sub.banner()
+    return _OMVS_ORIG_EXECUTE_PROD(self, raw)
+
+OmvsShellSession.execute = _omvs_prod_execute
+
+# Production-grade persistent USS FTP/Telnet sub-session integration v2.
+# Stores active network clients on GibsonState so web/line-oriented callers
+# that recreate OmvsShellSession still retain the explicit user sub-session.
+try:
+    from gibson.apps.uss_ftp_client import FtpSubsession as _ProdFtpSubsession2
+    from gibson.apps.uss_telnet_client import TelnetSubsession as _ProdTelnetSubsession2
+except Exception:  # pragma: no cover
+    _ProdFtpSubsession2 = None  # type: ignore
+    _ProdTelnetSubsession2 = None  # type: ignore
+
+_OMVS_EXECUTE_BEFORE_PERSISTENT_NET = OmvsShellSession.execute
+
+def _omvs_persistent_network_execute(self, raw: str):
+    try:
+        _argv_for_help = shlex.split(raw or '')
+    except Exception:
+        _argv_for_help = []
+    if _argv_for_help and _argv_for_help[0].lower() in {'help', 'man'} and len(_argv_for_help) > 1 and _argv_for_help[1].lower() == 'nmap':
+        return self._command_help('nmap')
+    if _argv_for_help and _argv_for_help[0].lower() == 'nmap' and len(_argv_for_help) > 1 and _argv_for_help[1].lower() in {'help', '-h', '--help', '?'}:
+        return self._command_help('nmap')
+    if not hasattr(self.state, '_omvs_network_subsessions'):
+        setattr(self.state, '_omvs_network_subsessions', {})
+    subs = getattr(self.state, '_omvs_network_subsessions')
+    key = (self.real_userid, self.mode)
+    sub = subs.get(key)
+    text = (raw or '').strip()
+    # If a sub-session is active, route all non-new-client commands to it.
+    if sub is not None and text.split(maxsplit=1)[0].lower() not in {'ftp', 'telnet'}:
+        out = sub.handle(text)
+        if getattr(sub, 'done', False):
+            subs.pop(key, None)
+        return out
+    try:
+        argv = shlex.split(raw)
+    except Exception:
+        return _OMVS_EXECUTE_BEFORE_PERSISTENT_NET(self, raw)
+    if argv and argv[0].lower() == 'ftp' and _ProdFtpSubsession2 is not None:
+        sub = _ProdFtpSubsession2(self.env, lambda: self.cwd,
+                                  lambda p: setattr(self, 'cwd', self.env.resolve(self.cwd, p)))
+        if len(argv) >= 2 and argv[1].upper() in {'HELP', '?', '-H', '--HELP'}:
+            return sub.help()
+        subs[key] = sub
+        if len(argv) >= 2:
+            return sub.connect_banner() + '\n' + sub.handle('open ' + ' '.join(argv[1:]))
+        return sub.banner()
+    if argv and argv[0].lower() == 'telnet' and _ProdTelnetSubsession2 is not None:
+        sub = _ProdTelnetSubsession2()
+        if len(argv) >= 2 and argv[1].upper() in {'HELP', '?', '-H', '--HELP'}:
+            return sub.help()
+        subs[key] = sub
+        if len(argv) >= 2:
+            return sub.connect_banner() + '\n' + sub.handle('open ' + ' '.join(argv[1:]))
+        return sub.banner()
+    return _OMVS_EXECUTE_BEFORE_PERSISTENT_NET(self, raw)
+
+OmvsShellSession.execute = _omvs_persistent_network_execute

@@ -1,0 +1,73 @@
+{
+  "name": "Account",
+  "type": "object",
+  "properties": {
+    "account_number": {
+      "type": "string",
+      "description": "10-digit account number"
+    },
+    "customer_id": {
+      "type": "string",
+      "description": "Linked customer ID"
+    },
+    "account_type": {
+      "type": "string",
+      "enum": [
+        "SAV",
+        "CUR",
+        "OVD",
+        "LON"
+      ],
+      "default": "CUR",
+      "description": "SAV=Savings CUR=Current OVD=Overdraft LON=Loan"
+    },
+    "sort_code": {
+      "type": "string"
+    },
+    "open_date": {
+      "type": "string"
+    },
+    "currency": {
+      "type": "string",
+      "enum": [
+        "GBP",
+        "USD",
+        "EUR"
+      ],
+      "default": "GBP"
+    },
+    "balance": {
+      "type": "number",
+      "default": 0
+    },
+    "credit_limit": {
+      "type": "number",
+      "default": 0
+    },
+    "interest_rate": {
+      "type": "number",
+      "default": 0
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "A",
+        "D",
+        "F"
+      ],
+      "default": "A",
+      "description": "A=Active D=Dormant F=Frozen"
+    },
+    "operator_id": {
+      "type": "string"
+    },
+    "last_update_date": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_number",
+    "customer_id",
+    "account_type"
+  ]
+}

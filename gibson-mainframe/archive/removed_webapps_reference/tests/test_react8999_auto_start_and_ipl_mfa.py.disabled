@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from gibson.cli import build_state
+
+
+def test_cli_ipl_prestart_can_define_mfa_pin_non_interactively(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "gibson.cli",
+            "--sim-root",
+            str(tmp_path),
+            "--ipl-prestart-console",
+            "--ipl-mfa-pin",
+            "5678",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "MASTER CONSOLE REPLY ===> R 04,5678" in proc.stdout
+    assert "MFA PIN ACCEPTED" in proc.stdout
+    assert "IPL REPLY SEQUENCE COMPLETE" in proc.stdout
+
+    from argparse import Namespace
+    state = build_state(Namespace(
+        secure=False,
+        vuln=True,
+        gacf=None,
+        sim_root=str(tmp_path),
+        host=None,
+        port=None,
+        ftp_port=None,
+        uss_port=None,
+        tn3270_port=None,
+        rest_port=None,
+        db2_tcp_port=None,
+        db2_ws_port=None,
+        no_web_terminal=False,
+        with_web_terminal=False,
+        web_terminal_port=None,
+        react8999_port=None,
+        with_react8999=False,
+        split_console=False,
+        logon_panel=False,
+    ))
+    assert state.mfa_pin_set()
+
+
+def test_gibsonctl_start_includes_react8999_and_ipl_pin_by_default(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["GIBSON_PROJECT_ROOT"] = str(root)
+    env["GIBSON_PID_DIR"] = str(tmp_path / "pids")
+    env["GIBSON_LOG_DIR"] = str(tmp_path / "logs")
+    env["GIBSON_WEB_TERMINAL"] = "0"
+    proc = subprocess.run(
+        ["bash", "gibsonctl.sh", "start", "--dry-run", "--no-master"],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--with-react8999" in proc.stdout
+    assert "--react8999-port 8999" in proc.stdout
+
+
+def test_gibsonctl_supports_explicit_ipl_mfa_pin_dry_run(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["GIBSON_PROJECT_ROOT"] = str(root)
+    env["GIBSON_PID_DIR"] = str(tmp_path / "pids")
+    env["GIBSON_LOG_DIR"] = str(tmp_path / "logs")
+    env["GIBSON_WEB_TERMINAL"] = "0"
+    proc = subprocess.run(
+        ["bash", "gibsonctl.sh", "start", "--dry-run", "--ipl-mfa-pin", "5678", "--no-master"],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--with-react8999" in proc.stdout
+    assert "--react8999-port 8999" in proc.stdout

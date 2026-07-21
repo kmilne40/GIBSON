@@ -1,0 +1,359 @@
+"""Safe HACK3270-inspired GMVB web-terminal simulation.
+
+This module does not implement a TN3270 man-in-the-middle proxy. It inspects
+Gibson GMVB screen-model metadata and returns training views that demonstrate
+3270 field concepts such as protected, hidden/dark, numeric-only, MDT and PF/AID
+handling. The implementation is original Gibson simulator code.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Any, Iterable
+import json
+import uuid
+
+SECRET_FIELD_NAMES = {
+    "PASSWORD",
+    "PASSTICKET",
+    "MFA",
+    "MFA_TOKEN",
+    "TOKEN",
+    "SESSION",
+    "SESSION_ID",
+    "PIN",
+    "PRIVATE_KEY",
+    "API_KEY",
+}
+
+SAFE_REVEAL_FIELDS = {
+    "AUTHFLAG",
+    "ADMINFLAG",
+    "DEBUGFLAG",
+    "OPERATOR_ROLE",
+    "INTERNAL_ROLE",
+    "AUTH_BYPASS_FLAG",
+    "OLD_BALANCE",
+    "SCENARIO_STATE",
+}
+
+@dataclass
+class HackEvent:
+    event_id: str
+    timestamp: str
+    session_id: str
+    userid: str
+    screen: str
+    action: str
+    field_name: str
+    old_value_masked: str
+    new_value_masked: str
+    attribute_change: str
+    result: str
+
+
+def _now() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mask_value(name: str, value: Any) -> str:
+    field = (name or "").upper()
+    text = "" if value is None else str(value)
+    if field in SECRET_FIELD_NAMES or any(token in field for token in ("PASS", "TOKEN", "SECRET", "PIN")):
+        return "*" * max(4, min(12, len(text) or 8))
+    if len(text) > 24:
+        return text[:21] + "..."
+    return text
+
+
+def _ensure_hack_state(sess: Any) -> None:
+    if not hasattr(sess, "hack3270_events"):
+        sess.hack3270_events = []
+    if not hasattr(sess, "hack3270_replay"):
+        sess.hack3270_replay = []
+    if not hasattr(sess, "hack3270_lab_mode"):
+        sess.hack3270_lab_mode = False
+
+
+def log_event(lab: Any, sid: str, action: str, field_name: str = "", old_value: Any = "", new_value: Any = "", result: str = "OK", attribute_change: str = "") -> dict[str, Any]:
+    sess = lab.ensure_session(sid)
+    _ensure_hack_state(sess)
+    ev = HackEvent(
+        event_id="HK" + uuid.uuid4().hex[:10].upper(),
+        timestamp=_now(),
+        session_id=sess.sid,
+        userid=sess.user or "ANON",
+        screen=(sess.current_screen or "GMVB").upper(),
+        action=action.upper(),
+        field_name=(field_name or "").upper(),
+        old_value_masked=mask_value(field_name, old_value),
+        new_value_masked=mask_value(field_name, new_value),
+        attribute_change=attribute_change,
+        result=result,
+    )
+    data = asdict(ev)
+    sess.hack3270_events.append(data)
+    sess.hack3270_events = sess.hack3270_events[-100:]
+    sess.hack3270_replay.append({"event_id": data["event_id"], "screen": data["screen"], "action": data["action"], "result": data["result"]})
+    sess.hack3270_replay = sess.hack3270_replay[-100:]
+    try:
+        if hasattr(lab, "gmvb_audit"):
+            lab.gmvb_audit.append({"TIME": data["timestamp"], "EVENT": "HACK3270", "USER": data["userid"], "DETAIL": data["action"], "RESULT": data["result"]})
+    except Exception:
+        pass
+    return data
+
+
+def enrich_field(field: dict[str, Any]) -> dict[str, Any]:
+    name = str(field.get("name", "")).upper()
+    protected = bool(field.get("protected", False))
+    hidden = bool(field.get("hidden", False)) or not bool(field.get("visible", True))
+    numeric = bool(field.get("numeric", False)) or bool(field.get("numeric_only", False))
+    editable = bool(field.get("editable", False))
+    width = int(field.get("width") or field.get("length") or 8)
+    classification = "STANDARD"
+    if hidden:
+        classification = "HIDDEN"
+    elif protected:
+        classification = "PROTECTED"
+    elif numeric:
+        classification = "NUMERIC_ONLY"
+    if field.get("intensified"):
+        classification = "INTENSIFIED"
+    revealable = hidden and name in SAFE_REVEAL_FIELDS and name not in SECRET_FIELD_NAMES
+    bms_bits = []
+    bms_bits.append("PROT" if protected else "UNPROT")
+    if hidden:
+        bms_bits.append("DRK")
+    if numeric:
+        bms_bits.append("NUM")
+    if bool(field.get("mdt", False)):
+        bms_bits.append("MDT")
+    value = str(field.get("value", ""))
+    display = str(field.get("display_value", mask_value(name, value)))
+    if hidden and not revealable:
+        display = mask_value(name, value)
+    return {
+        **field,
+        "name": name,
+        "label": field.get("label") or name,
+        "value": value,
+        "display_value": display,
+        "editable": editable,
+        "protected": protected,
+        "hidden": hidden,
+        "numeric_only": numeric,
+        "intensified": bool(field.get("intensified", False)),
+        "modified_data_tag": bool(field.get("mdt", False) or field.get("modified_data_tag", False)),
+        "row": int(field.get("row", 1) or 1),
+        "col": int(field.get("col", 1) or 1),
+        "length": width,
+        "bms_attribute": field.get("bms_attribute") or " ".join(bms_bits),
+        "validation": field.get("validation") or ("NUMERIC" if numeric else "TEXT"),
+        "classification": classification,
+        "revealable": revealable,
+        "tamperable_in_lab": bool(field.get("tamperable_in_lab", False) or name in {"AUTHFLAG", "ADMINFLAG", "DEBUGFLAG"}),
+        "mask_policy": "NEVER_REVEAL" if name in SECRET_FIELD_NAMES or any(t in name for t in ("PASS", "TOKEN", "SECRET", "PIN")) else ("MASK_BY_DEFAULT" if hidden else "DISPLAY"),
+    }
+
+
+def current_fields(lab: Any, sid: str) -> list[dict[str, Any]]:
+    snap = lab.snapshot(sid)
+    return [enrich_field(dict(f)) for f in snap.get("fields", [])]
+
+
+def hack_status(lab: Any, sid: str) -> dict[str, Any]:
+    sess = lab.ensure_session(sid)
+    _ensure_hack_state(sess)
+    fields = current_fields(lab, sid)
+    counts = {"standard": 0, "protected": 0, "hidden": 0, "numeric_only": 0}
+    for f in fields:
+        if f["classification"] == "STANDARD":
+            counts["standard"] += 1
+        if f["protected"]:
+            counts["protected"] += 1
+        if f["hidden"]:
+            counts["hidden"] += 1
+        if f["numeric_only"]:
+            counts["numeric_only"] += 1
+    return {
+        "enabled": bool(sess.hack.get("hack_enabled", False)),
+        "mode": "LAB TAMPER" if getattr(sess, "hack3270_lab_mode", False) else "PASSIVE INSPECT",
+        "session_id": sess.sid,
+        "userid": sess.user or "ANON",
+        "screen": (sess.current_screen or "GMVB").upper(),
+        "field_summary": counts,
+        "safe_simulation": True,
+        "real_proxy": False,
+    }
+
+
+def set_enabled(lab: Any, sid: str, enabled: bool) -> dict[str, Any]:
+    sess = lab.ensure_session(sid)
+    sess.hack["hack_enabled"] = bool(enabled)
+    action = "ENABLE" if enabled else "DISABLE"
+    log_event(lab, sid, action, result=f"HACK3270 {action}D")
+    sess.status = f"HACK3270 FIELD INSPECTOR {'ON' if enabled else 'OFF'}"
+    return {"status": hack_status(lab, sid), "screen": lab.snapshot(sid)}
+
+
+def filter_fields(fields: Iterable[dict[str, Any]], category: str) -> list[dict[str, Any]]:
+    cat = category.upper()
+    out = []
+    for f in fields:
+        if cat in {"FIELDS", "ALL", "ATTR"}:
+            out.append(f)
+        elif cat == "STANDARD" and f["classification"] == "STANDARD":
+            out.append(f)
+        elif cat == "PROTECTED" and f["protected"]:
+            out.append(f)
+        elif cat == "HIDDEN" and f["hidden"]:
+            out.append(f)
+        elif cat in {"NUMERIC", "NUMERIC_ONLY"} and f["numeric_only"]:
+            out.append(f)
+    return out
+
+
+def field_rows(fields: list[dict[str, Any]], reveal: bool = False) -> list[dict[str, str]]:
+    rows = []
+    for f in fields:
+        value = f.get("display_value", "")
+        if reveal and f.get("revealable") and f.get("mask_policy") != "NEVER_REVEAL":
+            value = f.get("value", "")
+        rows.append(
+            {
+                "FIELD NAME": str(f["name"]),
+                "CLASS": str(f["classification"]),
+                "ROW": f"{int(f['row']):02d}",
+                "COL": f"{int(f['col']):03d}",
+                "LEN": f"{int(f['length']):03d}",
+                "ATTR": str(f.get("bms_attribute", "")),
+                "VALUE": mask_value(str(f["name"]), value) if f.get("mask_policy") == "NEVER_REVEAL" else str(value),
+            }
+        )
+    return rows
+
+
+def menu(lab: Any, sid: str) -> dict[str, Any]:
+    st = hack_status(lab, sid)
+    output = [
+        "HACK3270 - GMVB FIELD INSPECTOR",
+        f"TARGET APPLID : GMVB",
+        f"CURRENT MAP   : {st['screen']}",
+        f"MODE          : {st['mode']}",
+        f"SESSION       : {st['userid']} / {st['session_id']}",
+        "",
+        "1  SHOW STANDARD FIELDS",
+        "2  SHOW PROTECTED FIELDS",
+        "3  SHOW HIDDEN FIELDS",
+        "4  REVEAL HIDDEN FIELD VALUES",
+        "5  MAKE PROTECTED FIELDS EDITABLE - SIMULATED",
+        "6  REMOVE NUMERIC-ONLY RESTRICTIONS - SIMULATED",
+        "7  SHOW BMS MAP / FIELD ATTRIBUTES",
+        "8  INJECT PF/AID KEY",
+        "9  FIELD FUZZ TEST - CONTROLLED",
+        "10 SESSION LOG",
+        "11 OFFLINE REPLAY",
+        "12 EXPORT LAB EVIDENCE",
+        "X  RETURN TO GMVB",
+    ]
+    log_event(lab, sid, "MENU", result="MENU DISPLAYED")
+    return {"screen": "HACK3270", "title": "HACK3270 - GMVB FIELD INSPECTOR", "output": output, "status": st}
+
+
+def action(lab: Any, sid: str, action_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    sess = lab.ensure_session(sid)
+    _ensure_hack_state(sess)
+    act = (action_name or "MENU").strip().upper()
+    if act in {"ON", "ENABLE"}:
+        return set_enabled(lab, sid, True)
+    if act in {"OFF", "DISABLE"}:
+        return set_enabled(lab, sid, False)
+    if act in {"MENU", "M"}:
+        return menu(lab, sid)
+    if act in {"FIELDS", "ALL", "STANDARD", "PROTECTED", "HIDDEN", "NUMERIC", "NUMERIC_ONLY", "ATTR"}:
+        fields = current_fields(lab, sid)
+        selected = filter_fields(fields, act)
+        log_event(lab, sid, f"SHOW_{act}", result=f"{len(selected)} FIELDS")
+        return {"screen": "HACK3270", "title": f"HACK3270 {act} FIELDS", "rows": field_rows(selected), "fields": selected, "status": hack_status(lab, sid)}
+    if act == "REVEAL":
+        selected = [f for f in current_fields(lab, sid) if f.get("hidden")]
+        rows = field_rows(selected, reveal=True)
+        log_event(lab, sid, "REVEAL", result="REVEALABLE HIDDEN FIELDS SHOWN")
+        return {"screen": "HACK3270", "title": "HACK3270 REVEAL HIDDEN", "message": "GMV3270I HIDDEN FIELD REVEALED IN LAB VIEW ONLY.", "rows": rows, "status": hack_status(lab, sid)}
+    if act in {"UNPROTECT", "TAMPER_PROTECTED", "MAKE_EDITABLE"}:
+        sess.hack["remove_protection"] = True
+        log_event(lab, sid, "UNPROTECT", result="SCREEN MODEL ONLY", attribute_change="PROT->UNPROT")
+        return {"screen": "HACK3270", "message": "GMV3270I CLIENT-SIDE PROTECTION REMOVED IN SCREEN MODEL. GMV3271I SERVER-SIDE VALIDATION REJECTED UNAUTHORISED UPDATE.", "status": hack_status(lab, sid), "screen_model": lab.snapshot(sid)}
+    if act in {"REMOVE_NUMERIC", "NUMERIC_BYPASS"}:
+        sess.hack["remove_numeric"] = True
+        log_event(lab, sid, "REMOVE_NUMERIC", result="SERVER VALIDATION STILL ENFORCED", attribute_change="NUMERIC->TEXT")
+        return {"screen": "HACK3270", "message": "GMV3272I CLIENT-SIDE NUMERIC CHECK BYPASSED; SERVER REJECTED INVALID VALUES.", "status": hack_status(lab, sid), "screen_model": lab.snapshot(sid)}
+    if act == "INJECT":
+        key = str(params.get("key") or params.get("aid") or "PF8").upper()
+        if key not in {"PF3", "PF5", "PF8", "ENTER", "CLEAR"}:
+            log_event(lab, sid, "INJECT", field_name=key, result="UNSUPPORTED AID")
+            return {"screen": "HACK3270", "message": f"GMV3273E AID KEY {key} NOT SUPPORTED IN SIMULATION", "status": hack_status(lab, sid)}
+        pf = key if key.startswith("PF") else ""
+        snap = lab.terminal_submit(sid, fields={}, command="" if key != "ENTER" else "INQUIRE", pf=pf)
+        log_event(lab, sid, "INJECT", field_name=key, result=f"AID {key} ROUTED")
+        return {"screen": "HACK3270", "message": f"GMV3273I AID KEY {key} INJECTED - ROUTED TO GMVB ACTION", "target_screen": snap, "status": hack_status(lab, sid)}
+    if act == "FUZZ":
+        field = str(params.get("field") or "CUSTOMER_ID").upper()
+        payload = str(params.get("payload") or "A" * 96)
+        result = lab.gmvb_overflow_test(sid, payload) if hasattr(lab, "gmvb_overflow_test") else lab.snapshot(sid)
+        log_event(lab, sid, "FUZZ", field_name=field, new_value=payload, result="CONTROLLED FUZZ SENT")
+        return {"screen": "HACK3270", "message": "ASRA ABEND SIMULATED IN PROGRAM BUFOVF. GMVBOF002I TRAINING ONLY - HOST MEMORY NOT MODIFIED", "target_screen": result, "status": hack_status(lab, sid)}
+    if act == "LOG":
+        return {"screen": "HACK3270", "title": "HACK3270 SESSION LOG", "rows": list(getattr(sess, "hack3270_events", [])), "status": hack_status(lab, sid)}
+    if act == "REPLAY":
+        event_id = str(params.get("event_id") or "")
+        events = list(getattr(sess, "hack3270_replay", []))
+        if event_id:
+            events = [e for e in events if e.get("event_id") == event_id]
+        return {"screen": "HACK3270", "title": "HACK3270 OFFLINE REPLAY", "rows": events, "message": "REPLAY IS NON-DESTRUCTIVE", "status": hack_status(lab, sid)}
+    if act == "EXPORT":
+        return export(lab, sid)
+    return {"screen": "HACK3270", "message": f"GMV3279E UNKNOWN HACK3270 ACTION {act}", "status": hack_status(lab, sid)}
+
+
+def fields_api(lab: Any, sid: str, category: str = "ALL") -> dict[str, Any]:
+    fields = current_fields(lab, sid)
+    selected = filter_fields(fields, category)
+    return {"status": hack_status(lab, sid), "fields": selected, "rows": field_rows(selected)}
+
+
+def log_api(lab: Any, sid: str) -> dict[str, Any]:
+    sess = lab.ensure_session(sid)
+    _ensure_hack_state(sess)
+    return {"events": list(sess.hack3270_events), "status": hack_status(lab, sid)}
+
+
+def replay_api(lab: Any, sid: str, event_id: str = "") -> dict[str, Any]:
+    return action(lab, sid, "REPLAY", {"event_id": event_id})
+
+
+def export(lab: Any, sid: str) -> dict[str, Any]:
+    sess = lab.ensure_session(sid)
+    _ensure_hack_state(sess)
+    bundle = {
+        "simulation": "HACK3270-inspired GMVB field-inspection lab; no real TN3270 proxy was used.",
+        "session_id": sess.sid,
+        "userid": sess.user or "ANON",
+        "timestamp": _now(),
+        "screen": (sess.current_screen or "GMVB").upper(),
+        "events": list(sess.hack3270_events),
+        "findings": [
+            "Client-side 3270 field attributes are presentation controls, not authorization controls.",
+            "Protected and numeric-only fields must be revalidated by server-side CICS/COBOL logic.",
+            "Hidden/dark fields must not carry secrets or authoritative privileges.",
+        ],
+        "remediation": [
+            "Validate authorization on every server-side transaction.",
+            "Reject invalid data independent of terminal attributes.",
+            "Do not expose secrets in screen buffers, traces, session logs, or packet captures.",
+        ],
+    }
+    log_event(lab, sid, "EXPORT", result="EVIDENCE EXPORTED")
+    return {"screen": "HACK3270", "title": "HACK3270 EVIDENCE EXPORT", "bundle": bundle, "output": json.dumps(bundle, indent=2), "status": hack_status(lab, sid)}

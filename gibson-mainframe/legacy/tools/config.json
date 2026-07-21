@@ -1,0 +1,21 @@
+{
+    "configuration": {
+        "output_ask": 0,
+        "output_default": 1,
+        "screen_output_ask": 0,
+        "screen_output_default": 1,
+        "report_ask": 1,
+        "report_default": 0,
+        "speed_dial_ask": 1
+    },
+    "speed_dial": {
+        "http": "-p 80",
+        "https": "-p 443",
+        "cool": "-p 1",
+        "ftptest": " -T4 -p 21 --script=/usr/share/nmap/scripts/ftp-anon.nse",
+        "TN3270-SCREEN": "-p23 -T4 --script tn3270-screen",
+        "VTAM-ENUM": "-p23 -T4 --script nwg-vtam-enum",
+        "TSO-ENUM": "-p23 -T4 --script nwg-tso-enum --script-args=userdb=tso_users.txt,tso-enum.commands=\"logon applid(TSO)\"",
+        "DB2-INFO": "-p4501 -sV -T4 --script=db2-das-info"
+    }
+}

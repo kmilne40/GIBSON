@@ -1,0 +1,116 @@
+from gibson.core.state import GibsonState
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.gmvb_upgrade import gmvb_json_api, render_gmvb_web
+
+
+def lab():
+    return get_banking_lab(GibsonState.create())
+
+
+def test_hack3270_off_by_default_and_switch_scoped():
+    l = lab()
+    sid = l.new_sid()
+    status, data = gmvb_json_api(l, "/api/v1/gmvb/hack3270/status", "GET", query={"sid": sid})
+    assert status == 200
+    assert data["enabled"] is False
+    status, data = gmvb_json_api(l, "/api/v1/gmvb/hack3270/enable", "POST", data={"sid": sid})
+    assert data["status"]["enabled"] is True
+    other = l.new_sid()
+    _, other_status = gmvb_json_api(l, "/api/v1/gmvb/hack3270/status", "GET", query={"sid": other})
+    assert other_status["enabled"] is False
+
+
+def test_hack3270_field_metadata_and_no_secret_reveal():
+    l = lab()
+    sid = l.new_sid()
+    l.login(sid, "IBMUSER", "SYS1")
+    l.menu_select(sid, "XFER")
+    status, payload = gmvb_json_api(l, "/api/v1/gmvb/hack3270/fields", "GET", query={"sid": sid})
+    assert status == 200
+    fields = payload["fields"]
+    assert any(f["protected"] for f in fields)
+    assert any(f["hidden"] for f in fields)
+    assert any(f["numeric_only"] for f in fields)
+    _, reveal = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "REVEAL"})
+    rows = reveal["rows"]
+    assert all("PASSTICKET" not in r.get("FIELD NAME", "") or r["VALUE"].startswith("*") for r in rows)
+
+
+def test_hack3270_menu_and_safe_tamper_simulation():
+    l = lab()
+    sid = l.new_sid()
+    l.login(sid, "IBMUSER", "SYS1")
+    l.menu_select(sid, "XFER")
+    _, menu = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "MENU"})
+    assert "HACK3270 - GMVB FIELD INSPECTOR" in "\n".join(menu["output"])
+    _, tamper = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "UNPROTECT"})
+    assert "SERVER-SIDE VALIDATION REJECTED" in tamper["message"]
+    assert l.ensure_session(sid).hack["remove_protection"] is True
+
+
+def test_hack3270_numeric_bypass_pf_inject_fuzz_log_replay_export():
+    l = lab()
+    sid = l.new_sid()
+    l.login(sid, "IBMUSER", "SYS1")
+    l.menu_select(sid, "XFER")
+    _, num = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "REMOVE_NUMERIC"})
+    assert "NUMERIC CHECK BYPASSED" in num["message"]
+    _, inj = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "INJECT", "key": "PF8"})
+    assert "AID KEY PF8" in inj["message"]
+    _, fuzz = gmvb_json_api(l, "/api/v1/gmvb/hack3270/action", "POST", data={"sid": sid, "action": "FUZZ", "field": "SURNAME"})
+    assert "ASRA ABEND SIMULATED" in fuzz["message"]
+    _, log = gmvb_json_api(l, "/api/v1/gmvb/hack3270/log", "GET", query={"sid": sid})
+    assert len(log["events"]) >= 3
+    _, replay = gmvb_json_api(l, f"/api/v1/gmvb/hack3270/replay/{log['events'][0]['event_id']}", "GET", query={"sid": sid})
+    assert replay["message"] == "REPLAY IS NON-DESTRUCTIVE"
+    _, export = gmvb_json_api(l, "/api/v1/gmvb/hack3270/export", "GET", query={"sid": sid})
+    assert "PassTicket" not in export["output"]
+    assert "HACK3270-inspired" in export["bundle"]["simulation"]
+
+
+def test_web_terminal_contains_hack3270_controls_inside_terminal():
+    l = lab()
+    sid = l.new_sid()
+    html = render_gmvb_web(l, sid)
+    assert "gmvb-terminal" in html
+    assert "HACK3270 MENU" in html
+    assert "<table" not in html.lower()
+    assert "/api/v1/gmvb/hack3270/action" in html
+
+import http.client
+import json
+import threading
+from tests.test_banking_tn3270_web_lab import _free_port, _wait_for_rest, make_state
+from gibson.services.rest_gateway import serve_rest
+
+
+def _post_json(port: int, path: str, payload: dict) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn.request("POST", path, body=json.dumps(payload), headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    status = resp.status
+    conn.close()
+    return status, body
+
+
+def test_hack3270_routes_available_on_8082_fallback(tmp_path):
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    _wait_for_rest(st)
+    port = st.config.rest_port
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn.request("GET", "/gmvb")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="ignore")
+    conn.close()
+    assert resp.status == 200
+    assert "HACK3270 MENU" in body
+    assert "<table" not in body.lower()
+    status, payload = _post_json(port, "/api/v1/gmvb/hack3270/enable", {"sid": "http1"})
+    assert status == 200 and payload["status"]["enabled"] is True
+    status, payload = _post_json(port, "/api/v1/gmvb/hack3270/action", {"sid": "http1", "action": "MENU"})
+    assert status == 200 and "HACK3270 - GMVB FIELD INSPECTOR" in "\n".join(payload["output"])
+    status, payload = _post_json(port, "/bank/passticket/generate", {"sid": "http1", "userid": "IBMUSER", "applid": "CICS"})
+    assert status == 200 and "passticket" in payload

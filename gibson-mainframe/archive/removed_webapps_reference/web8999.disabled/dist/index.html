@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gibson BANKMASTER/VS - DVCA / CICSLAB1</title>
+  <style>
+    :root{--green:#39ff88;--dim:#236b3d;--amber:#ffb000;--red:#ff4040;--blue:#38a3ff;--cyan:#00ffff;--bg:#000;}
+    html,body{margin:0;height:100%;background:#000;color:var(--green);font-family:"Courier New",monospace;}
+    .app{display:grid;grid-template-columns:minmax(620px,1fr) 430px;min-height:100vh;}
+    .term{white-space:pre;overflow:auto;padding:12px 18px 80px;font-size:16px;line-height:1.23;text-shadow:0 0 5px rgba(57,255,136,.35);}
+    .side{border-left:1px solid #064;background:#030806;padding:14px;overflow:auto;color:#bfffd0;}
+    h1{margin:0 0 8px;color:var(--green);font-size:18px}.small{font-size:12px;color:#8ebf9b}.amber{color:var(--amber)}.red{color:var(--red)}.blue{color:var(--blue)}.cyan{color:var(--cyan)}
+    label{display:block;margin:9px 0 3px;font-size:12px;color:#a7e7b7}input,select,textarea,button{box-sizing:border-box;background:#001a0b;color:var(--green);border:1px solid #096;padding:8px;font-family:inherit;font-size:13px}input,select,textarea{width:100%}button{cursor:pointer;font-weight:bold}button:hover{background:#064}.row{display:grid;grid-template-columns:1fr 1fr;gap:6px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}.chips button{padding:6px 8px}.msg{min-height:22px;color:var(--amber);margin:8px 0}.footer{position:fixed;bottom:0;left:0;right:430px;border-top:1px solid #0a5;background:#001a08;display:flex;gap:8px;padding:8px 18px}.footer input{flex:1}.toolbar{background:#d4d0c8;color:#000;border:1px solid #888;margin:-12px -18px 8px;padding:0;font-family:Tahoma,Arial,sans-serif;text-shadow:none}.titlebar{background:#0a246a;color:white;padding:3px 8px}.tabs span{display:inline-block;border:1px solid #888;padding:3px 8px;margin:3px 1px;background:#bbb}.tabbody{padding:6px 8px}.restbox{border:1px solid #095;padding:8px;margin-top:12px;background:#001006}.screenflag{display:inline-block;border:1px solid #095;padding:2px 6px;margin-left:4px}
+    @media(max-width:1000px){.app{grid-template-columns:1fr}.side{border-left:0;border-top:1px solid #064}.footer{position:static}}
+  </style>
+</head>
+<body>
+<div class="app"><main><div id="hackbar" class="toolbar" style="display:none"></div><pre id="terminal" class="term">Loading BANKMASTER/VS...</pre></main><aside class="side">
+  <h1>Gibson BANKMASTER/VS</h1><div class="small">Port 8999 · GACF/RACF authenticated · FIBS Db2-backed training.</div>
+  <div id="login"><label>Operator ID</label><input id="userid" value="IBMUSER" maxlength="8"><label>Password</label><input id="password" type="password" value="SYS1"><button id="loginBtn">SIGNON</button><button id="resetBtn">RESET SESSION</button></div>
+  <div class="msg" id="message"></div><div id="mode" class="small"></div>
+  <h2 class="amber">BANKMASTER Transactions</h2><div class="chips" id="chips"></div>
+  <div id="dvcaPanel" style="display:none"><h2 class="amber">hack3270 Controls</h2><div class="chips"><button onclick="send('HACKON')">Hack ON</button><button onclick="send('HIDDEN')">Hidden Fields</button><button onclick="send('PROTECT_OFF')">Disable Protection</button><button onclick="send('NUMERIC_OFF')">Remove Numeric</button><button onclick="send('INJECT_PRICE')">Inject Field</button><button onclick="send('PINBRUTE')">BATCH PIN</button><button onclick="send('PA3')">Inject PA3</button><button onclick="send('APILEAK')">API Leak</button></div><div id="stats" class="small"></div></div>
+  <div id="restPanel" class="restbox"><h2 class="amber">REST API Vulnerability Tester</h2><label>Endpoint</label><select id="endpoint"><option>/api/v1/ui8999/api-menu/unsafe-query</option><option>/api/v1/fibs/customers/10000002</option><option>/api/v1/fibs/accounts/1000000201</option><option>/api/v1/ui8999/cobol/programs/VULNERABLE-BANK-UPDATE</option><option>/api/v1/ui8999/cics/command</option></select><label>Method</label><select id="method"><option>POST</option><option>GET</option></select><label>Request body</label><textarea id="body" rows="4">{"query":"' OR '1'='1"}</textarea><button onclick="restTest()">SEND REST TEST</button><pre id="restOut" class="small"></pre></div>
+  <h2 class="amber">Active Fields</h2><div id="fields"></div><h2 class="amber">Backend</h2><div id="backend" class="small"></div>
+</aside></div><div class="footer"><span>SELECTION ==&gt;</span><input id="cmd" placeholder="DVCA, BLAB, CUST, ACCT, TRAN, BULK, REST, TN32, CICS, CEMT, CECI, LOGO"><button onclick="send()" style="width:120px">ENTER</button></div>
+<script>
+const sid='WEB8999-'+Math.random().toString(16).slice(2);let current=null;
+const tx=['MENU','CUST','ACCT','TRAN','BULK','REST','TN32','CICS','BLAB','DVCA','CECI','CEMT','LOGO'];
+function $(id){return document.getElementById(id)}
+async function api(path,body={}){const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sid,...body})});const j=await res.json();if(!j.ok&&j.error)$('message').innerHTML='<span class="red">'+j.error+'</span>';return j.data||j}
+function esc(s){return String(s??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;')}
+function render(data){current=data;const lines=data.lines||data.screen?.lines||[];$('terminal').textContent=lines.join('\n')||JSON.stringify(data,null,2);$('message').textContent=(data.messages||[])[0]||data.screen?.message||'';$('mode').innerHTML='Screen <span class="screenflag">'+esc(data.screen_name||data.screen?.name||'')+'</span> User <span class="screenflag">'+esc(data.userid||'')+'</span>';
+ const name=data.screen_name||data.screen?.name||'';const isDvca=data.dvca?.active||['MCGM','MCMM','MCOR','MCAD','MCHI','SCRT'].includes(name);$('dvcaPanel').style.display=isDvca?'block':'none';$('hackbar').style.display=isDvca?'block':'none'; if(isDvca){let h=data.hack3270||{};$('hackbar').innerHTML='<div class="titlebar">hack3270-glbson v1.0 <span style="float:right">training simulation only</span></div><div class="tabs"><span>Hack Field Attributes</span><span>Inject Info Fields</span><span>Inject Key Presses</span><span>BATCH PIN</span><span>API Leakage</span><span>Logs</span><span>Statistics</span><span>Help</span></div><div class="tabbody"><b>Hack Fields:</b> '+(h.master?'ON':'OFF')+' &nbsp; ☐ Disable Field Protection &nbsp; ☐ Enable Hidden Fields &nbsp; ☐ Remove Numeric Only Restrictions</div>';$('stats').textContent=JSON.stringify(h.stats||{});} 
+ const fields=data.fields||data.screen?.fields||[];$('fields').innerHTML=fields.filter(f=>!f.hidden).map(f=>`<label>${esc(f.label||f.name||f.id)}</label><input data-field="${esc(f.name||f.id)}" value="${esc(f.value||'')}">`).join('')||'<span class="small">No editable fields</span>';$('backend').innerHTML=Object.entries(data.backend||{}).map(([k,v])=>`<div><span class="amber">${esc(k)}</span>: ${esc(v)}</div>`).join('');}
+async function start(){render(await api('/api/v1/ui8999/fibs/session/start'))}async function login(){render(await api('/api/v1/ui8999/fibs/session/logon',{userid:$('userid').value,password:$('password').value}))}
+function collect(){let o={};document.querySelectorAll('[data-field]').forEach(i=>o[i.dataset.field]=i.value);return o}async function send(c){render(await api('/api/v1/ui8999/fibs/session/'+sid+'/input',{command:c??$('cmd').value,fields:collect()}));$('cmd').value='';$('cmd').focus()}
+async function restTest(){let ep=$('endpoint').value,method=$('method').value,body={};try{body=JSON.parse($('body').value||'{}')}catch(e){body={raw:$('body').value}};const res=await fetch(ep,{method,headers:{'Content-Type':'application/json'},body:method==='GET'?undefined:JSON.stringify(body)});const txt=await res.text();$('restOut').textContent=txt.slice(0,2000);await send('RESTTEST')}
+$('chips').innerHTML=tx.map(t=>`<button onclick="send('${t}')">${t}</button>`).join('');$('loginBtn').onclick=login;$('resetBtn').onclick=start;$('cmd').addEventListener('keydown',e=>{if(e.key==='Enter')send()});start();
+</script></body></html>

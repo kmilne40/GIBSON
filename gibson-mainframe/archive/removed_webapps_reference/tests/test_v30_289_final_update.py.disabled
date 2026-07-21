@@ -1,0 +1,78 @@
+from pathlib import Path
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.apps.tso import TsoCommandProcessor
+
+
+def make_state(tmp_path: Path) -> GibsonState:
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path/"f", commands_dir=tmp_path/"f"/"commands", transfer_root=tmp_path/"transfers", gacf_path=tmp_path/"GACF.DB")
+    cfg.gacf_path.write_text("IBMUSER:SYS1:SPECIAL:OMVS:SYS1\nGUEST:SYS1:NONE:NOOMVS:STUDENT\n")
+    return GibsonState.create(cfg)
+
+
+def test_adduser_altuser_segments_roaudit_uid0_and_persistence(tmp_path):
+    st = make_state(tmp_path)
+    tso = TsoCommandProcessor(st, "IBMUSER")
+    add = tso.run("ADDUSER AUDT01 PASSWORD(Initpass1) ROAUDIT UAUDIT AUDITOR OPERATIONS OMVS(UID(0) HOME('/u/audt01') PROGRAM('/bin/sh')) TSO(ACCTNUM(ACCT) PROC(ISPFPROC) SIZE(4096) MAXSIZE(8192) MSGCLASS(X) SYS(A) UNIT(SYSDA)) DFP(STORCLAS(SC) MGMTCLAS(MC) DATACLAS(DC))")
+    assert "ICH01024I USER AUDT01 DEFINED" in add
+    assert "ATTRIBUTE ROAUDIT ASSIGNED" in add
+    listed = tso.run("LISTUSER AUDT01 ALL")
+    assert "ATTRIBUTES=AUDITOR OPERATIONS ROAUDIT UAUDIT" in listed
+    assert "TSO INFORMATION" in listed and "PROC=ISPFPROC" in listed
+    assert "OMVS INFORMATION" in listed and "UID=0000000000" in listed
+    assert "DFP INFORMATION" in listed and "STORCLAS=SC" in listed
+    assert "AUDT01" in tso.run("SEARCH CLASS(USER) UID(0)")
+    priv = tso.run("ZSEC PRIVILEGE")
+    assert "AUDT01" in priv and "ROAUDIT" in priv
+    alt = tso.run("ALTUSER AUDT01 OMVS(UID(123)) NOROAUDIT")
+    assert "ATTRIBUTE ROAUDIT REMOVED" in alt
+    assert "UID=0000000123" in tso.run("LISTUSER AUDT01 OMVS")
+    assert "AUDT01" not in tso.run("SEARCH CLASS(USER) UID(0)")
+    assert "ROAUDIT" not in tso.run("ZSEC PRIVILEGE").split("AUDT01", 1)[-1]
+    # Verify persisted GACF v30.289 JSON blob reloads attributes and segments.
+    st2 = GibsonState.create(st.config)
+    listed2 = TsoCommandProcessor(st2, "IBMUSER").run("LISTUSER AUDT01 ALL")
+    assert "OPERATIONS" in listed2 and "UAUDIT" in listed2 and "UID=0000000123" in listed2
+
+
+def test_new_v30289_topic_commands_are_not_generic_menus(tmp_path):
+    st = make_state(tmp_path)
+    tso = TsoCommandProcessor(st, "IBMUSER")
+    for cmd, needle in [
+        ("ZSEC SURROGAT", "ZSECURE SURROGAT"),
+        ("ZSEC JES", "ZSECURE JES"),
+        ("ZSEC TSOAUTH", "ZSECURE TSOAUTH"),
+        ("ZSEC SERVAUTH", "ZSECURE SERVAUTH"),
+        ("ZSEC PASSTICKET", "ZSECURE PASSTICKET"),
+        ("ZSEC DB2", "ZSECURE DB2"),
+        ("ZSEC ICSF", "ZSECURE ICSF"),
+        ("ZSEC RACDCERT", "ZSECURE RACDCERT"),
+        ("ZSEC RARE", "ZSECURE RARE"),
+    ]:
+        out = tso.run(cmd)
+        assert needle in out
+        assert "MAIN MENU" not in out
+
+
+def test_new_command_shapes_and_help(tmp_path):
+    st = make_state(tmp_path)
+    tso = TsoCommandProcessor(st, "IBMUSER")
+    assert "NETACCESS DISPLAY" in tso.run("NETACCESS DISPLAY")
+    assert "DSNL080I" in tso.run("DB2 DISPLAY DDF")
+    assert "DSNX200I" in tso.run("DB2 DISPLAY SECURITY")
+    assert "CSFM100I" in tso.run("ICSF DISPLAY CKDS")
+    assert "CSFM101I" in tso.run("ICSF DISPLAY PKDS")
+    assert "CSFM102I" in tso.run("ICSF DISPLAY TKDS")
+    assert "IRRD107I" in tso.run("RACDCERT ID(IBMUSER) ADDRING(GIBRING)")
+    assert "PASSTICKET" in tso.run("PASSTICKET GENERATE USER(IBMUSER) APPL(CICS)")
+    for topic in ["ADDUSER", "ALTUSER", "LISTUSER", "ZSEC", "NETACCESS", "DB2", "ICSF", "RACDCERT", "PASSTICKET", "SURROGAT", "TSOAUTH", "SERVAUTH"]:
+        assert "HELP" in tso.run(f"HELP {topic}")
+
+
+def test_dashboard_image_removed_and_8082_not_default():
+    dash = Path("gibson/services/dashboard.py").read_text()
+    assert "IBM System/370-style simulated mainframe console image" not in dash
+    assert "System/370 Console" not in dash
+    assert "Gibson Control Panel" in dash
+    ctl = Path("gibsonctl.sh").read_text()
+    assert "PORTS=(1023 2022 2023 2111 8081 8443 50000 50001)" in ctl

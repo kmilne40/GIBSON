@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from io import BytesIO
+from pathlib import Path
+from types import SimpleNamespace
+
+from gibson.apps.cics import CicsSimulator
+from gibson.apps.editor import InteractiveEditor
+from gibson.apps.ftp_client import TsoFtpClientApp
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.render.input import InputResult
+from gibson.services.dashboard import _DashboardHandler
+
+
+class DummyHandler:
+    def __init__(self, state: GibsonState):
+        self.state = state
+        self.wfile = BytesIO()
+        self.responses = []
+        self.headers = {}
+
+    def _snapshot(self):
+        return _DashboardHandler._snapshot(self)  # type: ignore[misc]
+
+    def send_response(self, code: int) -> None:
+        self.responses.append(("code", code))
+
+    def send_header(self, name: str, value: str) -> None:
+        self.responses.append((name, value))
+
+    def end_headers(self) -> None:
+        self.responses.append(("end", None))
+
+
+class FakeLineDriver:
+    def __init__(self, answers):
+        self.answers = list(answers)
+
+    def read_line(self, prompt: str = "", hidden: bool = False, mask: bool = False):
+        if not self.answers:
+            return InputResult("", "EOF")
+        item = self.answers.pop(0)
+        return InputResult(item, None)
+
+
+class FakeKeyDriver:
+    def __init__(self, keys):
+        self.keys = list(keys)
+
+    def read_key(self):
+        if not self.keys:
+            return InputResult("", "EOF")
+        item = self.keys.pop(0)
+        if isinstance(item, tuple):
+            return InputResult(item[0], item[1])
+        if len(item) == 1:
+            return InputResult(item, None)
+        return InputResult("", item)
+
+
+def make_state(tmp_path: Path) -> GibsonState:
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path / 'f', commands_dir=tmp_path / 'f' / 'commands', gacf_path=tmp_path / 'GACF.DB')
+    cfg.ensure()
+    cfg.gacf_path.write_text('IBMUSER:SYS1:SPECIAL:OMVS\nGUEST:GUEST:NONE:OMVS\n', encoding='utf-8')
+    return GibsonState.create(cfg)
+
+
+def test_dashboard_snapshot_includes_smf80_and_system_box(tmp_path):
+    st = make_state(tmp_path)
+    st.audit.record('IBMUSER', 'LISTC', 'ENTER', 'TSO')
+    st.audit.record_smf80('IBMUSER', 'USER ALTER', 'USER=GUEST CHANGES=NOSPECIAL')
+    snap = _DashboardHandler._snapshot(SimpleNamespace(state=st))
+    components = [e['component'] for e in snap['recent_audit']]
+    assert components == ['TSO', 'SMF80']
+    assert 'memory_total' in snap['system_box']
+    assert 'ipl_time' in snap['system_box']
+
+
+def test_dashboard_html_contains_system_summary_panel(tmp_path):
+    st = make_state(tmp_path)
+    handler = DummyHandler(st)
+    _DashboardHandler._html(handler)  # type: ignore[arg-type]
+    page = handler.wfile.getvalue().decode('utf-8', errors='ignore')
+    assert 'System Summary' in page
+    assert 'System IPL time' in page
+    assert 'Listening ports' in page
+
+
+def test_gmvb_login_accepts_tilde_separator_in_line_mode(tmp_path):
+    st = make_state(tmp_path)
+    cics = CicsSimulator(st, 'IBMUSER')
+    out = cics.execute('GMVB LOGN IBMUSER~SYS1')
+    assert 'MENU - MAIN MENU' in out
+
+
+def test_tso_ftp_client_put_and_get_roundtrip(tmp_path):
+    st = make_state(tmp_path)
+    st.datasets.write('IBMUSER', 'IBMUSER.TESTSRC', 'HELLO FTP')
+    sent = []
+    app = TsoFtpClientApp(st, 'IBMUSER', '127.0.0.1', st.config.ftp_port)
+    driver = FakeLineDriver(['IBMUSER', 'SYS1', 'PUT TESTSRC REMOTE1', 'GET REMOTE1 TESTDST', 'QUIT'])
+    app.run(driver, sent.append)
+    assert st.datasets.read('IBMUSER', 'IBMUSER.TESTDST') == 'HELLO FTP'
+    rendered = ''.join(sent)
+    assert '230 IBMUSER logged in.' in rendered
+    assert 'PUT successful' in rendered
+    assert 'GET successful' in rendered
+
+
+def test_interactive_editor_tab_to_line_command_and_insert(tmp_path):
+    saved = []
+    editor = InteractiveEditor('IBMUSER.TEST', 'LINE1\nLINE2', save_callback=saved.append)
+    driver = FakeKeyDriver(['TAB', 'TAB', 'I', 'ENTER'])
+    editor.run(driver, lambda _text: None)
+    assert editor.lines[0] == ''
+    assert editor.lines[1] == 'LINE1'

@@ -1,0 +1,23 @@
+---------------------------------------- TSO/E LOGON ----------------------------------------
+
+Enter LOGON parameters below:                              RACF LOGON parameters:
+
+Userid     ===> xxxxxxx
+
+Password   ===>
+
+Procedure  ===> DBSPROCC                         New Password ===>
+
+Acct Nmbr  ===> ACCT#                            Group Ident  ===>
+
+Size       ===> 2096128
+
+Perform    ===>
+
+Command    ===> ispf
+
+Enter an 'S' before each option desired below:
+        -Nomail              -Nonotice          S -Reconnect            -OIDCard
+
+PF1/PF13 ==> Help    PF3/PF15 ==> Logoff    PA1 ==> Attention    PA2 ==> Reshow
+You may request specific help information by entering a '?' in any entry field

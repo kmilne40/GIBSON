@@ -1,0 +1,23 @@
+ STATUS:  ENTER ONE OF THE FOLLOWING
+
+ABend        DEFine       FREE         POP          RETUrn       SUspend    
+ACquire      DELAy        FREEMain     POSt         REWInd       SYncpoint  
+ADD          DELETE       GDs          PURge        REWRite      TEst       
+ADDRess      DELETEQ      GET          PUSh         ROute        TRACe      
+ALlocate     DEQ          GETMain      PUT          RUn          TRANsform  
+ASKtime      DISAble      GETNext      Query        SENd         UNlock     
+ASSign       DISCard      Handle       READ         SET          UPdate     
+BIf          DOcument     IGnore       READNext     SIGNAl       Verify     
+BUild        DUmp         INQuire      READPrev     SIGNOFf      WAIT       
+CAncel       ENAble       INVoke       READQ        SIGNON       WAITCics   
+CHAnge       ENDBR        ISsue        RECeive      SOapfault    WEb        
+CHEck        ENDBROwse    Journal      RELease      SPOOLClose   WRITE      
+COLlect      ENQ          LInk         REMove       SPOOLOpen    WRITEQ     
+CONNect      ENTer        LOad         RESET        SPOOLRead    WSAContext 
+CONVERSe     EXtract      MONitor      RESETBr      SPOOLWrite   WSAEpr     
+CONVERTtime  FEpi         MOVe         RESUme       START        Xctl       
+CReate       FORCe        PErform      RESYnc       STARTBR     
+CSd          FORMattime   POInt        RETRieve     STARTBROwse 
+
+
+PF 1 HELP 2 HEX 3 END 4 EIB 5 VAR 6 USER             9 MSG

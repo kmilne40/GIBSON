@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from gibson.apps.master_console import MasterConsoleController
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+
+
+def _post(st, path, data=None):
+    code, payload = handle_ui8999(st, path, method="POST", data=data or {}, query={})
+    assert code < 500, payload
+    assert payload["ok"], payload
+    return payload["data"]
+
+
+def _start_acct(st, sid="HX"):
+    _post(st, "/api/v1/ui8999/terminal/start", {"sid": sid})
+    _post(st, "/api/v1/ui8999/terminal/logon", {"sid": sid, "userid": "GUEST", "password": "GUEST"})
+    return _post(st, f"/api/v1/ui8999/terminal/session/{sid}/command", {"sid": sid, "command": "ACCT"})
+
+
+def _field(data, name):
+    return next(f for f in data["screen"]["fields"] if f["id"] == name)
+
+
+def test_hack_fields_off_hides_hidden_and_protects_db_fields():
+    st = GibsonState.create()
+    data = _start_acct(st, "HXOFF")
+    assert data["hack3270"]["enabled"] is False
+    assert all(not data["hack3270"].get(k) for k in ["hidden_fields_revealed", "disable_protection", "numeric_bypass", "modify_field", "start_field", "start_field_extended", "high_visibility"])
+    assert not any(f["id"] == "SQLTRACE" for f in data["screen"]["fields"])
+    balance = _field(data, "balance")
+    assert balance["protected"] is True
+    assert balance["editableNormal"] is False
+    assert balance["numericOnly"] is True
+
+
+def test_hack_fields_on_reveals_hidden_and_enables_attributes():
+    st = GibsonState.create()
+    _start_acct(st, "HXON")
+    data = _post(st, "/api/v1/ui8999/hack3270/session/HXON/toggle", {"sid": "HXON", "action": "on"})
+    for k in ["enabled", "hidden_fields_revealed", "disable_protection", "numeric_bypass", "modify_field", "start_field", "start_field_extended", "high_visibility"]:
+        assert data["hack3270"][k] is True
+    assert any(f["id"] == "SQLTRACE" for f in data["screen"]["fields"])
+    assert _field(data, "balance")["editableWhenHack"] is True
+
+
+def test_field_inject_and_batch_bruteforce_rejected_when_hack_off():
+    st = GibsonState.create()
+    _start_acct(st, "HXREJ")
+    data = _post(st, "/api/v1/ui8999/hack3270/session/HXREJ/field-inject", {"sid": "HXREJ", "field": "AUTHFLAG", "value": "Y"})
+    assert "REJECTED" in " ".join(data["messages"])
+    data = _post(st, "/api/v1/ui8999/hack3270/session/HXREJ/batch-pin-bruteforce", {"sid": "HXREJ", "pins": ["1337"]})
+    assert "BRUTE FORCE REJECTED" in " ".join(data["messages"])
+    assert data["screen"]["name"] == "ACCT"
+
+
+def test_field_inject_and_batch_bruteforce_terminal_output_when_hack_on():
+    st = GibsonState.create()
+    _start_acct(st, "HXACC")
+    _post(st, "/api/v1/ui8999/hack3270/session/HXACC/toggle", {"sid": "HXACC", "action": "on"})
+    data = _post(st, "/api/v1/ui8999/hack3270/session/HXACC/field-inject", {"sid": "HXACC", "field": "AUTHFLAG", "value": "Y"})
+    assert data["result"] == "INJECTED"
+    assert "FIELD AUTHFLAG" in " ".join(data["messages"])
+    data = _post(st, "/api/v1/ui8999/hack3270/session/HXACC/batch-pin-bruteforce", {"sid": "HXACC", "pins": ["0000", "1337"]})
+    assert data["found"] == "1337"
+    assert data["screen"]["name"] == "BATCH"
+    assert any("BATCH" in r["text"] for r in data["screen"]["rows"])
+
+
+def test_sqltrace_overtype_rejected_when_off_and_controlled_sqli_when_on():
+    st = GibsonState.create()
+    _start_acct(st, "HXSQL")
+    data = _post(st, "/api/v1/ui8999/terminal/session/HXSQL/command", {
+        "sid": "HXSQL", "current_screen": "ACCT", "command": "", "fields": {"SQLTRACE": "SELECT * FROM GMVB.ACCOUNT WHERE '1'='1"}
+    })
+    assert "REJECTED" in " ".join(data["messages"]) or any("REJECTED" in r["text"] for r in data["screen"]["rows"])
+    _post(st, "/api/v1/ui8999/hack3270/session/HXSQL/toggle", {"sid": "HXSQL", "action": "on"})
+    data = _post(st, "/api/v1/ui8999/terminal/session/HXSQL/command", {
+        "sid": "HXSQL", "current_screen": "ACCT", "command": "", "fields": {"SQLTRACE": "SELECT * FROM GMVB.ACCOUNT WHERE '1'='1"}
+    })
+    text = " ".join([*data["messages"], *[r["text"] for r in data["screen"]["rows"]]])
+    assert "CONTROLLED SQLI" in text
+    assert data["screen"]["name"] == "ACCT"
+
+
+def test_api_leakage_output_rendered_inside_terminal():
+    st = GibsonState.create()
+    _post(st, "/api/v1/ui8999/terminal/start", {"sid": "HXAPI"})
+    data = _post(st, "/api/v1/ui8999/api-menu/unsafe-query", {"sid": "HXAPI", "input": "' OR '1'='1"})
+    assert data["vulnerable"] is True
+    assert data["screen"]["name"] == "APIM"
+    assert "DATA LEAKAGE" in " ".join(data["messages"])
+
+
+def _ipl_controller(root: Path, configured_pin: str | None = None):
+    cfg = GibsonConfig(sim_root=root, files_root=root / "f", commands_dir=root / "f" / "commands", gacf_path=root / "GACF.DB")
+    cfg.ensure()
+    cfg.gacf_path.write_text("IBMUSER:SYS1:SPECIAL:OMVS\n", encoding="utf-8")
+    st = GibsonState.create(cfg)
+    if configured_pin:
+        st.set_mfa_pin(configured_pin, "TEST")
+    ctl = MasterConsoleController(st, "IBMUSER")
+    assert "R 02" in ctl.execute("R 01,CLPA").text
+    assert "R 03" in ctl.execute("R 02,U").text
+    out = ctl.execute("R 03,Y").text
+    assert "R 04" in out
+    assert "MFA PIN" in out
+    return st, ctl
+
+
+def test_manual_r_04_pin_accepted_after_r_03_y(tmp_path):
+    st, ctl = _ipl_controller(tmp_path / "default")
+    out = ctl.execute("R 04,1234").text
+    assert "MFA PIN ACCEPTED" in out
+    assert st.mfa_pin_set()
+
+
+def test_manual_r_04_configured_pin_required_after_r_03_y(tmp_path):
+    st, ctl = _ipl_controller(tmp_path / "configured", configured_pin="5678")
+    wrong = ctl.execute("R 04,1234").text
+    assert "MFA PIN REJECTED" in wrong
+    ok = ctl.execute("REPLY 04,5678").text
+    assert "MFA PIN ACCEPTED" in ok
+
+
+def test_r_04_before_r_03_y_rejected(tmp_path):
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path / "f", commands_dir=tmp_path / "f" / "commands", gacf_path=tmp_path / "GACF.DB")
+    cfg.ensure()
+    cfg.gacf_path.write_text("IBMUSER:SYS1:SPECIAL:OMVS\n", encoding="utf-8")
+    ctl = MasterConsoleController(GibsonState.create(cfg), "IBMUSER")
+    assert "REPLY ID 04 NOT FOUND" in ctl.execute("R 04,1234").text

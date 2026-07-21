@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+SCENARIOS = [
+ {"attack_id":"MF-TTP01","mitre_attack_id":"T1592","tactic":"Reconnaissance","description":"OSINT and mainframe footprinting","expected_smf_records":["119"],"zsecure_views":["ZSEC NETWORK","ZSEC M4M"],"forensic_questions":["Which source touched TN3270/FTP?","Was authentication attempted?"],"investigation_steps":["Review SMF119 connection records","Correlate CTI/geolocation telemetry"]},
+ {"attack_id":"MF-TTP02","mitre_attack_id":"T1566.002","tactic":"Initial Access","description":"Phishing path to users with mainframe reach","expected_smf_records":["80","119"],"zsecure_views":["ZSEC SMF80","ZSEC NETWORK"],"forensic_questions":["Was the source unusual?","Was MFA satisfied?"],"investigation_steps":["Review SMF80 logon records","Review SMF119 source path"]},
+ {"attack_id":"MF-TTP03","mitre_attack_id":"T1557.003","tactic":"Credential Access","description":"Adversary-in-the-middle against TN3270/FTP paths","expected_smf_records":["80","119"],"zsecure_views":["ZSEC NETWORK","ZSEC PASSTICKET"],"forensic_questions":["Did APPL/source change?","Were PassTickets evaluated?"],"investigation_steps":["Review TN3270/FTP SMF119 records","Review SMF80 failures"]},
+ {"attack_id":"MF-TTP04","mitre_attack_id":"T1106","tactic":"Execution","description":"CICS to JES internal reader abuse","expected_smf_records":["110","30","80"],"zsecure_views":["ZSEC CICS","ZSEC JES"],"forensic_questions":["Which transaction submitted JES work?"],"investigation_steps":["Review SMF110 transaction","Review SMF30 job and SURROGAT/JESSPOOL SMF80"]},
+ {"attack_id":"MF-TTP05","mitre_attack_id":"T1068","tactic":"Privilege Escalation","description":"Writable APF-authorized library escalation","expected_smf_records":["80","30"],"zsecure_views":["ZSEC APF","ZSEC SMF80"],"forensic_questions":["Who updated APF library?"],"investigation_steps":["Review DATASET UPDATE SMF80","Review SETPROG/APF and job execution"]},
+ {"attack_id":"MF-TTP06","mitre_attack_id":"T1005","tactic":"Collection","description":"RACF/Db2/dataset collection","expected_smf_records":["80","101","102","92"],"zsecure_views":["ZSEC DB2","ZSEC USS"],"forensic_questions":["What data was read?"],"investigation_steps":["Review dataset access SMF80","Review Db2 SMF101/102 and USS SMF92"]},
+ {"attack_id":"MF-TTP07","mitre_attack_id":"T1567","tactic":"Exfiltration","description":"Exfiltration of PII/card data","expected_smf_records":["101","102","119","123"],"zsecure_views":["ZSEC DB2","ZSEC NETWORK"],"forensic_questions":["Was bulk data returned outbound?"],"investigation_steps":["Review Db2 row counts","Review SMF119/123 volume and destination"]},
+ {"attack_id":"MF-TTP08","mitre_attack_id":"T1110.002","tactic":"Credential Access","description":"Offline RACF hash cracking","expected_smf_records":["80","30","92"],"zsecure_views":["ZSEC RACF","ZSEC USS"],"forensic_questions":["Was RACF DB or IRRDBU00 output accessed?"],"investigation_steps":["Review SMF80 RACF dataset access","Review dump job SMF30 and file SMF92"]},
+ {"attack_id":"MF-TTP09","mitre_attack_id":"T1070","tactic":"Defense Evasion","description":"JES/SDSF/SYSOUT footprint reduction","expected_smf_records":["30","80"],"zsecure_views":["ZSEC JES","ZSEC SMF80"],"forensic_questions":["Who purged or modified SYSOUT?"],"investigation_steps":["Review JESSPOOL SMF80","Review JES job records"]},
+ {"attack_id":"MF-TTP10","mitre_attack_id":"T1486","tactic":"Impact","description":"Dataset encryption impact scenario","expected_smf_records":["80","30","92","ICSF"],"zsecure_views":["ZSEC ICSF","ZSEC SMF80"],"forensic_questions":["What datasets changed and what keys refreshed?"],"investigation_steps":["Review dataset update SMF80","Review ICSF key refresh and job/process evidence"]},
+]
+
+def scenario_by_id(attack_id: str):
+    a=(attack_id or '').upper()
+    for s in SCENARIOS:
+        if s['attack_id'].upper()==a or s['mitre_attack_id'].upper()==a:
+            return s
+    return None

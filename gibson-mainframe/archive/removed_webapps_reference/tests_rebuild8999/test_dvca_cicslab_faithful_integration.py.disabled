@@ -1,0 +1,56 @@
+from gibson.core.state import GibsonState
+from gibson.apps.fibs_cics_bank import get_fibs_cics_session, reset_fibs_cics_session, authenticate, route_screen, to_response
+from gibson.apps.db2_sim import Db2Simulator
+
+
+def _login(st):
+    sess = reset_fibs_cics_session('PYTEST-DVCA')
+    assert authenticate(st, sess, 'IBMUSER', 'SYS1')
+    return sess
+
+
+def test_dvca_port8999_required_visual_elements_and_flow():
+    st = GibsonState.create(); sess = _login(st)
+    scr = route_screen(st, sess, 'DVCA')
+    text = '\n'.join(scr['lines'])
+    for required in ['hack3270-glbson', 'Hack Field Attributes', 'Inject Info Fields', 'BATCH PIN', 'API Leakage', 'x3270-gibson 127.0.0.1:9999', "Mel's Cargo", 'DAMN VULNERABLE CICS APPLICATION', 'PF5  - Main Menu', 'PA3  - Secret', 'TRANS: DVCA']:
+        assert required in text
+    for cmd, label in [('PF5','MCMM'), ('MCOR','MCOR'), ('MCAD','MCAD'), ('MCHI','MCHI')]:
+        scr = route_screen(st, sess, cmd)
+        assert label in '\n'.join(scr['lines'])
+
+
+def test_dvca_hack3270_controls_pa3_pin_and_db2_events():
+    st = GibsonState.create(); sess = _login(st)
+    route_screen(st, sess, 'DVCA')
+    assert route_screen(st, sess, 'PA3')['name'] == 'MCGM'
+    route_screen(st, sess, 'HACKON')
+    scr = route_screen(st, sess, 'PA3')
+    assert scr['name'] == 'SCRT'
+    route_screen(st, sess, 'PINBRUTE')
+    resp = to_response(st, sess, scr)
+    assert resp['hack3270']['stats']['pins_found'] >= 1
+    rows = Db2Simulator(st).run_sql('SELECT * FROM FIBS.HACK3270_EVENT', 'IBMUSER')
+    assert any('PIN_FOUND' in str(r).upper() or 'SECRET' in str(r).upper() for r in rows)
+
+
+def test_cicslab1_port8999_visual_and_rest_db2():
+    st = GibsonState.create(); sess = _login(st)
+    scr = route_screen(st, sess, 'BLAB')
+    text = '\n'.join(scr['lines'])
+    for required in ['BANKING LAB - CICSLAB1', 'S I G H B E R B A N K', 'APPLID: CICSLAB1', 'USERID', 'PASSWORD', 'LAB GUIDE', 'HACK PANEL', 'TN3270 PACKETS', 'TN3270 EXPLOIT', 'LAB OVERVIEW', 'VULNERABILITY INDEX', 'LAB EXERCISES', 'REMEDIATION GUIDE', 'REST API VULNERABILITY TESTER', 'HACK3270 ON', 'PF12 LAB EXIT']:
+        assert required in text
+    route_screen(st, sess, 'RESTTEST', {'rest_endpoint':'/api/v1/ui8999/api-menu/unsafe-query','rest_payload':"' OR '1'='1"})
+    rows = Db2Simulator(st).run_sql('SELECT * FROM FIBS.API_AUDIT', 'IBMUSER')
+    assert rows
+    assert any('REST' in str(r).upper() or 'SQLI' in str(r).upper() for r in rows)
+
+
+def test_db2_required_event_tables_visible():
+    st = GibsonState.create(); sess = _login(st)
+    route_screen(st, sess, 'DVCA'); route_screen(st, sess, 'BLAB')
+    db2 = Db2Simulator(st)
+    catalog = db2.run_sql("SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES WHERE CREATOR='FIBS'", 'IBMUSER')
+    text = str(catalog).upper()
+    for t in ['HACK3270_EVENT','TN3270_CAPTURE','API_AUDIT','AUDITLOG']:
+        assert t in text

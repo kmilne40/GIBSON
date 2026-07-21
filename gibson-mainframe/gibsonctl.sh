@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+# Gibson service controller v3
+# Stops/starts/restarts Gibson package and legacy standalone services.
+# Designed for Linux/Kali. Uses PID files, process groups, port owners, fuser/lsof/ss fallbacks.
+
+set -u
+
+ACTION="${1:-status}"
+shift || true
+
+PROJECT_ROOT="${GIBSON_PROJECT_ROOT:-$(pwd)}"
+PID_DIR="${GIBSON_PID_DIR:-$PROJECT_ROOT/.gibson-pids}"
+LOG_DIR="${GIBSON_LOG_DIR:-$PROJECT_ROOT/logs}"
+DEFAULT_PYTHON="python3"
+if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+  DEFAULT_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+fi
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
+MODULE_CMD="${GIBSON_MODULE_CMD:-gibson.cli}"
+
+# setsid ships with Linux util-linux but not with macOS. On Darwin, prefer
+# Homebrew's keg-only util-linux (not symlinked onto PATH) if present.
+SETSID_BIN="setsid"
+if ! command -v setsid >/dev/null 2>&1; then
+  if [[ -x "/opt/homebrew/opt/util-linux/bin/setsid" ]]; then
+    SETSID_BIN="/opt/homebrew/opt/util-linux/bin/setsid"
+  elif [[ -x "/usr/local/opt/util-linux/bin/setsid" ]]; then
+    SETSID_BIN="/usr/local/opt/util-linux/bin/setsid"
+  fi
+fi
+
+# Default Gibson ports: TSO/Telnet, USS, FTP, dashboard, DB2 TCP, DB2 WS
+PORTS=(1023 2022 2023 2111 8080 8081 8443 50000 50001)
+PATTERNS=(
+  "python.*-m[[:space:]]+gibson\.cli"
+)
+LEGACY_PATTERNS=(
+  "python.*gibson-new\.py"
+  "python.*gibftp033\.py"
+  "python.*DB2\.py"
+  "python.*zos_rest_gateway\.py"
+  "python.*vuln_gateway\.py"
+  "python.*CICS\.py"
+  "python.*pyspf_tui\.py"
+  "python.*gibftpmulti\.py"
+)
+
+WITH_LEGACY=0
+FORCE=0
+DRY_RUN=0
+DETACH=0
+MASTER_LAUNCH="auto"
+MASTER_MODE="curses"
+MASTER_ARGS=()
+if [[ -f "$PROJECT_ROOT/.gibson-install.conf" ]]; then
+  # shellcheck source=/dev/null
+  . "$PROJECT_ROOT/.gibson-install.conf"
+fi
+WEB_TERMINAL=${GIBSON_WEB_TERMINAL:-1}
+WEB_TERMINAL_PORT=${GIBSON_WEB_TERMINAL_PORT:-8023}
+# The IPL MFA PIN is defined during the pre-service IPL sequence.  In an
+# interactive console the operator is prompted.  In non-interactive starts,
+# default to the simulator training PIN unless overridden.
+IPL_MFA_PIN=${GIBSON_IPL_MFA_PIN:-}
+AUTO_IPL_MFA_PIN=${GIBSON_AUTO_IPL_MFA_PIN:-1234}
+START_ARGS=("--serve" "--with-ftp" "--with-app8080" "--with-cbsa-api" "--with-dvca" "--with-dvca-web" "--with-fibs-web")
+MODE_ARG=""
+
+remove_start_arg_pair() {
+  local key="$1"
+  local takes_value="${2:-0}"
+  local filtered=()
+  local skip_next=0
+  local arg
+  for arg in "${START_ARGS[@]}"; do
+    if [[ "$skip_next" -eq 1 ]]; then
+      skip_next=0
+      continue
+    fi
+    if [[ "$arg" == "$key" ]]; then
+      if [[ "$takes_value" -eq 1 ]]; then skip_next=1; fi
+      continue
+    fi
+    filtered+=("$arg")
+  done
+  START_ARGS=("${filtered[@]}")
+}
+
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --legacy) WITH_LEGACY=1 ;;
+    --force|-f) FORCE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --detach) DETACH=1 ; MASTER_LAUNCH="none" ;;
+    --no-master) MASTER_LAUNCH="none" ;;
+    --master) MASTER_LAUNCH="curses" ; MASTER_MODE="curses" ;;
+    --master-plain) MASTER_LAUNCH="plain" ; MASTER_MODE="plain" ; MASTER_ARGS+=("--plain") ;;
+    --master-curses) MASTER_LAUNCH="curses" ; MASTER_MODE="curses" ; MASTER_ARGS+=("--curses") ;;
+    --plain) MASTER_MODE="plain" ; MASTER_ARGS+=("--plain") ;;
+    --curses) MASTER_MODE="curses" ; MASTER_ARGS+=("--curses") ;;
+    --no-color) MASTER_ARGS+=("--no-color") ;;
+    --demo-events) MASTER_ARGS+=("--demo-events") ;;
+    --poll-interval) shift; MASTER_ARGS+=("--poll-interval" "$1") ;;
+    --secure)
+      if [[ "$MODE_ARG" == "--vuln" ]]; then
+        printf '%s\n' "GIBSON SECURITY MODE ERROR: --secure and --vuln are mutually exclusive"
+        exit 2
+      fi
+      MODE_ARG="--secure"
+      ;;
+    --vuln)
+      if [[ "$MODE_ARG" == "--secure" ]]; then
+        printf '%s\n' "GIBSON SECURITY MODE ERROR: --secure and --vuln are mutually exclusive"
+        exit 2
+      fi
+      MODE_ARG="--vuln"
+      ;;
+    --help|-h) ACTION="help" ;;
+    --port) shift; PORTS+=("$1") ;;
+    --no-ftp) START_ARGS=("--serve") ;;
+    --serve-only) START_ARGS=("--serve") ;;
+    --no-web-terminal) WEB_TERMINAL=0 ;;
+    --with-web-terminal) WEB_TERMINAL=1 ;;
+    --web-terminal-port) shift; WEB_TERMINAL_PORT="$1" ;;
+    --ipl-mfa-pin) shift; IPL_MFA_PIN="$1" ;;
+    --no-ipl-mfa-default) AUTO_IPL_MFA_PIN="" ;;
+    --) shift; START_ARGS+=("$@"); break ;;
+    *) START_ARGS+=("$1") ;;
+  esac
+  shift || true
+done
+
+if [[ "$WEB_TERMINAL" == "1" || "$WEB_TERMINAL" == "true" || "$WEB_TERMINAL" == "TRUE" ]]; then
+  # v30.289: browser terminal is managed as an external Guacamole sidecar.
+  # Do not pass --with-web-terminal to gibson.cli because that starts the retired custom web terminal.
+  PORTS+=("$WEB_TERMINAL_PORT")
+fi
+
+if [[ -n "$MODE_ARG" ]]; then
+  START_ARGS+=("$MODE_ARG")
+else
+  START_ARGS+=("--vuln")
+fi
+
+
+mkdir -p "$PID_DIR" "$LOG_DIR"
+MAIN_PID="$PID_DIR/gibson.pid"
+LOG_FILE="$LOG_DIR/gibson.log"
+WEB_HELPER="$PROJECT_ROOT/web-terminal/bin/gibson-web-terminal.sh"
+
+say() { printf '%s\n' "$*"; }
+run_cmd() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    say "DRY-RUN: $*"
+  else
+    "$@" 2>/dev/null || true
+  fi
+}
+
+web_enabled() { [[ "$WEB_TERMINAL" == "1" || "$WEB_TERMINAL" == "true" || "$WEB_TERMINAL" == "TRUE" ]]; }
+web_helper() {
+  if [[ -x "$WEB_HELPER" ]]; then
+    GIBSON_WEB_TERMINAL_PORT="$WEB_TERMINAL_PORT" GIBSON_TELNET_PORT="${GIBSON_TELNET_PORT:-2023}" "$WEB_HELPER" "$@"
+  else
+    say "Browser terminal helper not found: $WEB_HELPER"
+  fi
+}
+
+is_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+kill_pid_tree() {
+  local pid="$1"
+  [[ -z "$pid" ]] && return 0
+  if ! is_alive "$pid"; then return 0; fi
+
+  say "Stopping PID $pid"
+  # Try whole process group first. Works when started through setsid.
+  local pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  if [[ -n "$pgid" ]]; then
+    run_cmd kill -TERM "-$pgid"
+  fi
+  run_cmd pkill -TERM -P "$pid"
+  run_cmd kill -TERM "$pid"
+  sleep 1
+
+  if is_alive "$pid" || { [[ -n "$pgid" ]] && pgrep -g "$pgid" >/dev/null 2>&1; }; then
+    if [[ "$FORCE" -eq 1 ]]; then
+      say "Force killing PID/process group $pid"
+      [[ -n "$pgid" ]] && run_cmd kill -KILL "-$pgid"
+      run_cmd pkill -KILL -P "$pid"
+      run_cmd kill -KILL "$pid"
+    else
+      say "PID $pid still alive. Re-run with --force if needed."
+    fi
+  fi
+}
+
+pids_for_port() {
+  local port="$1"
+  local found=""
+
+  if command -v ss >/dev/null 2>&1; then
+    found+=" $(ss -ltnp "sport = :$port" 2>/dev/null | sed -nE 's/.*pid=([0-9]+).*/\1/p')"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    found+=" $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null)"
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    found+=" $(fuser "$port"/tcp 2>/dev/null)"
+  fi
+
+  echo "$found" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u
+}
+
+stop_ports() {
+  local port pid
+  for port in "${PORTS[@]}"; do
+    mapfile -t pids < <(pids_for_port "$port")
+    if [[ "${#pids[@]}" -gt 0 ]]; then
+      say "Port $port is held by PID(s): ${pids[*]}"
+      for pid in "${pids[@]}"; do
+        kill_pid_tree "$pid"
+      done
+      # Final fuser fallback, especially useful with inherited children.
+      if [[ "$FORCE" -eq 1 ]] && command -v fuser >/dev/null 2>&1; then
+        run_cmd fuser -k "$port"/tcp
+      fi
+    fi
+  done
+}
+
+stop_patterns() {
+  local patterns=("${PATTERNS[@]}")
+  if [[ "$WITH_LEGACY" -eq 1 ]]; then
+    patterns+=("${LEGACY_PATTERNS[@]}")
+  fi
+  local pat pids pid self self_pgid pid_pgid
+  self="$$"
+  self_pgid="$(ps -o pgid= -p "$self" 2>/dev/null | tr -d ' ')"
+  for pat in "${patterns[@]}"; do
+    mapfile -t pids < <(pgrep -af "$pat" 2>/dev/null | awk '{print $1}' | sort -u)
+    if [[ "${#pids[@]}" -gt 0 ]]; then
+      local targets=()
+      for pid in "${pids[@]}"; do
+        [[ "$pid" == "$self" || "$pid" == "$PPID" ]] && continue
+        pid_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        # Do not kill the shell/script currently running gibsonctl.  This
+        # matters when tests invoke gibsonctl through `bash -lc` and the
+        # command line text itself contains `python3 -m gibson.cli`.
+        if [[ -n "$self_pgid" && "$pid_pgid" == "$self_pgid" ]]; then
+          continue
+        fi
+        targets+=("$pid")
+      done
+      if [[ "${#targets[@]}" -gt 0 ]]; then
+        say "Pattern '$pat' matched PID(s): ${targets[*]}"
+        for pid in "${targets[@]}"; do
+          kill_pid_tree "$pid"
+        done
+      fi
+    fi
+  done
+}
+
+stop_service() {
+  if web_enabled; then
+    web_helper stop || true
+  fi
+  if [[ -f "$MAIN_PID" ]]; then
+    local pid
+    pid="$(cat "$MAIN_PID" 2>/dev/null || true)"
+    if [[ -n "$pid" ]]; then
+      kill_pid_tree "$pid"
+    fi
+    rm -f "$MAIN_PID"
+  fi
+  stop_patterns
+  stop_ports
+}
+
+run_ipl_prestart_if_needed() {
+  if [[ "$MASTER_LAUNCH" == "none" ]]; then
+    return 0
+  fi
+
+  local pin_arg=()
+  if [[ -n "$IPL_MFA_PIN" ]]; then
+    pin_arg=("--ipl-mfa-pin" "$IPL_MFA_PIN")
+    say "Starting Gibson IPL reply sequence before service startup with operator-supplied MFA PIN."
+    ( cd "$PROJECT_ROOT" && "$PYTHON_BIN" -m "$MODULE_CMD" --ipl-prestart-console "${pin_arg[@]}" )
+    return $?
+  fi
+
+  if is_interactive_terminal; then
+    say "Starting Gibson IPL reply sequence before service startup."
+    say "Complete replies such as R 01,CLPA, R 02,U, R 03,Y, then define the MFA PIN with R 04,<pin>."
+    ( cd "$PROJECT_ROOT" && "$PYTHON_BIN" -m "$MODULE_CMD" --ipl-prestart-console )
+    return $?
+  fi
+
+  if [[ -n "$AUTO_IPL_MFA_PIN" ]]; then
+    say "Interactive terminal unavailable; completing IPL MFA prestart with simulator default PIN from GIBSON_AUTO_IPL_MFA_PIN."
+    ( cd "$PROJECT_ROOT" && "$PYTHON_BIN" -m "$MODULE_CMD" --ipl-prestart-console --ipl-mfa-pin "$AUTO_IPL_MFA_PIN" )
+    return $?
+  fi
+
+  say "GIBMCS013W Interactive terminal unavailable and automatic IPL MFA PIN disabled; skipping IPL PIN definition."
+  return 0
+}
+
+start_service() {
+  if [[ -f "$MAIN_PID" ]]; then
+    local pid
+    pid="$(cat "$MAIN_PID" 2>/dev/null || true)"
+    if is_alive "$pid"; then
+      say "Gibson already appears to be running as PID $pid."
+      launch_master_after_start
+      return 0
+    fi
+    rm -f "$MAIN_PID"
+  fi
+
+  # Preflight: do not start if a required Gibson listener port is still held.
+  local check_port blockers
+  for check_port in 2023 2022; do
+    blockers="$(pids_for_port "$check_port" | tr '\n' ' ')"
+    if [[ -n "${blockers// /}" ]]; then
+      say "Cannot start: port $check_port is still in use by PID(s): $blockers"
+      say "Run: $0 stop --force --legacy"
+      return 98
+    fi
+  done
+
+  run_ipl_prestart_if_needed || return $?
+
+  if web_enabled; then
+    say "Guacamole browser terminal sidecar enabled: --with-web-terminal --web-terminal-port $WEB_TERMINAL_PORT"
+    web_helper start || true
+  fi
+
+  say "Starting Gibson services: $PYTHON_BIN -m $MODULE_CMD ${START_ARGS[*]}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    say "DRY-RUN: start skipped"
+    return 0
+  fi
+
+  # Start services in the background so the foreground terminal can be used
+  # by the local operator UI.  The PID file and process group preserve the
+  # existing stop/status control path.
+  ( cd "$PROJECT_ROOT" && "$SETSID_BIN" "$PYTHON_BIN" -m "$MODULE_CMD" "${START_ARGS[@]}" --pid-file "$MAIN_PID" >>"$LOG_FILE" 2>&1 & )
+  local pid=""
+  local waited=0
+  while [[ "$waited" -lt 20 ]]; do
+    pid="$(cat "$MAIN_PID" 2>/dev/null || true)"
+    if is_alive "$pid"; then
+      break
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+
+  if ! is_alive "$pid"; then
+    # Very early releases sometimes brought listeners up before the PID file
+    # was written.  Recover from that race by finding the primary listener.
+    pid="$(pids_for_port "${GIBSON_TELNET_PORT:-2023}" | head -1)"
+    if is_alive "$pid"; then
+      printf '%s' "$pid" > "$MAIN_PID"
+    fi
+  fi
+
+  if is_alive "$pid"; then
+    say "Started Gibson PID $pid"
+    say "Log: $LOG_FILE"
+  else
+    say "Gibson did not stay running. Last log lines:"
+    tail -40 "$LOG_FILE" 2>/dev/null || true
+    return 1
+  fi
+
+  launch_master_after_start
+}
+
+is_interactive_terminal() {
+  [[ -t 0 && -t 1 ]] || return 1
+  local term="${TERM:-}"
+  [[ -n "$term" && "$term" != "dumb" ]] || return 1
+  return 0
+}
+
+launch_master_after_start() {
+  if [[ "$MASTER_LAUNCH" == "none" ]]; then
+    say "GIBSON services are running. Master console suppressed by --no-master/--detach."
+    return 0
+  fi
+  if ! is_interactive_terminal; then
+    say "GIBMCS001W Interactive terminal unavailable; master console not launched."
+    say "GIBSON services remain running. Use ./gibsonctl.sh master from an interactive terminal."
+    return 0
+  fi
+  local args=()
+  case "$MASTER_LAUNCH:$MASTER_MODE" in
+    plain:*|*:plain) args+=("--plain") ;;
+    *) args+=("--curses") ;;
+  esac
+  args+=("${MASTER_ARGS[@]}")
+  say "Opening GIBSON MASTER CONSOLE. Use QUIT, EXIT, F12 or Q to leave."
+  say "GIBSON services will continue running after the console exits."
+  ( cd "$PROJECT_ROOT" && "$PYTHON_BIN" -m "$MODULE_CMD" --master-console "${args[@]}" ) || \
+    say "GIBMCS002W Master console ended or could not start; Gibson services remain running."
+}
+
+
+
+master_console_service() {
+  say "Opening GIBSON MASTER CONSOLE. Use QUIT, EXIT, F12 or Q to leave."
+  cd "$PROJECT_ROOT" || return 1
+  local args=()
+  if [[ "$MASTER_MODE" == "plain" ]]; then
+    args+=("--plain")
+  else
+    args+=("--curses")
+  fi
+  args+=("${MASTER_ARGS[@]}")
+  "$PYTHON_BIN" -m "$MODULE_CMD" --master-console "${args[@]}"
+}
+
+status_service() {
+  say "Project root: $PROJECT_ROOT"
+  if [[ -f "$MAIN_PID" ]]; then
+    local pid
+    pid="$(cat "$MAIN_PID" 2>/dev/null || true)"
+    if is_alive "$pid"; then say "Package PID: $pid running"; else say "Package PID file exists but PID $pid is not running"; fi
+  else
+    say "Package PID: none"
+  fi
+  say ""
+  say "Listening ports:"
+  local port pids
+  for port in "${PORTS[@]}"; do
+    pids="$(pids_for_port "$port" | tr '\n' ' ')"
+    if [[ -n "${pids// /}" ]]; then
+      say "  $port -> $pids"
+      ps -fp $pids 2>/dev/null || true
+    else
+      say "  $port -> free"
+    fi
+  done
+  say ""
+  if web_enabled; then
+    web_helper status || true
+    say ""
+  fi
+  say "Matching Gibson processes:"
+  pgrep -af 'gibson|gibftp|zos_rest_gateway|vuln_gateway|DB2\.py|CICS\.py|pyspf' 2>/dev/null || say "  none"
+}
+
+case "$ACTION" in
+  start) start_service ;;
+  stop) stop_service ;;
+  restart) stop_service; sleep 1; start_service ;;
+  master) master_console_service ;;
+  status) status_service ;;
+  web-status) web_helper status ;;
+  web-logs) web_helper logs ;;
+  web-restart) web_helper restart ;;
+  web-clean) web_helper web-clean ;;
+  web-enable) web_helper web-enable ;;
+  web-disable) web_helper web-disable ;;
+  preflight) web_helper preflight ;;
+  install-deps|install-docker) web_helper install-deps ;;
+  ports) for p in "${PORTS[@]}"; do echo "$p: $(pids_for_port "$p" | tr '
+' ' ')"; done ;;
+  help|--help|-h)
+    cat <<USAGE
+Usage: $0 {start|stop|restart|master|status|ports|web-status|web-logs|web-restart|web-clean|web-enable|web-disable|preflight|install-deps|install-docker} [options]
+
+Examples:
+  $0 start --vuln
+  $0 start --secure
+  $0 start --no-master
+  $0 start --master-plain
+  $0 start --ipl-mfa-pin 5678
+  $0 master --curses
+  $0 master --plain
+  $0 start --secure --dry-run
+  $0 start -- --serve --secure
+
+Options:
+  --secure      Start the CIS-aligned secure simulator profile (TSO/TN3270 1023, HTTPS 8443).
+  --vuln        Start the vulnerable/classroom training profile (default, selector 2023).
+  --legacy      Also stop original standalone scripts: gibson-new.py, gibftp033.py, DB2.py, gateways, etc.
+  --force, -f   Escalate from TERM to KILL and use fuser -k on occupied ports.
+  --dry-run     Show actions without running them.
+  --port N      Also manage an extra TCP port.
+  --no-ftp      Start package without FTP.
+  --no-rest     Start package without REST.
+  --serve-only  Start only telnet/TSO service.
+  --no-web-terminal Disable browser terminal on start.
+  --with-web-terminal Enable Guacamole browser terminal sidecar on start (disabled by default).
+  --web-terminal-port N Browser terminal port (default 8023).
+  --ipl-mfa-pin NNNN Define the simulator IPL MFA PIN during prestart.
+  --no-ipl-mfa-default Disable non-interactive default PIN fallback.
+  --detach      Start services in background and suppress automatic master console.
+  --no-master   Start services only; do not open the master console.
+  --master      Start services then open the curses master console.
+  --master-plain Start services then open the plain master console.
+  --master-curses Start services then open the curses master console.
+  --plain       With master: use plain text master console.
+  --curses      With master: force enhanced curses console when available.
+  --no-color    With start/master: disable enhanced console colours.
+  --demo-events With start/master: generate demonstration console events.
+  --curses      With master: force enhanced curses console when available.
+  --no-color    With master: disable enhanced console colours.
+  --demo-events With master: generate demonstration console events.
+  --            Pass following args directly to python -m gibson.cli.
+
+Mode notes:
+  --vuln is the default compatibility mode.
+  --secure and --vuln are mutually exclusive and fail closed if both are supplied.
+  gibsonctl forwards the selected mode to python -m gibson.cli.
+USAGE
+    exit 0
+    ;;
+  *)
+    cat <<USAGE
+Usage: $0 {start|stop|restart|master|status|ports|web-status|web-logs|web-restart|web-clean|web-enable|web-disable|preflight|install-deps|install-docker} [options]
+
+Examples:
+  $0 start --vuln
+  $0 start --secure
+  $0 start --no-master
+  $0 start --master-plain
+  $0 start --ipl-mfa-pin 5678
+  $0 master --curses
+  $0 master --plain
+  $0 start --secure --dry-run
+  $0 start -- --serve --secure
+
+Options:
+  --secure      Start the CIS-aligned secure simulator profile (TSO/TN3270 1023, HTTPS 8443).
+  --vuln        Start the vulnerable/classroom training profile (default, selector 2023).
+  --legacy      Also stop original standalone scripts: gibson-new.py, gibftp033.py, DB2.py, gateways, etc.
+  --force, -f   Escalate from TERM to KILL and use fuser -k on occupied ports.
+  --dry-run     Show actions without running them.
+  --port N      Also manage an extra TCP port.
+  --no-ftp      Start package without FTP.
+  --no-rest     Start package without REST.
+  --serve-only  Start only telnet/TSO service.
+  --no-web-terminal Disable browser terminal on start.
+  --with-web-terminal Enable Guacamole browser terminal sidecar on start (disabled by default).
+  --web-terminal-port N Browser terminal port (default 8023).
+  --ipl-mfa-pin NNNN Define the simulator IPL MFA PIN during prestart.
+  --no-ipl-mfa-default Disable non-interactive default PIN fallback.
+  --detach      Start services in background and suppress automatic master console.
+  --no-master   Start services only; do not open the master console.
+  --master      Start services then open the curses master console.
+  --master-plain Start services then open the plain master console.
+  --master-curses Start services then open the curses master console.
+  --plain       With master: use plain text master console.
+  --curses      With master: force enhanced curses console when available.
+  --no-color    With start/master: disable enhanced console colours.
+  --demo-events With start/master: generate demonstration console events.
+  --curses      With master: force enhanced curses console when available.
+  --no-color    With master: disable enhanced console colours.
+  --demo-events With master: generate demonstration console events.
+  --            Pass following args directly to python -m gibson.cli.
+
+Mode notes:
+  --vuln is the default compatibility mode.
+  --secure and --vuln are mutually exclusive and fail closed if both are supplied.
+  gibsonctl forwards the selected mode to python -m gibson.cli.
+
+Environment:
+  GIBSON_PROJECT_ROOT=/path/to/gibson_upgrade
+  PYTHON_BIN=python3
+  GIBSON_PID_DIR=.gibson-pids
+  GIBSON_LOG_DIR=logs
+  GIBSON_WEB_TERMINAL=1|0
+  GIBSON_WEB_TERMINAL_PORT=8023
+  GIBSON_IPL_MFA_PIN=NNNN
+  GIBSON_AUTO_IPL_MFA_PIN=1234
+  GIBSON_CONTAINER_RUNTIME=docker|podman
+  GIBSON_GUAC_USER=gibson
+  GIBSON_GUAC_PASSWORD=<generated by default>
+USAGE
+    exit 2
+    ;;
+esac

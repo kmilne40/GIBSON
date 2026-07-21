@@ -1,0 +1,28 @@
+*********************************
+                          * GIBSON PRODUCTION LPAR  *
+                          *********************************
+ ----------------------------------------------------------------------------
+    THIS SYSTEM CONTAINS RESTRICTED INFORMATION FOR AUTHORISED USERS ONLY     
+        THE SYSTEM MAY BE MONITORED, RECORDED, AND IS SUBJECT TO AUDIT        
+       UNAUTHORIZED USE OF THE SYSTEM IS PROHIBITED UNDER SCOTTISH LAW.       
+       USE OF THE SYSTEM INDICATES CONSENT TO MONITORING AND RECORDING.       
+ ----------------------------------------------------------------------------
+
+          ▇▇▇▇▇▇   ▇▇▇▇  ▇▇▇▇▇▇▇    ▇▇▇▇▇▇    ▇▇▇▇▇▇   ▇▇▇    ▇▇▇
+         ▇▇▇▇▇▇▇▇  ▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇▇   ▇▇▇
+         ▇▇▇       ▇▇▇▇  ▇▇▇   ▇▇  ▇▇▇       ▇▇▇  ▇▇▇  ▇▇▇▇▇  ▇▇▇
+         ▇▇▇       ▇▇▇▇  ▇▇▇▇▇▇▇   ▇▇▇▇▇▇▇▇  ▇▇▇  ▇▇▇  ▇▇▇▇▇▇ ▇▇▇
+         ▇▇▇ ▇▇▇▇  ▇▇▇▇  ▇▇▇▇▇▇▇        ▇▇▇  ▇▇▇  ▇▇▇  ▇▇▇ ▇▇▇▇▇▇
+         ▇▇▇   ▇▇  ▇▇▇▇  ▇▇▇   ▇▇       ▇▇▇  ▇▇▇  ▇▇▇  ▇▇▇  ▇▇▇▇▇
+         ▇▇▇▇▇▇▇▇  ▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇▇▇▇▇▇  ▇▇▇   ▇▇▇▇
+          ▇▇▇▇▇▇   ▇▇▇▇  ▇▇▇▇▇▇▇    ▇▇▇▇▇▇    ▇▇▇▇▇▇   ▇▇▇    ▇▇▇
+
+             LU NAME:  LU320                       CLIENT IP: xxx.xxx.xxx.xxx
+
+             SENSE CODE: AC/00                 SERVICE PORT: 2023
+             CLIENT PORT: yyyyy
+             -----------------------------------------------------------------
+
+             GTSOv30.227                  GDb30.227                  GICS v0.30
+LOGON using L TSO, L CICS or L DB2.
+Logon Type:

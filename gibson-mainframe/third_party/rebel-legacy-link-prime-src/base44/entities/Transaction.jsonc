@@ -1,0 +1,55 @@
+{
+  "name": "Transaction",
+  "type": "object",
+  "properties": {
+    "tran_id": {
+      "type": "string",
+      "description": "Auto-generated transaction ID"
+    },
+    "account_number": {
+      "type": "string"
+    },
+    "tran_type": {
+      "type": "string",
+      "enum": [
+        "CR",
+        "DR",
+        "TRF"
+      ],
+      "description": "CR=Credit DR=Debit TRF=Transfer"
+    },
+    "amount": {
+      "type": "number"
+    },
+    "description": {
+      "type": "string"
+    },
+    "reference": {
+      "type": "string"
+    },
+    "to_account": {
+      "type": "string",
+      "description": "Destination account for TRF"
+    },
+    "value_date": {
+      "type": "string"
+    },
+    "post_date": {
+      "type": "string"
+    },
+    "post_time": {
+      "type": "string"
+    },
+    "balance_after": {
+      "type": "number"
+    },
+    "operator_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_number",
+    "tran_type",
+    "amount"
+  ]
+}

@@ -1,0 +1,215 @@
+"""IND$FILE CUT-mode data conversion.
+
+Ported *verbatim* from x3270 ``Common/ft_cut.c`` (Paul Mattes, BSD-3).  The
+emulator and host must agree byte-for-byte on this mapping or the transfer
+corrupts, so the tables below are copied exactly and exercised by a
+round-trip self-test (see ``tests/test_indfile_cut_codec.py``).
+
+Direction terminology follows ft_cut.c (named from the *emulator's* point of
+view):
+
+  * download = host -> workstation  (a TSO ``IND$FILE GET``).  The host encodes
+    file bytes into displayable EBCDIC with :func:`encode_download`; the
+    emulator decodes with ``upload_convert``.  So Gibson (the host) calls
+    :func:`encode_download` for GET.
+  * upload   = workstation -> host  (a TSO ``IND$FILE PUT``).  The emulator
+    encodes with ``download_convert``; the host decodes with
+    :func:`decode_upload`.  So Gibson (the host) calls :func:`decode_upload`
+    for PUT.
+
+Only the binary path is implemented (no ASCII/CRLF remap); binary is the
+correct, lossless mode for arbitrary dataset content and is what Gibson uses.
+"""
+from __future__ import annotations
+
+from typing import List
+
+# --- ft_cut.c conversion tables (verbatim) -------------------------------
+NQ = 4          # number of quadrants
+NE = 77         # number of elements per quadrant
+OTHER_2 = 2     # the "OTHER 2" quadrant (includes NULL)
+XLATE_NULL = 0xC1   # translation of NULL
+
+# alphas[NE + 1]; leading space is element 0.
+ALPHAS = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789%&_()<+,-./:>?"
+assert len(ALPHAS) == NE  # C declares alphas[NE+1]; the +1 is the NUL terminator
+
+# conv[NQ] = { selector, xlate[NE] }
+_SELECTORS = [0x5E, 0x7E, 0x5C, 0x7D]   # ';', '=', '*', "'"
+_XLATE = [
+    # quadrant 0, selector 0x5e ';'
+    [0x40, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xd1, 0xd2,
+     0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6,
+     0xe7, 0xe8, 0xe9, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+     0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0xa2, 0xa3, 0xa4,
+     0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6,
+     0xf7, 0xf8, 0xf9, 0x6c, 0x50, 0x6d, 0x4d, 0x5d, 0x4c, 0x4e, 0x6b, 0x60,
+     0x4b, 0x61, 0x7a, 0x6e, 0x6f],
+    # quadrant 1, selector 0x7e '='
+    [0x20, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b,
+     0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+     0x58, 0x59, 0x5a, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+     0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75,
+     0x76, 0x77, 0x78, 0x79, 0x7a, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+     0x37, 0x38, 0x39, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+     0x2e, 0x2f, 0x3a, 0x3b, 0x3f],
+    # quadrant 2 (OTHER_2), selector 0x5c '*'
+    [0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+     0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+     0x17, 0x18, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x3c, 0x3d, 0x3e, 0x00, 0xfa, 0xfb, 0xfc,
+     0xfd, 0xfe, 0xff, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x1a, 0x1b, 0x1c, 0x1d,
+     0x1e, 0x1f, 0x00, 0x00, 0x00],
+    # quadrant 3, selector 0x7d "'"
+    [0x00, 0xa0, 0xa1, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xe0, 0xe1, 0xaa,
+     0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+     0xb7, 0xb8, 0xb9, 0x80, 0x00, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xc0,
+     0x00, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x00, 0xda, 0xdb, 0xdc,
+     0xdd, 0xde, 0xdf, 0xd0, 0x00, 0x00, 0x21, 0x22, 0x23, 0x24, 0x5b, 0x5c,
+     0x00, 0x5e, 0x5f, 0x00, 0x9c, 0x9d, 0x9e, 0x9f, 0xba, 0xbb, 0xbc, 0xbd,
+     0xbe, 0xbf, 0x9a, 0x9b, 0x00],
+]
+for _q in _XLATE:
+    assert len(_q) == NE
+
+TABLE6 = "abcdefghijklmnopqrstuvwxyz&-.,:+ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+assert len(TABLE6) == 64
+
+# --- EBCDIC<->ASCII for the invariant ALPHAS/selector set ----------------
+# ft_cut.c uses ebc2asc0/asc2ebc0 (its base code page 037 "bracket").  Every
+# character we actually look up (ALPHAS members and the four selectors) is in
+# the invariant subset where cp037 is identical to x3270's base tables, so the
+# Python cp037 codec is an exact stand-in.  We verify that at import (below).
+def _asc2ebc(ch: str) -> int:
+    return ch.encode("cp037")[0]
+
+
+def _ebc2asc(b: int) -> str:
+    return bytes([b]).decode("cp037")
+
+
+# Precompute ASCII char -> alphas index, and EBCDIC-of-alphas tables.
+_ALPHA_INDEX = {c: i for i, c in enumerate(ALPHAS)}
+_ALPHA_EBC = [_asc2ebc(c) for c in ALPHAS]   # asc2ebc0[alphas[ix]]
+
+
+def to6(value: int) -> int:
+    """Encode a 6-bit value as the EBCDIC byte the host/emulator expect
+    (``asc2ebc0[table6[value & 0x3f]]``)."""
+    return _asc2ebc(TABLE6[value & 0x3F])
+
+
+def from6(ebc: int) -> int:
+    """Decode a table6-encoded EBCDIC byte back to its 6-bit value
+    (ft_cut.c ``from6``: ``strchr(table6, ebc2asc0[c])``)."""
+    ch = _ebc2asc(ebc)
+    idx = TABLE6.find(ch)
+    return idx if idx >= 0 else 0
+
+
+class ConversionError(ValueError):
+    """Raised on an un-mappable byte (mirrors ft_cut.c ftCutConversionError)."""
+
+
+# --- encode: file bytes -> displayable EBCDIC (host side of GET) ----------
+def encode_download(data: bytes) -> bytes:
+    """Port of ft_cut.c ``download_convert``/``store_download`` (binary path).
+
+    The quadrant state resets per call (each DATA frame is encoded fresh,
+    matching how the host builds one frame at a time)."""
+    out = bytearray()
+    quadrant = -1
+
+    def store(c: int, q: int) -> int:
+        # returns new quadrant; appends to out
+        nonlocal out
+        if q >= 0:
+            xl = _XLATE[q]
+            try:
+                ix = xl.index(c)
+            except ValueError:
+                ix = -1
+            if ix >= 0:
+                out.append(_ALPHA_EBC[ix])
+                return q
+        oq = q
+        for nq in range(NQ):
+            if nq == oq:
+                continue
+            xl = _XLATE[nq]
+            try:
+                ix = xl.index(c)
+            except ValueError:
+                continue
+            out.append(_SELECTORS[nq])
+            out.append(_ALPHA_EBC[ix])
+            return nq
+        raise ConversionError(f"byte 0x{c:02x} not representable")
+
+    for c in data:
+        if c == 0:
+            if quadrant != OTHER_2:
+                quadrant = OTHER_2
+                out.append(_SELECTORS[OTHER_2])
+            out.append(XLATE_NULL)
+            continue
+        quadrant = store(c, quadrant)
+    return bytes(out)
+
+
+# --- decode: displayable EBCDIC -> file bytes (host side of PUT) ----------
+def decode_upload(buf: bytes) -> bytes:
+    """Port of ft_cut.c ``upload_convert`` (binary path).
+
+    Quadrant state persists across the buffer (the stream carries selector
+    bytes that switch it)."""
+    out = bytearray()
+    quadrant = -1
+    i = 0
+    n = len(buf)
+    while i < n:
+        c = buf[i]
+        i += 1
+        # retry loop (ft_cut.c uses goto retry)
+        while True:
+            if quadrant < 0:
+                # find the quadrant from a selector byte
+                q = -1
+                for qi in range(NQ):
+                    if c == _SELECTORS[qi]:
+                        q = qi
+                        break
+                if q < 0:
+                    raise ConversionError(f"no quadrant selector for 0x{c:02x}")
+                quadrant = q
+                break  # consumed selector; next input byte
+            if c < 0x40 or c > 0xF9:
+                raise ConversionError(f"byte 0x{c:02x} out of range")
+            ch = _ebc2asc(c)
+            ix = _ALPHA_INDEX.get(ch, -1)
+            if ix < 0:
+                quadrant = -1
+                continue  # retry: treat c as a selector
+            if quadrant != OTHER_2 and c != XLATE_NULL and _XLATE[quadrant][ix] == 0:
+                quadrant = -1
+                continue  # retry in another quadrant
+            out.append(_XLATE[quadrant][ix])
+            break
+    return bytes(out)
+
+
+# Import-time sanity: cp037 stand-in must round-trip every ALPHAS char and
+# every selector, and table6 must map cleanly.
+def _self_check() -> None:
+    for c in ALPHAS:
+        assert _ebc2asc(_asc2ebc(c)) == c, c
+    for s in _SELECTORS:
+        # selectors must NOT collide with an ALPHAS member (so decode treats
+        # them as quadrant switches, never as data)
+        assert _ebc2asc(s) not in _ALPHA_INDEX, hex(s)
+    for v in range(64):
+        assert from6(to6(v)) == v, v
+
+
+_self_check()

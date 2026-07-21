@@ -1,0 +1,3 @@
+# SMF MANx / Logstream Test Report
+
+Validated D SMF, D SMF,DS, SMF SWITCH, SMF DUMP MAN(...), SMF RECORDING(LOGSTREAM), and SMF DUMP LOGSTREAM(...).

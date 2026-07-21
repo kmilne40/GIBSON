@@ -1,0 +1,166 @@
+from pathlib import Path
+import socket
+import threading
+
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.services.react8999_api import handle_ui8999
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.services.telnet_server import _Handler as GibsonTelnetHandler
+from socketserver import TCPServer
+
+
+def make_state(tmp_path):
+    cfg = GibsonConfig.from_env()
+    cfg.sim_root = tmp_path / 'sim'
+    cfg.files_root = cfg.sim_root / 'f'
+    cfg.commands_dir = cfg.files_root / 'commands'
+    cfg.transfer_root = cfg.sim_root / 'transfers'
+    cfg.assets_dir = Path('gibson/assets').resolve()
+    cfg.gacf_path = cfg.assets_dir / 'GACF.DB'
+    return GibsonState.create(cfg)
+
+
+def login(state, sid='DVCA1'):
+    code, payload = handle_ui8999(state, '/api/v1/ui8999/fibs/session/logon', 'POST', {
+        'sid': sid, 'userid': 'IBMUSER', 'password': 'SYS1'
+    }, {})
+    assert code == 200
+    assert payload['data']['authenticated'] is True
+    return payload['data']
+
+
+def send(state, cmd, sid='DVCA1', fields=None):
+    code, payload = handle_ui8999(state, f'/api/v1/ui8999/fibs/session/{sid}/input', 'POST', {
+        'sid': sid, 'command': cmd, 'fields': fields or {}
+    }, {})
+    assert code == 200
+    return payload['data']
+
+
+def test_dvca_entry_renders_mels_cargo_hack3270(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    data = send(state, 'DVCA')
+    text = '\n'.join(data['lines'])
+    assert data['screen_name'] == 'MCGM'
+    assert data['dvca']['active'] is True
+    assert data['hack3270']['toolbar'] is True
+    assert 'hack3270-glbson v1.0' in text
+    assert "Mel's Cargo" in text
+    assert 'DAMN VULNERABLE CICS APPLICATION' in text
+    assert 'x3270-gibson 127.0.0.1:9999' in text
+    assert 'TRANS: DVCA' in text
+
+
+def test_dvca_transaction_flow(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    assert send(state, 'DVCA')['screen_name'] == 'MCGM'
+    assert send(state, 'MCMM')['screen_name'] == 'MCMM'
+    assert send(state, 'MCOR')['screen_name'] == 'MCOR'
+    assert send(state, 'MCAD')['screen_name'] == 'MCAD'
+    assert send(state, 'MCHI')['screen_name'] == 'MCHI'
+
+
+def test_hack_controls_pa3_pin_and_db2_events(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    send(state, 'DVCA')
+    data = send(state, 'HACKON')
+    assert data['hack3270']['master'] is True
+    data = send(state, 'HIDDEN')
+    assert data['hack3270']['enable_hidden_fields'] is True
+    data = send(state, 'PROTECT_OFF')
+    assert data['hack3270']['disable_field_protection'] is True
+    data = send(state, 'NUMERIC_OFF')
+    assert data['hack3270']['remove_numeric_only'] is True
+    data = send(state, 'PINBRUTE')
+    assert data['hack3270']['stats']['pins_found'] == 1
+    data = send(state, 'PA3')
+    assert data['screen_name'] == 'SCRT'
+    rows = Db2Simulator(state).run_sql("SELECT * FROM FIBS.HACK3270_EVENT")
+    joined = ' '.join(str(r) for r in rows)
+    assert 'PIN' in joined
+    assert 'PA3' in joined or 'SECRET_SCREEN' in joined
+
+
+def test_api_leak_and_api_audit(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    send(state, 'DVCA')
+    data = send(state, 'APILEAK')
+    assert data['hack3270']['stats']['api_intercepted'] >= 1
+    assert 'API LEAK' in ' '.join(data['messages']).upper()
+    api_rows = Db2Simulator(state).run_sql("SELECT * FROM FIBS.API_AUDIT")
+    assert any('REST_VULN_TEST' in str(r) or 'API' in str(r) for r in api_rows)
+
+
+def test_cicslab1_entry_and_rest_tester(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    data = send(state, 'BLAB')
+    text = '\n'.join(data['lines'])
+    assert data['screen_name'] == 'BLAB'
+    assert data['cicslab1']['active'] is True
+    assert 'BANKING LAB - CICSLAB1' in text
+    assert 'LAB GUIDE' in text
+    assert 'HACK PANEL' in text
+    assert 'TN3270 PACKETS' in text
+    assert 'TN3270 EXPLOIT' in text
+    assert 'VULNERABILITY INDEX' in text
+    assert 'LAB EXERCISES' in text
+    assert 'REMEDIATION GUIDE' in text
+    assert 'REST API VULNERABILITY TESTER' in text
+    data = send(state, 'RESTTEST')
+    assert data['rest_tester']['active'] is True
+    assert Db2Simulator(state).run_sql("SELECT * FROM FIBS.API_AUDIT")
+
+
+def test_db2_audit_visibility_for_dvca_and_blab(tmp_path):
+    state = make_state(tmp_path)
+    login(state)
+    send(state, 'DVCA')
+    send(state, 'HACKON')
+    send(state, 'BLAB')
+    send(state, 'RESTTEST')
+    db = Db2Simulator(state)
+    assert db.run_sql("SELECT * FROM FIBS.HACK3270_EVENT")
+    assert db.run_sql("SELECT * FROM FIBS.API_AUDIT")
+    assert db.run_sql("SELECT * FROM FIBS.TN3270_CAPTURE")
+    audit = db.run_sql("SELECT * FROM FIBS.AUDITLOG WHERE EVENT_TYPE='DVCA'")
+    assert audit
+
+
+def test_vtam_raw_initial_data_stays_nmap_compatible(tmp_path):
+    state = make_state(tmp_path)
+    class H(GibsonTelnetHandler):
+        pass
+    H.state = state
+    class S(TCPServer):
+        allow_reuse_address = True
+    server = S(('127.0.0.1', 0), H)
+    host, port = server.server_address
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    try:
+        with socket.create_connection((host, port), timeout=2) as s:
+            initial = s.recv(2048)
+            try:
+                initial += s.recv(4096)
+            except Exception:
+                pass
+            assert not initial.startswith(b'\xff')
+            assert b'GIBSON' in initial or b'LOGON' in initial or b'L TSO' in initial
+            s.sendall(b'L TSO\r\n')
+            data = b''
+            import time
+            end = time.time() + 2.0
+            while time.time() < end and b'USERID' not in data.upper() and b'ENTER' not in data.upper():
+                try:
+                    data += s.recv(4096)
+                except Exception:
+                    pass
+            assert b'USERID' in data.upper() or b'ENTER' in data.upper()
+    finally:
+        server.shutdown(); server.server_close()

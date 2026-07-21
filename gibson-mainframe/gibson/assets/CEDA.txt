@@ -1,0 +1,24 @@
+  
+  ENTER ONE OF THE FOLLOWING
+
+ ADd         
+ ALter       
+ APpend      
+ CHeck       
+ COpy        
+ DEFine      
+ DELete      
+ DIsplay     
+ Expand      
+ Install     
+ Lock        
+ Move        
+ REMove      
+ REName      
+ UNlock      
+ USerdefine  
+ View        
+
+                                                      SYSID=CICS APPLID=CICS   
+
+ PF 1 HELP       3 END             6 CRSR             9 MSG             12 CNCL

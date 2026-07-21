@@ -1,0 +1,12 @@
+{
+  "attack_id": "MF-TTP08",
+  "mitre_attack_id": "T1110.002",
+  "attack_name": "Offline RACF hash cracking",
+  "tactic": "Credential Access",
+  "description": "Access to SYS1.RACFDS or a backup/copy exposes legacy-DES lab hashes that can be converted with racf2john and cracked with john-sim in vulnerable Gibson training mode.",
+  "expected_smf_records": ["80 DATASET ACCESS SYS1.RACFDS", "30 OMVS PROGRAM RACF2JOHN/JOHN", "92 USS FILE/TOOL ACTIVITY", "119 FTP/TCP EXFILTRATION IF HASH DATASET TRANSFERRED"],
+  "zsecure_views": ["ZSEC RACFDS", "ZSEC OFFLINEHASH", "ZSEC TIMELINE <correlation-id>"],
+  "cti_event_types": ["RACF_DATABASE_READ", "RACF_HASH_EXTRACT", "RACF_HASH_CRACK_ATTEMPT", "RACF_HASH_CRACK_SUCCESS", "RACF_HASH_EXFIL"],
+  "forensic_questions": ["Who accessed SYS1.RACFDS or SYS1.RACFDS.BACKUP?", "Was the access permitted by SPECIAL, explicit PERMIT or warning mode?", "Did racf2john or john execute in OMVS?", "Were hashes written to another dataset?", "Was that dataset transferred over FTP/TCP?"],
+  "investigation_steps": ["Run SMF LIST TYPE(80)", "Run SMF LIST TYPE(30)", "Run SMF LIST TYPE(92)", "Run ZSEC OFFLINEHASH", "Run SMF TIMELINE <correlation-id>"]
+}

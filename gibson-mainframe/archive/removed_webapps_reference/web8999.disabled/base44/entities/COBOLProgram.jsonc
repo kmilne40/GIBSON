@@ -1,0 +1,25 @@
+{
+  "name": "COBOLProgram",
+  "type": "object",
+  "properties": {
+    "program_name": {
+      "type": "string"
+    },
+    "transaction_code": {
+      "type": "string"
+    },
+    "source_code": {
+      "type": "string"
+    },
+    "sql_ddl": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "program_name",
+    "transaction_code"
+  ]
+}

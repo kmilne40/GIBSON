@@ -1,0 +1,606 @@
+"""Additive GMVB banking application upgrade for Gibson.
+
+This module deliberately extends the existing Sighberbank/GMVB lab without
+replacing its legacy APIs.  It keeps Gibson authentication, PassTicket and MFA
+integration in the existing classes and adds richer CICS/REST/Db2 training
+content on top of the shared BankingLabService state.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from typing import Any, Dict, List
+import html
+import json
+import re
+from gibson.apps import gmvb_hack3270
+from gibson.apps.gmvb_service import get_gmvb_service
+
+COBOL_SOURCES: dict[str, str] = {
+    "GMVBMENU": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. GMVBMENU.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  WS-TRANSID        PIC X(4).\n       01  WS-USERID         PIC X(8).\n       PROCEDURE DIVISION.\n           EXEC CICS ASSIGN USERID(WS-USERID) END-EXEC.\n           EXEC CICS RECEIVE MAP('GMVBMNU') END-EXEC.\n           EVALUATE WS-TRANSID\n             WHEN 'CUST' EXEC CICS XCTL PROGRAM('CUSTINQ') END-EXEC\n             WHEN 'ACCT' EXEC CICS XCTL PROGRAM('ACCTINQ') END-EXEC\n             WHEN 'TRAN' EXEC CICS XCTL PROGRAM('TRANPST') END-EXEC\n             WHEN OTHER  EXEC CICS SEND MAP('GMVBMNU') END-EXEC\n           END-EVALUATE.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "CUSTINQ": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. CUSTINQ.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  WS-CUSTOMER-ID    PIC X(32).\n       01  WS-SQL            PIC X(256).\n       EXEC SQL INCLUDE SQLCA END-EXEC.\n       PROCEDURE DIVISION.\n           EXEC CICS RECEIVE MAP('CUSTMAP') INTO(WS-CUSTOMER-ID) END-EXEC.\n      *    TRAINING WEAKNESS: UNSAFE STRING CONCATENATION FOR SQLI LAB.\n           STRING 'SELECT * FROM GMVB.CUSTOMER WHERE CUSTOMER_ID='''\n                  WS-CUSTOMER-ID '''' INTO WS-SQL.\n           EXEC SQL PREPARE S1 FROM :WS-SQL END-EXEC.\n           EXEC SQL EXECUTE S1 END-EXEC.\n           EXEC CICS SEND MAP('CUSTMAP') END-EXEC.\n""",
+    "CUSTUPD": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. CUSTUPD.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  INPUT-BUFFER      PIC X(120).\n       01  CUSTOMER-RECORD.\n           05 CUSTOMER-ID    PIC X(8).\n           05 SURNAME        PIC X(30).\n           05 FORENAME       PIC X(20).\n           05 AUTH-FLAG      PIC X.\n       PROCEDURE DIVISION.\n           EXEC CICS RECEIVE INTO(INPUT-BUFFER) END-EXEC.\n      *    TRAINING WEAKNESS: DIRECT MOVE CAN OVERWRITE ADJACENT FIELDS.\n           MOVE INPUT-BUFFER TO CUSTOMER-RECORD.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "ACCTINQ": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. ACCTINQ.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  WS-ACCOUNT-NO     PIC X(10).\n       EXEC SQL INCLUDE SQLCA END-EXEC.\n       PROCEDURE DIVISION.\n           EXEC CICS RECEIVE MAP('ACCTMAP') INTO(WS-ACCOUNT-NO) END-EXEC.\n           EXEC SQL SELECT BALANCE, STATUS\n              INTO :WS-BALANCE, :WS-STATUS\n              FROM GMVB.ACCOUNT\n              WHERE ACCOUNT_NUMBER = :WS-ACCOUNT-NO\n           END-EXEC.\n           EXEC CICS SEND MAP('ACCTMAP') END-EXEC.\n""",
+    "TRANPST": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TRANPST.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  WS-FROM-ACCT      PIC X(10).\n       01  WS-TO-ACCT        PIC X(10).\n       01  WS-AMOUNT         PIC S9(9)V99 COMP-3.\n       PROCEDURE DIVISION.\n           EXEC CICS RECEIVE MAP('TRANMAP') END-EXEC.\n      *    TRAINING BRANCH: DORMANT/FROZEN CHECK CAN BE DISABLED IN LAB MODE.\n           EXEC SQL UPDATE GMVB.ACCOUNT\n              SET BALANCE = BALANCE - :WS-AMOUNT\n              WHERE ACCOUNT_NUMBER = :WS-FROM-ACCT\n           END-EXEC.\n           EXEC CICS SYNCPOINT END-EXEC.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "BLKPRC": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. BLKPRC.\n       PROCEDURE DIVISION.\n           EXEC CICS START TRANSID('BULK') END-EXEC.\n           DISPLAY 'BATCPST0001 - INITIALISING BATCH STREAM'.\n           DISPLAY 'BATCPST0004 - RECORDS PROCESSED / 0 REJECTED'.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "CARDAUTH": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. CARDAUTH.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01  APP-ID            PIC X(10).\n       01  DECISION          PIC X.\n       PROCEDURE DIVISION.\n           EXEC CICS RECEIVE MAP('CARDMAP') END-EXEC.\n           EVALUATE DECISION\n             WHEN 'A' DISPLAY 'APPLICATION APPROVED'\n             WHEN 'R' DISPLAY 'APPLICATION REFERRED'\n             WHEN 'D' DISPLAY 'APPLICATION DECLINED'\n           END-EVALUATE.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "RESTTST": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. RESTTST.\n       PROCEDURE DIVISION.\n           DISPLAY 'REST API TESTER CALLS GIBSON HTTP ROUTES'.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "TN32CAP": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TN32CAP.\n       PROCEDURE DIVISION.\n           DISPLAY 'STATIC TN3270 PACKET CAPTURE VIEWER'.\n           EXEC CICS RETURN END-EXEC.\n""",
+    "GMVBAUTH": """       IDENTIFICATION DIVISION.\n       PROGRAM-ID. GMVBAUTH.\n       PROCEDURE DIVISION.\n      *    LIVE AUTHENTICATION IS PROVIDED BY GIBSON GACF/RACF,\n      *    PASSTICKET/PTKGEN AND MFA. NO LOCAL PASSWORD TABLE IS USED.\n           EXEC CICS RETURN END-EXEC.\n""",
+}
+
+COPYBOOKS = {
+    "CUSTREC": "01 CUSTREC.\n   05 CUSTOMER-ID PIC X(8).\n   05 SURNAME     PIC X(30).\n   05 FORENAME    PIC X(20).\n   05 DOB         PIC X(8).\n   05 NI-NUMBER   PIC X(9).\n",
+    "ACCTREC": "01 ACCTREC.\n   05 ACCOUNT-NUMBER PIC X(10).\n   05 CUSTOMER-ID    PIC X(8).\n   05 ACCT-TYPE      PIC X(3).\n   05 BALANCE        PIC S9(9)V99 COMP-3.\n",
+    "TRANREC": "01 TRANREC.\n   05 TRAN-ID        PIC X(16).\n   05 ACCOUNT-NUMBER PIC X(10).\n   05 TRAN-TYPE      PIC X(3).\n   05 AMOUNT         PIC S9(9)V99 COMP-3.\n",
+}
+
+CUSTOMERS = {
+    "10000001": {"SURNAME":"HARRISON","FORENAME":"WILLIAM","DOB":"12/04/58","SORTCODE":"204514","NI":"JR574821A","ADDRESS":"14 ELMWOOD AVENUE KENSINGTON LONDON W8 6PP","STATUS":"A","TYPE":"P","OWNER":"JSMITH"},
+    "10000002": {"SURNAME":"THATCHER","FORENAME":"MARGARET","DOB":"07/09/52","SORTCODE":"204514","NI":"AB123456C","ADDRESS":"4 PRIVET DRIVE GRANTHAM LINCOLNSHIRE NG31 6QL","STATUS":"A","TYPE":"P","OWNER":"JSMITH"},
+    "10000003": {"SURNAME":"BLACKWELL","FORENAME":"DOROTHY","DOB":"30/11/45","SORTCODE":"309812","NI":"CD345678E","ADDRESS":"7 BAKER STREET MARYLEBONE LONDON NW1 6XE","STATUS":"A","TYPE":"P","OWNER":"ABROWN"},
+    "10000004": {"SURNAME":"PEMBERTON","FORENAME":"ARTHUR","DOB":"18/06/61","SORTCODE":"204514","NI":"EF567890G","ADDRESS":"22 VICTORIA ROAD LEEDS YORKSHIRE LS1 4AP","STATUS":"A","TYPE":"P","OWNER":"ABROWN"},
+    "10000005": {"SURNAME":"WHITMORE","FORENAME":"PATRICIA","DOB":"05/02/55","SORTCODE":"309812","NI":"GH789012I","ADDRESS":"118 HIGH STREET BIRMINGHAM WEST MIDLANDS B1 1BB","STATUS":"A","TYPE":"P","OWNER":"CJONES"},
+    "10000006": {"SURNAME":"ACME-TRADING-PLC","FORENAME":"ACCOUNTS","DOB":"01/01/75","SORTCODE":"204514","NI":"000000000","ADDRESS":"UNIT 5 INDUSTRIAL EST WOLVERHAMPTON WV1 3AB","STATUS":"A","TYPE":"C","OWNER":"JSMITH"},
+    "10000007": {"SURNAME":"HENDERSON","FORENAME":"GEORGE","DOB":"25/12/48","SORTCODE":"412367","NI":"IJ901234K","ADDRESS":"3 CHURCHGATE CHESTER CHESHIRE CH1 2HQ","STATUS":"A","TYPE":"P","OWNER":"CJONES"},
+    "10000008": {"SURNAME":"MORRISON","FORENAME":"ELEANOR","DOB":"14/03/63","SORTCODE":"412367","NI":"KL123456M","ADDRESS":"9 PARK LANE MANCHESTER M1 4NQ","STATUS":"A","TYPE":"P","OWNER":"ABROWN"},
+    "10000009": {"SURNAME":"FITZGERALD","FORENAME":"BRENDAN","DOB":"08/07/57","SORTCODE":"309812","NI":"MN345678O","ADDRESS":"45 CASTLE STREET EDINBURGH EH1 2ND","STATUS":"I","TYPE":"P","OWNER":"JSMITH"},
+    "10000010": {"SURNAME":"CALDWELL","FORENAME":"SUSAN","DOB":"21/09/70","SORTCODE":"204514","NI":"OP567890Q","ADDRESS":"67 ROSE AVENUE BRISTOL AVON BS1 5TR","STATUS":"A","TYPE":"P","OWNER":"CJONES"},
+    "10000011": {"SURNAME":"THORNTON","FORENAME":"RICHARD","DOB":"03/05/42","SORTCODE":"412367","NI":"QR789012S","ADDRESS":"101 THE CRESCENT BATH SOMERSET BA1 2QW","STATUS":"A","TYPE":"P","OWNER":"ABROWN"},
+    "10000012": {"SURNAME":"MIDLANDS-MOTORS-LTD","FORENAME":"FINANCE","DOB":"01/01/80","SORTCODE":"309812","NI":"000000001","ADDRESS":"SHOWROOM COURT COVENTRY CV1 2GD","STATUS":"A","TYPE":"C","OWNER":"JSMITH"},
+}
+
+ACCOUNTS = {
+    "1000000101": {"CUSTOMER":"10000001","TYPE":"CUR","SORTCODE":"204514","OPENED":"15/01/82","CURRENCY":"GBP","BALANCE":"3420.55","LIMIT":"500.00","RATE":"0.00","STATUS":"A","OWNER":"JSMITH"},
+    "1000000102": {"CUSTOMER":"10000001","TYPE":"SAV","SORTCODE":"204514","OPENED":"15/01/82","CURRENCY":"GBP","BALANCE":"12650.00","LIMIT":"0.00","RATE":"7.50","STATUS":"A","OWNER":"JSMITH"},
+    "1000000201": {"CUSTOMER":"10000002","TYPE":"CUR","SORTCODE":"204514","OPENED":"22/03/79","CURRENCY":"GBP","BALANCE":"8742.10","LIMIT":"1000.00","RATE":"0.00","STATUS":"A","OWNER":"JSMITH"},
+    "1000000301": {"CUSTOMER":"10000003","TYPE":"CUR","SORTCODE":"309812","OPENED":"01/07/80","CURRENCY":"GBP","BALANCE":"1250.30","LIMIT":"250.00","RATE":"0.00","STATUS":"A","OWNER":"ABROWN"},
+    "1000000302": {"CUSTOMER":"10000003","TYPE":"LON","SORTCODE":"309812","OPENED":"15/03/85","CURRENCY":"GBP","BALANCE":"-8500.00","LIMIT":"10000.00","RATE":"12.50","STATUS":"A","OWNER":"ABROWN"},
+    "1000000401": {"CUSTOMER":"10000004","TYPE":"CUR","SORTCODE":"204514","OPENED":"14/09/83","CURRENCY":"GBP","BALANCE":"567.80","LIMIT":"500.00","RATE":"0.00","STATUS":"A","OWNER":"ABROWN"},
+    "1000000402": {"CUSTOMER":"10000004","TYPE":"OVD","SORTCODE":"204514","OPENED":"10/01/86","CURRENCY":"GBP","BALANCE":"-342.15","LIMIT":"1000.00","RATE":"18.50","STATUS":"F","OWNER":"ABROWN"},
+    "1000000501": {"CUSTOMER":"10000005","TYPE":"SAV","SORTCODE":"309812","OPENED":"28/11/77","CURRENCY":"GBP","BALANCE":"45820.00","LIMIT":"0.00","RATE":"8.25","STATUS":"A","OWNER":"CJONES"},
+    "1000000601": {"CUSTOMER":"10000006","TYPE":"CUR","SORTCODE":"204514","OPENED":"05/04/75","CURRENCY":"GBP","BALANCE":"125430.00","LIMIT":"50000.00","RATE":"0.00","STATUS":"A","OWNER":"JSMITH"},
+    "1000000901": {"CUSTOMER":"10000009","TYPE":"CUR","SORTCODE":"309812","OPENED":"12/10/78","CURRENCY":"GBP","BALANCE":"200.00","LIMIT":"0.00","RATE":"0.00","STATUS":"D","OWNER":"JSMITH"},
+}
+
+TRANSACTIONS = [
+    {"TRANID":"T000001","ACCOUNT":"1000000101","TYPE":"CR","AMOUNT":"2100.00","DESC":"SALARY CREDIT","REF":"PAYROLL"},
+    {"TRANID":"T000002","ACCOUNT":"1000000101","TYPE":"DR","AMOUNT":"35.00","DESC":"WIRE FEE","REF":"FEE"},
+    {"TRANID":"T000003","ACCOUNT":"1000000501","TYPE":"CR","AMOUNT":"180.25","DESC":"INTEREST CREDIT","REF":"INT"},
+    {"TRANID":"T000004","ACCOUNT":"1000000601","TYPE":"DR","AMOUNT":"1250.00","DESC":"SUPPLIER PAYMENT","REF":"BACS"},
+]
+
+BULK_JOBS = {
+    "MTG-2026-MAY": {"DESC":"MAY 2026 MORTGAGE COLLECTION RUN","RECORDS":"312","VALUE":"487620.00","STATUS":"READY"},
+    "MTG-2026-APR": {"DESC":"APR 2026 MORTGAGE COLLECTION RUN","RECORDS":"309","VALUE":"483250.50","STATUS":"COMPLETE"},
+    "REM-2026-MAY": {"DESC":"MAY 2026 REDEMPTION SETTLEMENTS","RECORDS":"8","VALUE":"95400.00","STATUS":"READY"},
+    "OFF-2026-MAY": {"DESC":"OFFSET ACCOUNT INTEREST POSTINGS","RECORDS":"44","VALUE":"18320.75","STATUS":"PENDING"},
+}
+
+PAYMENTS = {
+    "BACS-SAL-MAY": {"TYPE":"BACS","PRIORITY":"STD","RECORDS":"148","VALUE":"312450.00","STATUS":"QUEUED"},
+    "CHAPS-PROP-01": {"TYPE":"CHAPS","PRIORITY":"URG","RECORDS":"5","VALUE":"875000.00","STATUS":"QUEUED"},
+    "BACS-SUP-MAY": {"TYPE":"BACS","PRIORITY":"STD","RECORDS":"67","VALUE":"95230.40","STATUS":"QUEUED"},
+    "CHAPS-INT-02": {"TYPE":"CHAPS","PRIORITY":"URG","RECORDS":"12","VALUE":"2340000.00","STATUS":"QUEUED"},
+}
+
+CARDS = {
+    "APP-CC-001": {"SURNAME":"HARRISON","FORENAME":"WILLIAM","SCORE":"742","DTI":"28","DEBT":"4200","SYSTEM":"APPROVE","STATUS":"OPEN"},
+    "APP-CC-002": {"SURNAME":"PEMBERTON","FORENAME":"ARTHUR","SCORE":"591","DTI":"52","DEBT":"8100","SYSTEM":"DECLINE","STATUS":"OPEN"},
+    "APP-CC-003": {"SURNAME":"WHITMORE","FORENAME":"PATRICIA","SCORE":"688","DTI":"34","DEBT":"1200","SYSTEM":"APPROVE","STATUS":"OPEN"},
+    "APP-CC-004": {"SURNAME":"MORRISON","FORENAME":"ELEANOR","SCORE":"623","DTI":"41","DEBT":"3400","SYSTEM":"REFER","STATUS":"OPEN"},
+    "APP-CC-005": {"SURNAME":"THORNTON","FORENAME":"RICHARD","SCORE":"781","DTI":"22","DEBT":"600","SYSTEM":"APPROVE","STATUS":"OPEN"},
+}
+
+SCENARIOS = {
+    "1": {"TITLE":"ACCOUNT BALANCE MANIPULATION","CWE":"CWE-778","DIFF":"MEDIUM","OBJECTIVE":"IDENTIFY A GBP 50000 UNEXPLAINED CREDIT ON ACCOUNT 1000000101"},
+    "2": {"TITLE":"UNAUTHORISED ACCOUNT ACCESS / IDOR","CWE":"CWE-639","DIFF":"MEDIUM","OBJECTIVE":"SHOW TEST USER CAN VIEW VIP ACCOUNTS IN TRAINING MODE"},
+    "3": {"TITLE":"ROUND-TRIP EMBEZZLEMENT","CWE":"CWE-840","DIFF":"HARD","OBJECTIVE":"FIND TEN GBP 499 TRANSFERS TO AN INACTIVE ACCOUNT"},
+    "4": {"TITLE":"SQL INJECTION CUSTOMER SEARCH","CWE":"CWE-89","DIFF":"HARD","OBJECTIVE":"EXTRACT CUSTOMER RECORDS WITH CONTROLLED SQLI"},
+    "5": {"TITLE":"UNAUTHENTICATED CEMT ACCESS","CWE":"CWE-862","DIFF":"EASY","OBJECTIVE":"DISABLE A TRANSACTION IN A SIMULATED LAB"},
+    "6": {"TITLE":"CECI REMOTE CODE EXECUTION SIMULATION","CWE":"CWE-94/CWE-862","DIFF":"HARD","OBJECTIVE":"RUN SAFE SIMULATED EXEC CICS LINK/SHUTDOWN COMMANDS"},
+    "7": {"TITLE":"PLAINTEXT TN3270 CREDENTIAL CAPTURE","CWE":"CWE-319","DIFF":"EASY","OBJECTIVE":"DECODE STATIC PACKET CAPTURES"},
+    "8": {"TITLE":"WEAK COBOL BUFFER OVERFLOW","CWE":"CWE-120","DIFF":"MEDIUM","OBJECTIVE":"TRIGGER A SAFE SIMULATED COMMAREA OVERWRITE"},
+}
+
+
+def _now() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _audit(self, operator: str, event_type: str, detail: str, result: str = "OK") -> None:
+    if not hasattr(self, "gmvb_audit"):
+        self.gmvb_audit = []
+    self.gmvb_audit.append({"TIMESTAMP": _now(), "EVENT_TYPE": event_type, "OPERATOR": operator or "ANON", "DETAILS": detail[:120], "RESULT": result})
+    self.gmvb_audit = self.gmvb_audit[-250:]
+    try:
+        self.state.record_security_event((operator or "ANON").upper(), event_type, detail[:100], service="GMVB")
+    except Exception:
+        pass
+
+
+def install_bankinglab_upgrade(cls) -> None:
+    if getattr(cls, "_gmvb_upgrade_installed", False):
+        return
+    orig_init = cls.__init__
+    orig_catalog = cls.catalog
+    orig_table_metadata = cls.table_metadata
+    orig_seed = cls._seed_training_members
+    orig_screen_lines = cls._screen_lines
+    orig_field_specs = cls._field_specs
+    orig_terminal_submit = cls.terminal_submit
+    orig_menu_select = cls.menu_select
+
+    def __init__(self, state):
+        orig_init(self, state)
+        self.gmvb_customers = {k: dict(v) for k, v in CUSTOMERS.items()}
+        self.gmvb_accounts = {k: dict(v) for k, v in ACCOUNTS.items()}
+        self.gmvb_transactions = [dict(x) for x in TRANSACTIONS]
+        self.gmvb_bulk_jobs = {k: dict(v) for k, v in BULK_JOBS.items()}
+        self.gmvb_payment_batches = {k: dict(v) for k, v in PAYMENTS.items()}
+        self.gmvb_card_apps = {k: dict(v) for k, v in CARDS.items()}
+        self.gmvb_scenarios = {k: dict(v) for k, v in SCENARIOS.items()}
+        self.gmvb_audit = []
+        self.gmvb_last_bulk = []
+        self._seed_training_members()
+
+    def _seed_training_members(self):
+        orig_seed(self)
+        for uid in sorted(self.state.racf.users):
+            try:
+                src_lib = f"{uid}.GMVB.COBOL"
+                cpy_lib = f"{uid}.GMVB.COPYLIB"
+                self.state.datasets.allocate(uid, src_lib, org="PO")
+                self.state.datasets.allocate(uid, cpy_lib, org="PO")
+                for name, content in COBOL_SOURCES.items():
+                    dsn = f"{src_lib}({name})"
+                    if not self.state.datasets.exists(uid, dsn):
+                        self.state.datasets.write(uid, dsn, content)
+                for name, content in COPYBOOKS.items():
+                    dsn = f"{cpy_lib}({name})"
+                    if not self.state.datasets.exists(uid, dsn):
+                        self.state.datasets.write(uid, dsn, content)
+                ddl = "\n".join([
+                    "CREATE TABLE GMVB.CUSTOMER (CUSTOMER_ID CHAR(8), SURNAME VARCHAR(30), FORENAME VARCHAR(20), NI_NUMBER CHAR(9));",
+                    "CREATE TABLE GMVB.ACCOUNT (ACCOUNT_NUMBER CHAR(10), CUSTOMER_ID CHAR(8), TYPE CHAR(3), BALANCE DECIMAL(11,2), STATUS CHAR(1));",
+                    "CREATE TABLE GMVB.TRANSACTION (TRAN_ID CHAR(16), ACCOUNT_NUMBER CHAR(10), TRAN_TYPE CHAR(3), AMOUNT DECIMAL(11,2), DESCRIPTION VARCHAR(40));",
+                    "CREATE TABLE GMVB.AUDITLOG (TIMESTAMP CHAR(19), EVENT_TYPE VARCHAR(32), OPERATOR VARCHAR(8), DETAILS VARCHAR(120));",
+                ]) + "\n"
+                dsn = f"{uid}.SQL.LAB(GMVBDDL)"
+                if not self.state.datasets.exists(uid, dsn):
+                    self.state.datasets.write(uid, dsn, ddl)
+            except Exception:
+                pass
+
+    def catalog(self):
+        data = orig_catalog(self)
+        data["GMVB.CUSTOMER"] = [{"CUSTOMER_ID": cid, **meta} for cid, meta in sorted(self.gmvb_customers.items())]
+        data["GMVB.ACCOUNT"] = [{"ACCOUNT_NUMBER": acct, **meta} for acct, meta in sorted(self.gmvb_accounts.items())]
+        data["GMVB.TRANSACTION"] = list(self.gmvb_transactions[-100:])
+        data["GMVB.AUDITLOG"] = list(getattr(self, "gmvb_audit", []))
+        data["GMVB.BULKJOB"] = [{"JOB_ID": jid, **meta} for jid, meta in sorted(self.gmvb_bulk_jobs.items())]
+        data["GMVB.PAYMENT_BATCH"] = [{"BATCH_ID": bid, **meta} for bid, meta in sorted(self.gmvb_payment_batches.items())]
+        data["GMVB.CARD_APPLICATION"] = [{"APP_ID": aid, **meta} for aid, meta in sorted(self.gmvb_card_apps.items())]
+        data["GMVB.COBOL_SOURCE"] = [{"PROGRAM": k, "LINES": str(len(v.splitlines())), "PURPOSE": "TRAINING SOURCE"} for k, v in sorted(COBOL_SOURCES.items())]
+        return data
+
+    def table_metadata(self):
+        tables, columns = orig_table_metadata(self)
+        for name, ts in [("CUSTOMER","GMVBCUST"),("ACCOUNT","GMVBACCT"),("TRANSACTION","GMVBTRAN"),("AUDITLOG","GMVBAUD"),("BULKJOB","GMVBBULK"),("PAYMENT_BATCH","GMVBPAY"),("CARD_APPLICATION","GMVBCARD")]:
+            tables.append({"NAME": name, "CREATOR": "GMVB", "TYPE": "T", "DBNAME": "GIBDB", "TSNAME": ts})
+        columns.extend([
+            {"TBNAME":"CUSTOMER","TBCREATOR":"GMVB","NAME":"CUSTOMER_ID","COLTYPE":"CHAR","LENGTH":"8"},
+            {"TBNAME":"CUSTOMER","TBCREATOR":"GMVB","NAME":"NI","COLTYPE":"CHAR","LENGTH":"9"},
+            {"TBNAME":"ACCOUNT","TBCREATOR":"GMVB","NAME":"ACCOUNT_NUMBER","COLTYPE":"CHAR","LENGTH":"10"},
+            {"TBNAME":"ACCOUNT","TBCREATOR":"GMVB","NAME":"BALANCE","COLTYPE":"DECIMAL","LENGTH":"11"},
+            {"TBNAME":"TRANSACTION","TBCREATOR":"GMVB","NAME":"TRANID","COLTYPE":"CHAR","LENGTH":"16"},
+            {"TBNAME":"AUDITLOG","TBCREATOR":"GMVB","NAME":"EVENT_TYPE","COLTYPE":"VARCHAR","LENGTH":"32"},
+        ])
+        return tables, columns
+
+    def _screen_lines(self, sess):
+        cur = sess.current_screen.upper()
+        if cur == "MENU":
+            return [
+                f"SIGNED ON USER . . .  {sess.user or 'GUEST'}",
+                "",
+                "1  CUST - CUSTOMER MASTER MAINTENANCE",
+                "2  ACCT - ACCOUNT INQUIRY AND MAINTENANCE",
+                "3  TRAN - TRANSACTION POSTING",
+                "4  BULK - BULK PROCESSING CENTRE",
+                "5  LOGO - SIGN OFF",
+                "6  REST - REST API SECURITY TESTER",
+                "7  TN32 - TN3270 PACKET ANALYSER",
+                "8  MAN  - OPERATOR REFERENCE MANUAL",
+                "9  LAB  - SCENARIO VULNERABILITY LAB",
+                "0  SOL  - INSTRUCTOR SOLUTION VIEWER",
+                "CECI / CEMT / CEDA - SIMULATED CICS TOOLS",
+                "SELECTION . . . . .  ____",
+            ]
+        if cur == "CUST":
+            return ["CUSTOMER MASTER MAINTENANCE", "", "CUSTOMER ID . . . .  ________", "SURNAME . . . . . .  ______________________________", "FORENAME . . . . . . ____________________", "", "PF5=ADD PF6=UPDATE PF7=DELETE PF8=INQUIRE PF12=COBOL"]
+        if cur == "TRAN":
+            return ["TRANSACTION POSTING", "", "ACCOUNT NUMBER . . . __________", "TRAN TYPE CR/DR/TRF . ___", "AMOUNT . . . . . . . __________", "TO ACCOUNT . . . . . __________", "DESCRIPTION . . . . . ______________________________", "", "PF5=POST PF8=HISTORY PF12=COBOL"]
+        if cur == "BULK":
+            return ["BULK PROCESSING CENTRE", "", "1 MORTGAGE BATCH", "2 BACS/CHAPS PAYMENTS", "3 CREDIT CARD APPROVALS", "", "TYPE 1/2/3 OR JOB/BATCH/APPLICATION ID. PF5=SUBMIT PF3=MENU"]
+        if cur == "MAN":
+            return ["BANKMASTER/VS OPERATOR REFERENCE MANUAL", "", "PAGE 1 SYSTEM OVERVIEW", "GMVB USES GIBSON GACF/RACF, PASSTICKET/PTKGEN AND MFA.", "MENU CODES: CUST ACCT TRAN BULK REST TN32 MAN LAB SOL.", "PF7=PREV PF8=NEXT PF3=MENU"]
+        if cur == "LAB":
+            lines=["SCENARIO VULNERABILITY LAB", ""]
+            for k, v in sorted(self.gmvb_scenarios.items()):
+                lines.append(f"{k} {v['TITLE'][:42]:<42} {v['DIFF']}")
+            lines.extend(["", "TYPE SCENARIO NUMBER OR ACTIVATE n. PF3=MENU"])
+            return lines
+        if cur == "SOL":
+            return ["INSTRUCTOR SOLUTION VIEWER", "", "TYPE SCENARIO NUMBER TO VIEW SOLUTION.", "AUTHORITY: GIBSON PRIVILEGED USER OR INSTRUCTOR MODE.", "PF3=MENU"]
+        if cur == "REST":
+            return ["REST API SECURITY TESTER", "", "1 GET /api/v1/gmvb/customers/{id}", "2 GET /api/v1/gmvb/accounts/{num}", "3 POST /api/v1/gmvb/transactions", "4 GET /api/v1/gmvb/admin/users", "5 GET /api/v1/gmvb/reports?customer={id}", "", "TYPE ENDPOINT NUMBER OR HELP."]
+        if cur == "TN32":
+            return ["TN3270 PACKET ANALYSER", "", "00000000  FF FB 18 FF FA 18 00 49 42 4D FF F0  CICS NEGOTIATE", "00000010  D6 D7 C5 D9 C1 E3 D6 D9 7E D1 E2 D4  OPERATOR=JSMITH", "00000020  D7 C1 E2 E2 E6 D6 D9 C4 7E D7 C1 E2  PASSWORD=PASS1", "00000030  C1 C3 C3 E3 7E F1 F0 F0 F0 F0 F0 F0  ACCT=10000001", "", "TRAINING CAPTURE ONLY - NOT LIVE TRAFFIC."]
+        if cur == "COBL":
+            return ["COBOL SOURCE LIBRARY", "", "PROGRAMS: " + ", ".join(sorted(COBOL_SOURCES)[:8]), "TYPE PROGRAM NAME OR PF3=MENU."]
+        if cur == "BOF":
+            return ["WEAK COBOL BUFFER OVERFLOW LAB", "", "ENTER CUSTOMER SURNAME. LENGTH > 30 TRIGGERS SAFE ASRA SIMULATION.", "INPUT . . . . . . . ______________________________", "", "PF5=TEST PF12=COBOL"]
+        return orig_screen_lines(self, sess)
+
+    def _field_specs(self, sess):
+        cur = sess.current_screen.upper()
+        FieldSpec = __import__('gibson.apps.banking_lab', fromlist=['FieldSpec']).FieldSpec
+        if cur == "MENU":
+            return [FieldSpec("SELECTION", "Selection", 18, 24, 6, sess.fields.get("SELECTION", ""))]
+        if cur == "CUST":
+            return [FieldSpec("CUSTOMER_ID", "Customer ID", 8, 24, 18, sess.fields.get("CUSTOMER_ID", "10000001")), FieldSpec("SURNAME", "Surname", 9, 24, 30, sess.fields.get("SURNAME", "")), FieldSpec("FORENAME", "Forename", 10, 24, 20, sess.fields.get("FORENAME", ""))]
+        if cur == "TRAN":
+            return [FieldSpec("ACCOUNT", "Account", 8, 24, 10, sess.fields.get("ACCOUNT", "1000000101")), FieldSpec("TRANTYPE", "Type", 9, 24, 3, sess.fields.get("TRANTYPE", "CR")), FieldSpec("AMOUNT", "Amount", 10, 24, 10, sess.fields.get("AMOUNT", "10.00"), numeric=True), FieldSpec("TO_ACCOUNT", "To", 11, 24, 10, sess.fields.get("TO_ACCOUNT", "1000000102")), FieldSpec("DESC", "Description", 12, 24, 30, sess.fields.get("DESC", "LAB POST"))]
+        if cur == "BOF":
+            return [FieldSpec("OVERFLOW", "Input", 8, 24, 60, sess.fields.get("OVERFLOW", ""))]
+        return orig_field_specs(self, sess)
+
+    def menu_select(self, sid, selection):
+        sess = self.ensure_session(sid)
+        entered = (selection or "").strip().upper()
+        mapping = {"1":"CUST","2":"ACCT","3":"TRAN","4":"BULK","5":"LOGN","6":"REST","7":"TN32","8":"MAN","9":"LAB","0":"SOL","CUST":"CUST","ACCT":"ACCT","TRAN":"TRAN","BULK":"BULK","LOGO":"LOGN","REST":"REST","TN32":"TN32","MAN":"MAN","HELP":"MAN","LAB":"LAB","SOL":"SOL","CECI":"CECI","CEMT":"CEMT","CEDA":"CEDA","COBL":"COBL","BOF":"BOF"}
+        if entered in mapping:
+            sess.previous_screen = sess.current_screen
+            sess.current_screen = mapping[entered]
+            sess.status = f"{mapping[entered]} READY"
+            return self.snapshot(sid)
+        return orig_menu_select(self, sid, selection)
+
+    def gmvb_customer_lookup(self, sid, customer_id):
+        sess = self.ensure_session(sid); cid=(customer_id or '').strip().upper(); sess.current_screen='CUST'; sess.last_rows=[]
+        if " OR " in cid or "'" in cid or "--" in cid:
+            sess.last_rows = self.catalog()["GMVB.CUSTOMER"]
+            sess.status = "DFHSQ0001 DB2 ERROR: UNHANDLED EXCEPTION - CONTROLLED SQLI DUMP"
+            _audit(self, sess.user, "SQLI", f"CUSTOMER SEARCH {cid}", "TRAINING")
+            return self.snapshot(sid)
+        row = self.gmvb_customers.get(cid)
+        if row:
+            sess.last_rows=[{"CUSTOMER_ID":cid, **row}]; sess.status=f"CUSTOMER {cid} DISPLAYED"; _audit(self, sess.user, "CUSTOMER_INQ", cid)
+        else:
+            sess.status=f"CUSTOMER {cid or 'BLANK'} NOT FOUND"
+        return self.snapshot(sid)
+
+    def gmvb_post_transaction(self, sid, fields):
+        sess=self.ensure_session(sid); acct=str(fields.get('ACCOUNT','')).strip(); typ=str(fields.get('TRANTYPE','CR')).upper(); amt_s=str(fields.get('AMOUNT','0')).strip(); to=str(fields.get('TO_ACCOUNT','')).strip(); desc=str(fields.get('DESC','LAB POST')).upper()[:40]
+        sess.current_screen='TRAN'; sess.last_rows=[]
+        try: amt=Decimal(amt_s)
+        except Exception: sess.status='AMOUNT FORMAT INVALID'; return self.snapshot(sid)
+        if acct not in self.gmvb_accounts: sess.status=f"ACCOUNT {acct} NOT FOUND"; return self.snapshot(sid)
+        txid='T'+datetime.utcnow().strftime('%H%M%S')+f"{len(self.gmvb_transactions)%1000:03d}"
+        if typ == 'DR': self.gmvb_accounts[acct]['BALANCE']=f"{Decimal(self.gmvb_accounts[acct]['BALANCE'])-amt:.2f}"
+        elif typ == 'TRF' and to in self.gmvb_accounts:
+            self.gmvb_accounts[acct]['BALANCE']=f"{Decimal(self.gmvb_accounts[acct]['BALANCE'])-amt:.2f}"; self.gmvb_accounts[to]['BALANCE']=f"{Decimal(self.gmvb_accounts[to]['BALANCE'])+amt:.2f}"
+        else: self.gmvb_accounts[acct]['BALANCE']=f"{Decimal(self.gmvb_accounts[acct]['BALANCE'])+amt:.2f}"
+        row={"TRANID":txid,"ACCOUNT":acct,"TYPE":typ,"AMOUNT":f"{amt:.2f}","DESC":desc,"REF":to or "GMVB"}
+        self.gmvb_transactions.append(row); sess.last_rows=[row]; sess.status=f"NORMAL - TRAN {txid} POSTED. BAL: GBP {self.gmvb_accounts[acct]['BALANCE']}"; _audit(self, sess.user, "TRANSACTION", f"{txid} {acct} {typ} {amt:.2f}")
+        return self.snapshot(sid)
+
+    def gmvb_bulk_action(self, sid, action):
+        sess=self.ensure_session(sid); entered=(action or '').strip().upper(); sess.current_screen='BULK'; sess.last_rows=[]
+        if entered in self.gmvb_bulk_jobs:
+            job=self.gmvb_bulk_jobs[entered]; job['STATUS']='COMPLETE'; rows=[{"SPOOL":"IEF236I ALLOC. FOR BLKPRC MTGBATCH"},{"SPOOL":"BATCPST0001 - INITIALISING BATCH STREAM"},{"SPOOL":f"BATCPST0004 - {job['RECORDS']} RECORDS PROCESSED / 0 REJECTED"},{"SPOOL":"IEFC001I //MTGBATCH JOB ENDED - MAXCC=0000"}]; sess.last_rows=rows; sess.status=f"BATCH {entered} COMPLETE"; _audit(self,sess.user,"BULK_SUBMIT",entered); return self.snapshot(sid)
+        rows=[{"JOB_ID":jid, **v} for jid,v in sorted(self.gmvb_bulk_jobs.items())]+[{"BATCH_ID":bid, **v} for bid,v in sorted(self.gmvb_payment_batches.items())]+[{"APP_ID":aid, **v} for aid,v in sorted(self.gmvb_card_apps.items())]
+        sess.last_rows=rows[:12]; sess.status="BULK QUEUES DISPLAYED"; return self.snapshot(sid)
+
+    def gmvb_activate_lab(self, sid, scenario):
+        sess=self.ensure_session(sid); key=(scenario or '').strip().upper().replace('ACTIVATE','').strip() or '1'; sess.current_screen='LAB'; sess.last_rows=[]
+        if key == '1':
+            self.gmvb_accounts['1000000101']['BALANCE']=f"{Decimal(self.gmvb_accounts['1000000101']['BALANCE'])+Decimal('50000.00'):.2f}"; self.gmvb_transactions.append({"TRANID":"GHOST-TX-001","ACCOUNT":"1000000101","TYPE":"CR","AMOUNT":"50000.00","DESC":"UNEXPLAINED CREDIT","REF":"DVCA"})
+        elif key == '3':
+            for i in range(10): self.gmvb_transactions.append({"TRANID":f"EMB-{i+1:03d}","ACCOUNT":"1000000601","TYPE":"TRF","AMOUNT":"499.00","DESC":"ROUND TRIP BELOW THRESHOLD","REF":"1000000901"})
+        sess.status=f"SCENARIO {key} ACTIVATED"; info=self.gmvb_scenarios.get(key,{}); sess.last_rows=[{"SCENARIO":key, **info}]; _audit(self,sess.user,"LAB_ACTIVATE",key); return self.snapshot(sid)
+
+    def gmvb_overflow_test(self, sid, value):
+        sess=self.ensure_session(sid); text=str(value or sess.fields.get('OVERFLOW','')); sess.current_screen='BOF'; sess.last_rows=[]
+        if len(text)>30:
+            sess.status='ASRA ABEND IN PROGRAM CUSTUPD - SIMULATED COMMAREA OVERWRITE'; sess.last_rows=[{"RESULT":"GMVBOF001I SIMULATED COMMAREA OVERWRITE DETECTED"},{"RESULT":"GMVBOF002I TRAINING ONLY - HOST MEMORY NOT MODIFIED"}]; _audit(self,sess.user,"BUFFER_OVERFLOW_LAB",f"LEN={len(text)}","TRAINING")
+        else:
+            sess.status='INPUT ACCEPTED - NO OVERFLOW CONDITION'; sess.last_rows=[{"RESULT":"NORMAL RESPONSE"}]
+        return self.snapshot(sid)
+
+    def terminal_submit(self, sid, fields=None, command='', pf=''):
+        sess=self.ensure_session(sid)
+        if fields:
+            for k,v in fields.items(): sess.fields[str(k).upper()]=str(v)
+        pf_u=(pf or '').upper(); entered=(command or '').strip()
+        if pf_u in {'PF5','F5'} and sess.current_screen=='TRAN': return self.gmvb_post_transaction(sid, sess.fields)
+        if pf_u in {'PF8','F8'} and sess.current_screen=='CUST': return self.gmvb_customer_lookup(sid, sess.fields.get('CUSTOMER_ID',''))
+        if pf_u in {'PF5','F5'} and sess.current_screen=='BULK': return self.gmvb_bulk_action(sid, sess.fields.get('BULKID',''))
+        if pf_u in {'PF5','F5'} and sess.current_screen=='BOF': return self.gmvb_overflow_test(sid, sess.fields.get('OVERFLOW',''))
+        if sess.current_screen=='CUST' and (entered or sess.fields.get('CUSTOMER_ID')): return self.gmvb_customer_lookup(sid, entered or sess.fields.get('CUSTOMER_ID',''))
+        if sess.current_screen=='TRAN' and (entered.upper() in {'POST','PF5'}): return self.gmvb_post_transaction(sid, sess.fields)
+        if sess.current_screen=='BULK' and entered: return self.gmvb_bulk_action(sid, entered)
+        if sess.current_screen=='LAB' and entered: return self.gmvb_activate_lab(sid, entered)
+        if sess.current_screen=='SOL' and entered:
+            key=entered.strip(); sess.last_rows=[{"SOLUTION":SCENARIOS.get(key,{}).get('TITLE','UNKNOWN'),"ROOT_CAUSE":"TRAINING CONTROL WEAKNESS","REMEDIATION":"VALIDATE AUTHORITY, JOURNAL DATA CHANGES, AND USE PARAMETERISED SQL"}]; sess.status=f"SOLUTION {key} DISPLAYED"; return self.snapshot(sid)
+        if sess.current_screen=='BOF' and entered: return self.gmvb_overflow_test(sid, entered)
+        if sess.current_screen=='COBL' and entered.upper() in COBOL_SOURCES:
+            src=COBOL_SOURCES[entered.upper()].splitlines(); sess.last_rows=[{"LINE":f"{i+1:04d} {line}"} for i,line in enumerate(src[:40])]; sess.status=f"COBOL {entered.upper()} DISPLAYED"; return self.snapshot(sid)
+        return orig_terminal_submit(self, sid, fields, command, pf)
+
+    cls.__init__ = __init__
+    cls._seed_training_members = _seed_training_members
+    cls.catalog = catalog
+    cls.table_metadata = table_metadata
+    cls._screen_lines = _screen_lines
+    cls._field_specs = _field_specs
+    cls.menu_select = menu_select
+    cls.terminal_submit = terminal_submit
+    cls.gmvb_customer_lookup = gmvb_customer_lookup
+    cls.gmvb_post_transaction = gmvb_post_transaction
+    cls.gmvb_bulk_action = gmvb_bulk_action
+    cls.gmvb_activate_lab = gmvb_activate_lab
+    cls.gmvb_overflow_test = gmvb_overflow_test
+    cls._gmvb_upgrade_installed = True
+
+
+
+def _gmvb_rows_to_terminal(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    lines = []
+    for row in rows[:18]:
+        parts = [f"{str(k)[:14]}={str(v)[:48]}" for k, v in row.items()]
+        lines.append(" | ".join(parts)[:118])
+    return "\n".join(lines)
+
+
+def _gmvb_screen_model(lab, sid: str) -> dict[str, Any]:
+    snap = lab.snapshot(sid)
+    hack = gmvb_hack3270.hack_status(lab, sid)
+    fields = [gmvb_hack3270.enrich_field(dict(f)) for f in snap.get("fields", [])]
+    return {
+        "sid": sid,
+        "screen": snap.get("current_screen", "GMVB"),
+        "title": "BANKMASTER/VS - GMVB CICS BANKING",
+        "status_code": "NORMAL" if "ERROR" not in str(snap.get("status", "")).upper() else "INVREQ",
+        "message": snap.get("status", ""),
+        "fields": fields,
+        "output": [snap.get("terminal_screen", ""), _gmvb_rows_to_terminal(snap.get("rows") or [])],
+        "actions": [
+            {"key": "MENU", "label": "PF3=MENU"},
+            {"key": "INQUIRE", "label": "PF8=INQUIRE"},
+            {"key": "POST", "label": "PF5=POST"},
+            {"key": "CODE", "label": "PF12=CODE"},
+            {"key": "HACK3270 MENU", "label": "HACK3270"},
+        ],
+        "pfbar": "PF1=HELP PF3=MENU PF5=ADD/POST PF6=UPD PF7=DEL PF8=INQ PF12=CODE",
+        "hack3270": hack,
+    }
+
+
+def gmvb_json_api(lab, path: str, method: str = "GET", data: dict[str, Any] | None = None, query: dict[str, str] | None = None):
+    data = data or {}; query = query or {}; sid = str(data.get('sid') or query.get('sid') or lab.new_sid()); sess=lab.ensure_session(sid)
+    p = path.rstrip('/')
+    svc = get_gmvb_service(lab.state)
+    operator = str(data.get('operator') or data.get('userid') or query.get('operator') or 'REST').upper()
+
+    def ok(payload):
+        wrapped = {"ok": True, "data": payload, "error": None, "messages": [], "audit": [], "source": "gmvb-service"}
+        # Compatibility: older Gibson tests and clients expected raw dicts for
+        # some /api/v1/gmvb/* endpoints.  Keep the stable wrapper while also
+        # exposing top-level keys when the payload is an object.
+        if isinstance(payload, dict):
+            wrapped.update(payload)
+        return 200, wrapped
+    def err(status, message):
+        return status, {"ok": False, "data": None, "error": str(message), "messages": [str(message)], "audit": [], "source": "gmvb-service"}
+
+    try:
+        if p == '/api/v1/gmvb/tables':
+            return ok(sorted(svc.catalog().keys()))
+        if p == '/api/v1/gmvb/audit':
+            return ok(list(svc.audit))
+        if p in {'/api/v1/gmvb/health','/api/v1/gmvb/capabilities'}:
+            payload = {"status":"ok","application":"GMVB","auth":"GACF/RACF PASSTICKET MFA","cics_transaction":"GMVB","hack3270_lab":"screen-model simulation available and off by default","service":"GmvbBankingService","mode": __import__('os').getenv('GIBSON_GMVB_MODE','STANDARD'),"batch_pin":"0032","tables": sorted([k for k in svc.catalog() if k.startswith('GMVB.')])}
+            return ok(payload)
+        if p == '/api/v1/gmvb/customers/search':
+            return ok(svc.search_customers_by_name(query.get('name') or data.get('name') or '', int(query.get('limit') or data.get('limit') or 10)))
+        if p == '/api/v1/gmvb/customers' and method == 'GET':
+            return ok(list(svc.customers.values()))
+        if p == '/api/v1/gmvb/customers' and method == 'POST':
+            return ok(svc.create_customer(data, operator))
+        msvc = re.match(r"/api/v1/gmvb/customers/([^/]+)$", p)
+        if msvc and method == 'GET':
+            row = svc.get_customer(msvc.group(1))
+            return ok(row) if row else err(404, 'customer not found')
+        if msvc and method in {'PUT','POST'}:
+            return ok(svc.update_customer(msvc.group(1), data, operator))
+        if msvc and method == 'DELETE':
+            return ok(svc.delete_customer(msvc.group(1), operator))
+
+        if p == '/api/v1/gmvb/accounts/by-customer':
+            return ok(svc.get_accounts_for_customer(query.get('customer_id') or data.get('customer_id') or ''))
+        if p == '/api/v1/gmvb/accounts' and method == 'GET':
+            return ok(list(svc.accounts.values()))
+        if p == '/api/v1/gmvb/accounts' and method == 'POST':
+            return ok(svc.create_account(data, operator))
+        msvc = re.match(r"/api/v1/gmvb/accounts/by-customer/([^/]+)$", p)
+        if msvc:
+            return ok(svc.get_accounts_for_customer(msvc.group(1)))
+        msvc = re.match(r"/api/v1/gmvb/accounts/([^/]+)$", p)
+        if msvc and method == 'GET':
+            row = svc.get_account(msvc.group(1))
+            # Compatibility with legacy GMVB lab state: if the older terminal
+            # path has just posted a transaction, expose that latest balance
+            # at the top level and in data so existing callers do not see stale
+            # account values.
+            legacy = getattr(lab, 'gmvb_accounts', {}).get(msvc.group(1), {}) if hasattr(lab, 'gmvb_accounts') else {}
+            if row and legacy:
+                merged = dict(row); merged.update(legacy); merged.setdefault('ACCOUNT_NUMBER', msvc.group(1))
+                return ok(merged)
+            return ok(row) if row else err(404, 'account not found')
+        if msvc and method in {'PUT','POST'}:
+            return ok(svc.update_account(msvc.group(1), data, operator))
+        if msvc and method == 'DELETE':
+            return ok(svc.delete_account(msvc.group(1), operator))
+
+        if p == '/api/v1/gmvb/transactions' and method == 'GET':
+            return ok(svc.list_transactions(limit=int(query.get('limit') or 50)))
+        if p == '/api/v1/gmvb/transactions/credit' and method == 'POST':
+            return ok(svc.credit_account(data.get('account_id') or data.get('account') or data.get('ACCOUNT_NUMBER'), data.get('amount') or data.get('AMOUNT'), data.get('description','CREDIT'), operator))
+        if p == '/api/v1/gmvb/transactions/debit' and method == 'POST':
+            return ok(svc.debit_account(data.get('account_id') or data.get('account') or data.get('ACCOUNT_NUMBER'), data.get('amount') or data.get('AMOUNT'), data.get('description','DEBIT'), operator))
+        if p == '/api/v1/gmvb/transactions/transfer' and method == 'POST':
+            return ok(svc.transfer_funds(data.get('from_account'), data.get('to_account'), data.get('amount'), data.get('description','TRANSFER'), operator))
+        msvc = re.match(r"/api/v1/gmvb/transactions/account/([^/]+)$", p)
+        if msvc:
+            return ok(svc.list_transactions(account_id=msvc.group(1)))
+
+        if p == '/api/v1/gmvb/batch' and method == 'GET':
+            return ok(svc.list_batches(query.get('status') or None))
+        if p == '/api/v1/gmvb/batch' and method == 'POST':
+            return ok(svc.create_batch(data, operator))
+        msvc = re.match(r"/api/v1/gmvb/batch/([^/]+)/release$", p)
+        if msvc and method == 'POST':
+            return ok(svc.release_batch(msvc.group(1), data.get('supervisor_id') or data.get('supervisor') or operator, str(data.get('pin') or ''), operator, injected=bool(data.get('injected'))))
+        msvc = re.match(r"/api/v1/gmvb/batch/([^/]+)/reject$", p)
+        if msvc and method == 'POST':
+            return ok(svc.reject_batch(msvc.group(1), data.get('reason','REJECTED'), operator))
+        msvc = re.match(r"/api/v1/gmvb/batch/([^/]+)$", p)
+        if msvc:
+            row = svc.get_batch(msvc.group(1)); return ok(row) if row else err(404, 'batch not found')
+
+        if p == '/api/v1/gmvb/swift' and method == 'GET':
+            return ok(svc.list_swift_messages(query.get('status') or None))
+        if p == '/api/v1/gmvb/swift' and method == 'POST':
+            return ok(svc.create_swift_message(data, operator))
+        msvc = re.match(r"/api/v1/gmvb/swift/([^/]+)/approve$", p)
+        if msvc and method == 'POST': return ok(svc.approve_swift_message(msvc.group(1), data.get('approver') or operator))
+        msvc = re.match(r"/api/v1/gmvb/swift/([^/]+)/release$", p)
+        if msvc and method == 'POST': return ok(svc.release_swift_message(msvc.group(1), data.get('releaser') or operator))
+        msvc = re.match(r"/api/v1/gmvb/swift/([^/]+)/repair$", p)
+        if msvc and method == 'POST': return ok(svc.repair_swift_message(msvc.group(1), data, operator))
+        msvc = re.match(r"/api/v1/gmvb/swift/([^/]+)$", p)
+        if msvc:
+            row = svc.get_swift_message(msvc.group(1)); return ok(row) if row else err(404, 'swift message not found')
+
+        if p == '/api/v1/gmvb/source/cobol':
+            return ok({"programs": sorted(COBOL_SOURCES.keys())})
+        if p == '/api/v1/gmvb/source/bms':
+            return ok({"maps": ["BNK1MAI", "BNK1ACC", "BNK1TFM"], "source": "GMVB simulated BMS source imported from sample reference"})
+    except Exception as exc:
+        return err(400, exc)
+
+    # HACK3270-inspired GMVB-only simulation endpoints. These are intentionally
+    # screen-model based and do not create a real TN3270 proxy.
+    if p == '/api/v1/gmvb/hack3270/status':
+        return 200, gmvb_hack3270.hack_status(lab, sid)
+    if p == '/api/v1/gmvb/hack3270/enable' and method == 'POST':
+        return 200, gmvb_hack3270.set_enabled(lab, sid, True)
+    if p == '/api/v1/gmvb/hack3270/disable' and method == 'POST':
+        return 200, gmvb_hack3270.set_enabled(lab, sid, False)
+    if p == '/api/v1/gmvb/hack3270/action' and method == 'POST':
+        return 200, gmvb_hack3270.action(lab, sid, str(data.get('action') or 'MENU'), data)
+    if p == '/api/v1/gmvb/hack3270/fields':
+        return 200, gmvb_hack3270.fields_api(lab, sid, str(query.get('category') or data.get('category') or 'ALL'))
+    if p == '/api/v1/gmvb/hack3270/log':
+        return 200, gmvb_hack3270.log_api(lab, sid)
+    m = re.match(r"/api/v1/gmvb/hack3270/replay/([^/]+)$", p)
+    if m:
+        return 200, gmvb_hack3270.replay_api(lab, sid, m.group(1))
+    if p == '/api/v1/gmvb/hack3270/export':
+        return 200, gmvb_hack3270.export(lab, sid)
+
+    if p in {'/api/v1/gmvb/health','/api/v1/gmvb/capabilities'}:
+        return 200, {"status":"ok","application":"GMVB","auth":"GACF/RACF PASSTICKET MFA","cics_transaction":"GMVB","hack3270_lab":"screen-model simulation available and off by default"}
+    if p in {'/api/v1/gmvb/session/start'}:
+        return 200, _gmvb_screen_model(lab, sid)
+    if p == '/api/v1/gmvb/session/action' and method == 'POST':
+        command=str(data.get('command') or data.get('action') or '')
+        if command.upper().startswith('HACK3270'):
+            parts=command.split(maxsplit=1); act=parts[1] if len(parts)>1 else 'MENU'
+            return 200, gmvb_hack3270.action(lab, sid, act, data)
+        lab.terminal_submit(sid, fields=data.get('fields') or {}, command=command, pf=str(data.get('pf') or ''))
+        return 200, _gmvb_screen_model(lab, sid)
+    m = re.match(r"/api/v1/gmvb/session/([^/]+)$", p)
+    if m:
+        return 200, _gmvb_screen_model(lab, m.group(1))
+    if p == '/api/v1/gmvb/auth/login':
+        snap=lab.login(sid, str(data.get('userid') or data.get('user') or ''), str(data.get('password') or ''), str(data.get('passticket') or ''), str(data.get('applid') or 'GMVB'))
+        return (200 if snap.get('authenticated') else 401), snap
+    m=re.match(r"/api/v1/gmvb/customers/([^/]+)$", p)
+    if m: return 200, lab.gmvb_customer_lookup(sid, m.group(1))
+    m=re.match(r"/api/v1/gmvb/accounts/([^/]+)$", p)
+    if m:
+        acct=m.group(1); row=lab.gmvb_accounts.get(acct); return (200 if row else 404), ({"ACCOUNT_NUMBER":acct, **row} if row else {"error":"not found"})
+    m=re.match(r"/api/v1/gmvb/transactions/([^/]+)$", p)
+    if m:
+        acct=m.group(1); return 200, [x for x in lab.gmvb_transactions if x.get('ACCOUNT')==acct or x.get('ACCOUNT_NUMBER')==acct]
+    if p == '/api/v1/gmvb/transactions' and method == 'POST': return 200, lab.gmvb_post_transaction(sid, {"ACCOUNT":data.get('account') or data.get('ACCOUNT'), "TRANTYPE":data.get('type') or data.get('TRANTYPE','CR'), "AMOUNT":data.get('amount') or data.get('AMOUNT','0'), "TO_ACCOUNT":data.get('to_account',''), "DESC":data.get('description','REST POST')})
+    if p == '/api/v1/gmvb/audit': return 200, list(getattr(lab,'gmvb_audit',[]))
+    if p == '/api/v1/gmvb/labs': return 200, lab.gmvb_scenarios
+    m=re.match(r"/api/v1/gmvb/labs/([^/]+)/activate$", p)
+    if m and method == 'POST': return 200, lab.gmvb_activate_lab(sid, m.group(1))
+    if p == '/api/v1/gmvb/admin/users': return 200, sorted(lab.state.racf.users)
+    return 404, {"error":"not found"}
+
+
+def render_gmvb_web(lab, sid: str) -> str:
+    snap = lab.snapshot(sid)
+    terminal = html.escape(str(snap.get('terminal_screen','')))
+    rows_text = html.escape(_gmvb_rows_to_terminal(snap.get('rows') or []))
+    sid_e = html.escape(sid)
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>GMVB Banking Terminal</title><style>
+body{{background:#000;color:#33ff33;font-family:'Courier New',monospace;margin:0;padding:1rem}}
+.terminal{{max-width:1120px;margin:auto;border:2px solid #33ff33;background:#020402;box-shadow:0 0 18px #0f3;padding:1rem}}
+.header{{color:#aaffaa;border-bottom:1px solid #33ff33;padding-bottom:.4rem;margin-bottom:.6rem}}
+.screen{{white-space:pre-wrap;min-height:420px;border:1px solid #14532d;padding:1rem;background:#000;color:#33ff33}}
+.output{{white-space:pre-wrap;border-top:1px dashed #14532d;margin-top:.6rem;padding-top:.6rem;color:#aaffaa}}
+input{{background:#001b06;color:#3399ff;border:1px solid #33ff33;font-family:inherit;padding:.25rem;margin:.15rem}}
+button{{background:#001b06;color:#aaffaa;border:1px solid #33ff33;font-family:inherit;padding:.3rem .6rem;margin:.15rem;cursor:pointer}}
+.alert{{color:#ff3333}} .warn{{color:#ffcc33}} .cyan{{color:#79d8ff}}
+.panel{{border:1px solid #14532d;padding:.6rem;margin-top:.6rem;background:#001000}}
+</style></head><body><div class='terminal' id='gmvb-terminal'>
+<div class='header'>BANKMASTER/VS GMVB CICS BANKING TERMINAL &nbsp; SID={sid_e} &nbsp; HACK3270=<span id='hack-state'>OFF</span></div>
+<div id='screen' class='screen'>{terminal}<div class='output'>{rows_text}</div></div>
+<div class='panel'>
+  CMD ===> <input id='cmd' maxlength='80' value=''>
+  <button onclick='sendAction()'>ENTER</button><button onclick='pf("PF3")'>PF3 MENU</button><button onclick='pf("PF8")'>PF8 INQ</button><button onclick='hack("MENU")'>HACK3270 MENU</button><button onclick='hack("ON")'>HACK3270 ON</button><button onclick='hack("OFF")'>HACK3270 OFF</button>
+</div>
+<div id='hack-panel' class='panel' style='display:none'></div>
+</div><script>
+const SID={json.dumps(sid)};
+async function post(url, data){{ const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(Object.assign({{sid:SID}},data||{{}}))}}); return await r.json(); }}
+function renderRows(rows){{ if(!rows||!rows.length)return ''; return rows.map(r=>Object.entries(r).map(([k,v])=>`${{k}}=${{v}}`).join(' | ')).join('\n'); }}
+function render(data){{
+  const s=data.screen_model||data.screen||data.target_screen||data;
+  const out=[];
+  if(s.output) out.push(Array.isArray(s.output)?s.output.join('\n'):s.output);
+  if(s.terminal_screen) out.push(s.terminal_screen);
+  if(data.message) out.push(data.message);
+  if(data.rows) out.push(renderRows(data.rows));
+  if(s.rows) out.push(renderRows(s.rows));
+  if(data.bundle) out.push(JSON.stringify(data.bundle,null,2));
+  document.getElementById('screen').textContent=out.filter(Boolean).join('\n\n') || JSON.stringify(data,null,2);
+  if(data.status && typeof data.status==='object') document.getElementById('hack-state').textContent=data.status.enabled?'ON':'OFF';
+  if(data.title && String(data.title).startsWith('HACK3270')){{document.getElementById('hack-panel').style.display='block';document.getElementById('hack-panel').textContent=(data.output?data.output.join('\n'):JSON.stringify(data,null,2));}}
+}}
+async function sendAction(){{ const cmd=document.getElementById('cmd').value; document.getElementById('cmd').value=''; render(await post('/api/v1/gmvb/session/action',{{command:cmd}})); }}
+async function pf(key){{ render(await post('/api/v1/gmvb/session/action',{{pf:key}})); }}
+async function hack(action){{ render(await post('/api/v1/gmvb/hack3270/action',{{action:action}})); }}
+async function status(){{ const r=await fetch('/api/v1/gmvb/hack3270/status?sid='+encodeURIComponent(SID)); const data=await r.json(); document.getElementById('hack-state').textContent=data.enabled?'ON':'OFF'; }}
+status();
+</script></body></html>"""

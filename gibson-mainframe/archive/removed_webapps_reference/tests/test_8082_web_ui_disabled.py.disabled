@@ -1,0 +1,89 @@
+import http.client
+import json
+import threading
+import time
+
+from gibson.services.rest_gateway import serve_rest
+from tests.test_banking_tn3270_web_lab import make_state, _free_port
+
+
+def rest_state(tmp_path):
+    st = make_state(tmp_path, rest_port=_free_port())
+    t = threading.Thread(target=serve_rest, args=(st,), daemon=True)
+    t.start()
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=0.5)
+            conn.request("GET", "/bank/session")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            return st
+        except Exception:
+            time.sleep(0.1)
+    raise AssertionError("REST gateway did not start")
+
+
+def request(st, method, path, body=None):
+    conn = http.client.HTTPConnection("127.0.0.1", st.config.rest_port, timeout=2)
+    headers = {}
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, dict(resp.getheaders()), data
+
+
+def assert_disabled(status, headers, data):
+    assert status == 410
+    assert b"<html" not in data.lower()
+    payload = json.loads(data.decode("utf-8"))
+    assert payload["status"] == "disabled"
+    assert payload["component"] == "port-8082-web-ui"
+    assert "L TSO" in payload["message"]
+
+
+def test_user_facing_8082_pages_are_disabled(tmp_path):
+    st = rest_state(tmp_path)
+    for path in ["/", "/gmvb", "/gmvb/menu", "/gmvb/manual", "/gmvb/labs", "/gmvb/solutions", "/bank/gmvb", "/query-form"]:
+        assert_disabled(*request(st, "GET", path))
+
+
+def test_query_form_post_is_disabled_but_query_api_remains(tmp_path):
+    st = rest_state(tmp_path)
+    assert_disabled(*request(st, "POST", "/query-form", {"user":"IBMUSER","password":"SYS1","sql":"SELECT * FROM GIBSON.ACCOUNT"}))
+    status, headers, data = request(st, "POST", "/query", {"user":"IBMUSER","password":"SYS1","sql":"SELECT * FROM GIBSON.ACCOUNT"})
+    assert status in (200, 400, 403)
+    assert b"<html" not in data.lower()
+    json.loads(data.decode("utf-8"))
+
+
+def test_legacy_bank_json_backends_remain_without_html_pages(tmp_path):
+    st = rest_state(tmp_path)
+    checks = [
+        ("GET", "/bank/session", None),
+        ("GET", "/bank/account?id=10001&user=IBMUSER", None),
+        ("POST", "/bank/login", {"user":"IBMUSER","password":"SYS1"}),
+        ("POST", "/bank/transfer", {"user":"IBMUSER","source":"10001","destination":"10002","amount":"1.00"}),
+    ]
+    for method, path, body in checks:
+        status, headers, data = request(st, method, path, body)
+        assert status == 200
+        assert b"<html" not in data.lower()
+        json.loads(data.decode("utf-8"))
+
+
+def test_passticket_and_gmvb_api_backends_remain_available(tmp_path):
+    st = rest_state(tmp_path)
+    status, headers, data = request(st, "POST", "/bank/passticket/generate", {"sid":"S1","userid":"IBMUSER","applid":"CICS"})
+    assert status == 200
+    json.loads(data.decode("utf-8"))
+    status, headers, data = request(st, "GET", "/api/v1/gmvb/health")
+    assert status in (200, 404)
+    assert b"<html" not in data.lower()
+    json.loads(data.decode("utf-8"))

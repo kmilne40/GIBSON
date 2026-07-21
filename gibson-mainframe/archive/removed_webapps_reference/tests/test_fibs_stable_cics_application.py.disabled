@@ -1,0 +1,83 @@
+from gibson.core.state import GibsonState
+from gibson.apps.cics import CicsSimulator
+from gibson.services.react8999_api import handle_ui8999
+
+
+def test_cics_fibs_menu_options_do_not_fall_to_dfhce3551():
+    st = GibsonState.create(); c = CicsSimulator(st, "IBMUSER")
+    assert "FIBS - GIBSON BANKING APPLICATION" in c.execute("FIBS")
+    out = c.execute("1")
+    assert "FIBS CUSTOMER INQUIRY" in out
+    assert "DFHCE3551" not in out
+    out = c.execute("10000002")
+    assert "MARGARET THATCHER" in out
+    assert "DFHCE3551" not in out
+
+
+def test_cics_pf3_and_pf5_navigation_inside_fibs():
+    st = GibsonState.create(); c = CicsSimulator(st, "IBMUSER")
+    c.execute("FIBS"); c.execute("1"); c.execute("10000002")
+    out = c.execute("PF3")
+    assert "FIBS - GIBSON BANKING APPLICATION" in out
+    c.execute("2"); c.execute("1000000201")
+    out = c.execute("PF5")
+    assert "FIBS ACCOUNT INQUIRY" in out
+    assert "ACCOUNT NUMBER" in out or "ACCOUNT . ." in out
+
+
+def test_cics_customer_and_account_add_delete_workflows():
+    st = GibsonState.create(); c = CicsSimulator(st, "IBMUSER")
+    c.execute("FIBS")
+    out = c.execute("CUST ADD FORENAME=TEST SURNAME=CLERK TOWN=LEEDS")
+    assert "CUSTOMER RECORD CREATED" in out
+    # Extract created id from display and delete through the same screen path.
+    created = [tok for tok in out.split() if tok.startswith("100000")][0]
+    out = c.execute(f"DEL {created}")
+    assert "CUSTOMER RECORD DELETED" in out
+    c.execute("PF3")
+    out = c.execute("ACCT ADD CUSTOMER=10000002 TYPE=CUR BALANCE=1.00")
+    assert "ACCOUNT RECORD CREATED" in out
+    acct = [tok for tok in out.split() if tok.startswith("100000") and len(tok) >= 10][0]
+    out = c.execute(f"DEL {acct}")
+    assert "ACCOUNT RECORD DELETED" in out
+
+
+def test_cics_batch_swift_and_cobol_scroll_are_stateful():
+    st = GibsonState.create(); c = CicsSimulator(st, "IBMUSER")
+    c.execute("FIBS")
+    out = c.execute("B")
+    assert "FIBS BATCH PROCESSING" in out
+    out = c.execute("RELEASE B2026A17 PIN=0032")
+    assert "BATCH RELEASED" in out
+    c.execute("PF3")
+    out = c.execute("SWFT")
+    assert "FIBS SWIFT MESSAGE PROCESSING" in out
+    out = c.execute("APPROVE SWF000001")
+    assert "APPROVED" in out
+    c.execute("PF3")
+    out1 = c.execute("COBL")
+    out2 = c.execute("PF8")
+    assert "FIBS COBOL / BMS SOURCE REVIEW" in out1
+    assert "SCROLLED DOWN" in out2
+    out3 = c.execute("PF7")
+    assert "SCROLLED UP" in out3
+
+
+def test_react8999_fibs_customer_and_account_are_service_backed_and_pf3_returns_menu():
+    st = GibsonState.create(); sid = "TSTFIBS"
+    code, payload = handle_ui8999(st, "/api/v1/ui8999/terminal/start", "POST", {"sid": sid, "userid": "GUEST"}, {})
+    assert code == 200
+    assert payload["data"]["screen"]["name"] == "FIBS"
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "1", "current_screen": "FIBS", "fields": {}}, {})
+    assert payload["data"]["screen"]["name"] == "CUST"
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "", "current_screen": "CUST", "fields": {"customer_id": "10000002"}}, {})
+    fields = {f["id"]: f for f in payload["data"]["screen"]["fields"]}
+    assert fields["surname"]["value"] == "THATCHER"
+    assert fields["surname"]["protected"] is True
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/aid", "POST", {"sid": sid, "aid": "PF3"}, {})
+    assert payload["data"]["screen"]["name"] == "FIBS"
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "2", "current_screen": "FIBS", "fields": {}}, {})
+    code, payload = handle_ui8999(st, f"/api/v1/ui8999/terminal/session/{sid}/command", "POST", {"sid": sid, "command": "", "current_screen": "ACCT", "fields": {"account": "1000000201"}}, {})
+    fields = {f["id"]: f for f in payload["data"]["screen"]["fields"]}
+    assert fields["balance"]["value"] == "8742.10"
+    assert fields["balance"]["protected"] is True

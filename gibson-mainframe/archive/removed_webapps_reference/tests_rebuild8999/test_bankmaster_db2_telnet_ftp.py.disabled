@@ -1,0 +1,107 @@
+from pathlib import Path
+
+from gibson.core.config import GibsonConfig
+from gibson.core.state import GibsonState
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.apps.fibs_cics_bank import reset_fibs_cics_session, authenticate, route_screen
+from gibson.apps.uss_telnet_client import TelnetSubsession
+from gibson.apps.uss_ftp_client import FtpSubsession
+
+
+def make_state(tmp_path: Path) -> GibsonState:
+    cfg = GibsonConfig(sim_root=tmp_path, files_root=tmp_path/'f', commands_dir=tmp_path/'f'/'commands', gacf_path=tmp_path/'GACF.DB')
+    return GibsonState.create(cfg)
+
+
+def test_fibs_tables_visible_and_queryable(tmp_path):
+    state = make_state(tmp_path)
+    db = Db2Simulator(state)
+    tables = db.run_sql("SELECT NAME, CREATOR FROM SYSIBM.SYSTABLES WHERE CREATOR='FIBS'")
+    names = {r['NAME'] for r in tables}
+    for name in {'CUSTOMER','ACCOUNT','CONTROL','PROCTRAN','AUDITLOG','BATCH_TRANSFER','PAYMENT_BATCH','SWIFT_MESSAGE','SWIFT_AUDIT','CARD_APPLICATION','COBOL_SOURCE','API_AUDIT','TN3270_CAPTURE','HACK3270_EVENT'}:
+        assert name in names
+    assert db.run_sql("SELECT * FROM FIBS.CUSTOMER WHERE CUSTOMER_ID='10000002'")[0]['SURNAME'] == 'THATCHER'
+    assert db.run_sql("SELECT * FROM FIBS.ACCOUNT WHERE ACCOUNT_NUMBER='1000000201'")[0]['ACTUAL_BALANCE'] == '8742.10'
+    assert 'THATCHER' in db.format_spufi("SELECT * FROM FIBS.CUSTOMER WHERE CUSTOMER_ID='10000002'")
+
+
+def test_fibs_cics_uses_db2_for_read_write_and_audit(tmp_path):
+    state = make_state(tmp_path)
+    db = Db2Simulator(state)
+    sess = reset_fibs_cics_session('pytest')
+    assert authenticate(state, sess, 'IBMUSER', 'SYS1')[0]
+    cust = route_screen(state, sess, 'CUST 10000002')
+    assert any('THATCHER' in line for line in cust['lines'])
+    acct = route_screen(state, sess, 'ACCT 1000000201')
+    assert any('8742.10' in line for line in acct['lines'])
+    route_screen(state, sess, 'TRAN', {'from_account':'1000000101','to_account':'1000000201','amount':'1.23'})
+    assert db.run_sql("SELECT * FROM FIBS.PROCTRAN")[-1]['AMOUNT'] == '1.23'
+    route_screen(state, sess, 'BULK', {'batch_id':'B2026A17','release_pin':'0032'})
+    assert db.run_sql("SELECT * FROM FIBS.BATCH_TRANSFER WHERE BATCH_ID='B2026A17'")[0]['STATUS'] == 'RELEASED'
+    route_screen(state, sess, 'REST')
+    route_screen(state, sess, 'TN32')
+    route_screen(state, sess, 'DVCA')
+    assert db.run_sql("SELECT * FROM FIBS.AUDITLOG")
+    assert db.run_sql("SELECT * FROM FIBS.API_AUDIT")
+    assert db.run_sql("SELECT * FROM FIBS.TN3270_CAPTURE")
+    assert db.run_sql("SELECT * FROM FIBS.HACK3270_EVENT")
+    assert db.run_sql("SELECT * FROM FIBS.COBOL_SOURCE")
+
+
+class FakeTelnetSocket:
+    def __init__(self):
+        self.replies = [b'GIBSON USS terminal on port 2022\nlogin:', b'Password:', b'IBMUSER:/u/ibmuser$ ']
+    def settimeout(self, _): pass
+    def recv(self, _):
+        if self.replies:
+            return self.replies.pop(0)
+        import socket
+        raise socket.timeout()
+    def sendall(self, data):
+        self.last = data
+    def close(self): pass
+
+
+def test_telnet_prompt_after_authentication_only():
+    sub = TelnetSubsession(socket_factory=lambda *a, **k: FakeTelnetSocket())
+    out = sub.handle('open 192.168.0.197 2022')
+    assert 'login:' in out
+    assert 'telnet>' not in out
+    out = sub.handle('IBMUSER')
+    assert 'Password:' in out
+    assert 'telnet>' not in out
+    out = sub.handle('SYS1')
+    assert 'IBMUSER:/u/ibmuser$' in out
+
+
+class FakeFtp:
+    def connect(self, host, port, timeout=10): return '220 GIBSON FTP READY'
+    def set_pasv(self, _): pass
+    def login(self, user, password):
+        if password != 'SYS1': raise Exception('530 Login incorrect')
+        return f'230 {user} is logged on.'
+    def pwd(self): return '/'
+    def retrlines(self, cmd, cb): cb('SYS1'); cb('IBMUSER')
+    def nlst(self, *args): return ['SYS1','IBMUSER']
+    def close(self): pass
+    def quit(self): return '221 Goodbye'
+
+
+class FakeEnv:
+    state = None
+    def resolve(self, cwd, p): return p
+    def real_path(self, p): return Path('/tmp')
+
+
+def test_ftp_prompt_after_authentication_only():
+    sub = FtpSubsession(FakeEnv(), lambda: '/', lambda p: None, ftp_factory=FakeFtp)
+    out = sub.handle('open 192.168.0.197 21')
+    assert 'Name (192.168.0.197:IBMUSER):' in out
+    assert 'ftp>' not in out
+    out = sub.handle('IBMUSER')
+    assert 'Password:' in out
+    assert 'ftp>' not in out
+    out = sub.handle('SYS1')
+    assert '230 IBMUSER is logged on.' in out
+    assert 'ftp>' in out
+    assert 'SYS1' in sub.handle('ls')

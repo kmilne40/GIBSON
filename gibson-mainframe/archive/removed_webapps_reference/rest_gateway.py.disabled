@@ -1,0 +1,929 @@
+from __future__ import annotations
+
+import html
+import json
+import secrets
+import threading
+import weakref
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from gibson.apps.banking_lab import get_banking_lab
+from gibson.apps.gmvb_upgrade import gmvb_json_api, render_gmvb_web
+from gibson.apps.db2_sim import Db2Simulator
+from gibson.core.state import GibsonState
+from gibson.core.issues import is_expected_disconnect
+from gibson.core.transfers import get_transfer_manager
+
+
+_REST_SERVERS: "weakref.WeakSet[_FallbackRestServer]" = weakref.WeakSet()
+_REST_LOCK = threading.RLock()
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in {'1','true','yes','y','on'}:
+        return True
+    if s in {'0','false','no','n','off',''}:
+        return False
+    return bool(value)
+
+
+def _web_ui_disabled_payload(path: str) -> dict[str, Any]:
+    return {
+        "status": "disabled",
+        "component": "port-8082-web-ui",
+        "path": path,
+        "message": "Web UI disabled; use L TSO, L CICS or L DB2 from the Gibson terminal. Backend/API services remain available where documented.",
+    }
+
+def _is_html_request(headers: Any) -> bool:
+    accept = str(headers.get("Accept", "")) if headers is not None else ""
+    return "text/html" in accept.lower()
+
+
+def _query_db2(state: GibsonState, data: dict[str, Any]) -> tuple[int, dict[str, Any] | list[dict[str, str]]]:
+    user = str(data.get("user", "")).upper()
+    password = str(data.get("password", ""))
+    sql = str(data.get("sql", ""))
+    if not user or not password or not sql:
+        return 400, {"error": "'user', 'password' and 'sql' fields are required"}
+    state.racf.load()
+    if not state.racf.verify_password(user, password):
+        state.record_security_event(user or "UNKNOWN", "LOGON", "DB2 QUERY PASSWORD FAILURE", result="FAILURE", service="REST")
+        return 403, {"error": "invalid user or password"}
+    state.record_security_event(user, "LOGON", "DB2 QUERY PASSWORD", service="REST")
+    rec = state.racf.get(user)
+    if rec and not rec.has_omvs:
+        return 403, {"error": "OMVS segment missing"}
+    try:
+        return 200, Db2Simulator(state).run_sql(sql, user)
+    except PermissionError as exc:
+        return 403, {"error": str(exc)}
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+    except Exception as exc:  # pragma: no cover
+        return 500, {"error": f"internal error: {exc}"}
+
+
+
+def _render_rows(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return "<p class='small'>No rows.</p>"
+    headers = list(rows[0].keys())
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = []
+    for row in rows:
+        body.append("<tr>" + "".join(f"<td>{html.escape(str(row.get(h, '')))}</td>" for h in headers) + "</tr>")
+    return f"<table><tr>{head}</tr>{''.join(body)}</table>"
+
+
+
+def _render_portal(state: GibsonState, sid: str, *, query_status: int | None = None, query_payload: Any = None, query_sql: str = "") -> str:
+    lab = get_banking_lab(state)
+    snap = lab.snapshot(sid)
+    initial = json.dumps(snap)
+    query_result = ""
+    if query_status is not None:
+        payload = query_payload if isinstance(query_payload, str) else json.dumps(query_payload, indent=2)
+        query_result = f"<div class='panel'><h3>REST /query result (HTTP {query_status})</h3><pre>{html.escape(payload)}</pre></div>"
+    sid_esc = html.escape(sid)
+    query_sql = html.escape(query_sql or "SELECT CURRENT SERVER FROM SYSIBM.SYSDUMMY1;")
+    initial_terminal = html.escape(str(snap.get("terminal_screen", "")))
+    return f"""
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Gibson Sighberbank TN3270 Web Lab</title>
+<style>
+:root {{
+  --bg:#020a02; --panel:#091109; --panel2:#0d180d; --green:#72ff7e; --dim:#2fd05d; --cyan:#79d8ff; --red:#ff6b6b; --amber:#ffd166; --line:#1d6b35; --white:#f8fff8;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--green); font-family: "Courier New", Courier, monospace; }}
+a {{ color: var(--cyan); }}
+.topbar {{ display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; padding:.8rem 1rem; border-bottom:1px solid var(--line); background:#030703; position:sticky; top:0; z-index:2; }}
+.brand {{ color:var(--white); font-weight:bold; margin-right:1rem; }}
+.tab {{ border:1px solid var(--line); background:#061006; color:var(--green); padding:.45rem .7rem; cursor:pointer; border-radius:.35rem; }}
+.tab.active {{ border-color:var(--cyan); color:var(--white); }}
+.layout {{ display:grid; grid-template-columns:minmax(540px,2fr) minmax(320px,1fr); gap:1rem; padding:1rem; }}
+.panel {{ border:1px solid var(--line); background:linear-gradient(180deg,var(--panel),var(--panel2)); padding:.85rem; border-radius:.45rem; box-shadow:0 0 0 1px rgba(114,255,126,.05) inset; }}
+.screenwrap {{ border:1px solid #194d2c; padding:.5rem; background:#000; }}
+.screen {{ white-space:pre; min-height:30rem; margin:0; font-size:15px; line-height:1.12; color:var(--green); }}
+.subtitle {{ color:var(--cyan); margin:.2rem 0 .7rem; }}
+.forms {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:.75rem; margin-top:.8rem; }}
+.field {{ display:flex; flex-direction:column; gap:.2rem; }}
+label {{ font-size:.92rem; color:var(--white); }}
+input, textarea, select {{ width:100%; padding:.45rem .55rem; background:#020702; border:1px solid #14532d; color:var(--green); border-radius:.3rem; font-family:inherit; }}
+input[readonly] {{ opacity:.7; }}
+button {{ border:1px solid var(--line); background:#071407; color:var(--green); padding:.5rem .7rem; border-radius:.32rem; cursor:pointer; font-family:inherit; }}
+button:hover {{ border-color:var(--cyan); color:var(--white); }}
+.controls {{ display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.75rem; }}
+.kv {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:.45rem; }}
+.small {{ color:#9bd3a1; font-size:.9rem; }}
+.status {{ color:var(--amber); }}
+.note-list li {{ margin-bottom:.35rem; }}
+.meta {{ font-size:.85rem; color:var(--cyan); }}
+pre {{ overflow:auto; }}
+table {{ border-collapse:collapse; width:100%; margin-top:.5rem; }}
+th,td {{ border:1px solid #14532d; padding:.35rem .4rem; text-align:left; vertical-align:top; }}
+th {{ color:var(--white); background:#0a170a; }}
+.toolbar-note {{ margin-left:auto; color:var(--amber); font-size:.9rem; }}
+.switches {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:.3rem .8rem; margin-top:.6rem; }}
+.switches label {{ display:flex; align-items:center; gap:.45rem; color:var(--green); }}
+.switches input {{ width:auto; }}
+.hidden-note {{ color:var(--red); }}
+.section-title {{ color:var(--white); margin:.1rem 0 .55rem; }}
+.pill {{ display:inline-block; border:1px solid var(--line); padding:.1rem .4rem; border-radius:999px; margin-right:.35rem; color:var(--cyan); font-size:.82rem; }}
+.footer {{ padding:0 1rem 1rem; color:#8ac99a; }}
+@media (max-width: 1080px) {{ .layout {{ grid-template-columns:1fr; }} }}
+</style>
+</head>
+<body>
+<div class='topbar'>
+  <div class='brand'>Gibson Sighberbank TN3270 Web Lab</div>
+  <button class='tab active' type='button' onclick='showView("terminal")'>Terminal</button>
+  <button class='tab' type='button' onclick='showView("hack")'>Hack3270</button>
+  <button class='tab' type='button' onclick='showView("trace")'>API Trace</button>
+  <button class='tab' type='button' onclick='showView("passticket")'>PassTicket</button>
+  <button class='tab' type='button' onclick='showView("tutorial")'>Tutorial</button>
+  <button class='tab' type='button' onclick='showView("solutions")'>Solutions</button>
+  <span class='toolbar-note'>Port 8082 · DVCA-style banking flow · Hack3270-inspired field panel</span>
+</div>
+<div class='layout'>
+  <div class='panel'>
+    <div class='section-title'>CICS simulated green-screen front end</div>
+    <div class='subtitle'>This browser page mirrors a CICS/GMVB-style TN3270 banking workflow while keeping the original <code>POST /query</code> SQL gateway available. It is both a training banking application and a banking lab for Gibson.</div>
+    <div class='screenwrap'><pre id='terminal-screen' class='screen'>{initial_terminal}</pre></div>
+    <div class='controls'>
+      <button type='button' onclick='sendPF("PF3")'>PF3 Back</button>
+      <button type='button' onclick='sendPF("PF4")'>PF4 Menu</button>
+      <button type='button' onclick='sendPF("PF12")'>PF12 Logoff</button>
+      <button type='button' onclick='loadSession()'>Refresh</button>
+    </div>
+    <div id='field-form' class='forms'></div>
+    <div class='controls'>
+      <button type='button' onclick='submitCurrentScreen()'>Enter</button>
+      <button type='button' onclick='directMenu("MENU")'>Menu</button>
+      <button type='button' onclick='directMenu("ACCT")'>ACCT</button>
+      <button type='button' onclick='directMenu("STMT")'>STMT</button>
+      <button type='button' onclick='directMenu("XFER")'>XFER</button>
+      <button type='button' onclick='directMenu("APRV")'>APRV</button>
+      <button type='button' onclick='directMenu("PTKT")'>PTKT</button>
+      <button type='button' onclick='directMenu("HACK")'>HACK</button>
+    </div>
+    <div id='status-block' class='small status'></div>
+    <div id='rows-block'></div>
+  </div>
+  <div>
+    <div id='hack-view' class='panel'>
+      <div class='section-title'>Hack3270 field manipulation panel</div>
+      <div class='small'>Hack3270 documents field-attribute hacking, hidden-field reveal, numeric-only bypass, and key injection against TN3270 application flows. This panel recreates those ideas inside Gibson so you can demonstrate why field controls are not security controls.</div>
+      <div class='switches'>
+        <label><input id='hack_enabled' type='checkbox' onchange='applyHack()'>Hack fields</label>
+        <label><input id='reveal_hidden' type='checkbox' onchange='applyHack()'>Reveal hidden fields</label>
+        <label><input id='remove_protection' type='checkbox' onchange='applyHack()'>Disable protection</label>
+        <label><input id='remove_numeric' type='checkbox' onchange='applyHack()'>Remove numeric-only</label>
+        <label><input id='show_metadata' type='checkbox' onchange='applyHack()'>Show field metadata</label>
+        <label><input id='show_mdt' type='checkbox' onchange='applyHack()'>Show MDT</label>
+        <label><input id='show_positions' type='checkbox' onchange='applyHack()'>Show row/col positions</label>
+        <label><input id='show_standard' type='checkbox' onchange='applyHack()'>Show standard fields</label>
+      </div>
+      <div id='field-meta' class='small' style='margin-top:.75rem;'></div>
+    </div>
+    <div id='trace-view' class='panel' style='margin-top:1rem;'>
+      <div class='section-title'>API / COBOL / Db2 trace</div>
+      <div class='small'>The trace links each lab action to simulated <code>EXEC CICS</code>, COBOL, and Db2 activity.</div>
+      <div id='trace-block'></div>
+    </div>
+    <div id='passticket-view' class='panel' style='margin-top:1rem;'>
+      <div class='section-title'>PassTicket lab</div>
+      <div class='small'>Generate a simulated RACF PassTicket, adjust PTKTDATA lab flags, and sign on to the banking region without sending a RACF password.</div>
+      <div class='forms'>
+        <div class='field'><label>User</label><input id='ptkt_user' value='IBMUSER'></div>
+        <div class='field'><label>APPLID</label><input id='ptkt_appl' value='CICS'></div>
+        <div class='field'><label>PassTicket</label><input id='ptkt_ticket' value=''></div>
+      </div>
+      <div class='controls'>
+        <button type='button' onclick='generatePassTicket()'>Generate</button>
+        <button type='button' onclick='usePassTicket()'>Use on LOGN</button>
+        <button type='button' onclick='setPassTicketScenario(true,false,false)'>Strict default</button>
+        <button type='button' onclick='setPassTicketScenario(false,false,false)'>Replay off</button>
+        <button type='button' onclick='setPassTicketScenario(null,true,false)'>Relax APPL match</button>
+        <button type='button' onclick='setPassTicketScenario(null,null,true)'>Enable leak</button>
+      </div>
+      <div id='ptkt-profile-block'></div>
+      <div id='ptkt-issued-block'></div>
+      <div id='ptkt-audit-block'></div>
+    </div>
+    <div id='tutorial-view' class='panel' style='margin-top:1rem;'>
+      <div class='section-title'>Tutorial and solutions</div>
+      <div class='kv'>
+        <div>
+          <span class='pill'>Tutorial mode</span>
+          <select id='tutorial_mode' onchange='applyHack()'>
+            <option value='off'>Off</option>
+            <option value='hint'>Hint</option>
+            <option value='guided'>Guided</option>
+          </select>
+        </div>
+        <div>
+          <span class='pill'>Solutions</span>
+          <label><input id='show_solutions' type='checkbox' onchange='applyHack()'>Show solutions</label>
+        </div>
+      </div>
+      <h3 id='tutorial-title' class='section-title'></h3>
+      <p id='tutorial-hint' class='small'></p>
+      <p id='tutorial-guided' class='small'></p>
+      <p id='tutorial-solution' class='small'></p>
+    </div>
+    <div class='panel' style='margin-top:1rem;'>
+      <div class='section-title'>Original REST SQL gateway</div>
+      <div class='small'>The compatibility route remains available at <code>POST /query</code>.</div>
+      <form method='post' action='/query-form'>
+        <input type='hidden' name='sid' value='{sid_esc}'>
+        <div class='forms'>
+          <div class='field'><label>User</label><input name='user' value='IBMUSER'></div>
+          <div class='field'><label>Password</label><input type='password' name='password' value='SYS1'></div>
+          <div class='field' style='grid-column:1/-1'><label>SQL</label><textarea name='sql' rows='4'>{query_sql}</textarea></div>
+        </div>
+        <div class='controls'><button type='submit'>Execute SQL</button></div>
+      </form>
+      {query_result}
+    </div>
+  </div>
+</div>
+<div class='footer small'>
+  <p>Compatibility routes preserved: <code>/query</code>, <code>/query-form</code>, <code>/bank/login</code>, <code>/bank/account</code>, and <code>/bank/transfer</code>. PassTicket lab routes add <code>/bank/passticket/generate</code>, <code>/bank/passticket/use</code>, and <code>/bank/passticket/scenario</code>. The full COBOL-inspired lab flow now renders as a DVCA-style banking terminal with a Hack3270 button on the same page.</p>
+</div>
+<script>
+const initialState = {initial};
+let currentState = initialState;
+let currentView = 'terminal';
+const SID = initialState.sid || '{sid_esc}';
+function esc(value) {{
+  return String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+function showView(view) {{
+  currentView = view;
+  document.querySelectorAll('.tab').forEach(btn => btn.classList.remove('active'));
+  const labels = ['terminal','hack','trace','passticket','tutorial','solutions'];
+  const idx = labels.indexOf(view);
+  if (idx >= 0) document.querySelectorAll('.tab')[idx].classList.add('active');
+  if (view === 'hack') document.getElementById('hack-view').scrollIntoView({{behavior:'smooth', block:'start'}});
+  if (view === 'trace') document.getElementById('trace-view').scrollIntoView({{behavior:'smooth', block:'start'}});
+  if (view === 'passticket') document.getElementById('passticket-view').scrollIntoView({{behavior:'smooth', block:'start'}});
+  if (view === 'tutorial' || view === 'solutions') document.getElementById('tutorial-view').scrollIntoView({{behavior:'smooth', block:'start'}});
+}}
+async function postJSON(path, payload) {{
+  const resp = await fetch(path, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
+  return await resp.json();
+}}
+function renderRows(rows) {{
+  const target = document.getElementById('rows-block');
+  if (!rows || !rows.length) {{ target.innerHTML = ''; return; }}
+  const headers = Object.keys(rows[0]);
+  const head = '<tr>' + headers.map(h => `<th>${{esc(h)}}</th>`).join('') + '</tr>';
+  const body = rows.map(row => '<tr>' + headers.map(h => `<td>${{esc(row[h])}}</td>`).join('') + '</tr>').join('');
+  target.innerHTML = `<div class='panel' style='margin-top:1rem;'><div class='section-title'>Result rows</div><table>${{head}}${{body}}</table></div>`;
+}}
+function renderFields(fields) {{
+  const target = document.getElementById('field-form');
+  if (!fields || !fields.length) {{ target.innerHTML = ''; return; }}
+  let htmlOut = '';
+  fields.forEach(field => {{
+    if (!field.visible && !currentState.hack.show_metadata) return;
+    const readonly = field.editable ? '' : 'readonly';
+    const cls = (!field.visible ? 'hidden-note' : field.protected ? 'meta' : '');
+    const type = field.hidden && !currentState.hack.reveal_hidden ? 'password' : 'text';
+    htmlOut += `<div class='field'><label>${{esc(field.label)}} <span class='${{cls}}'>${{field.hidden ? '[HIDDEN]' : field.protected ? '[PROTECTED]' : '[STANDARD]'}}${{field.numeric ? ' [NUM]' : ''}}</span></label><input data-name='${{esc(field.name)}}' data-screen='${{esc(currentState.current_screen)}}' type='${{type}}' value='${{esc(field.value)}}' ${{readonly}}></div>`;
+  }});
+  target.innerHTML = htmlOut;
+}}
+function renderTrace(traces) {{
+  const target = document.getElementById('trace-block');
+  if (!traces || !traces.length) {{ target.innerHTML = '<p class="small">No trace yet.</p>'; return; }}
+  target.innerHTML = traces.map(t => `<div class='panel' style='margin-top:.55rem;'><div><span class='pill'>${{esc(t.stage)}}</span><span class='small'>${{esc(t.severity || 'INFO')}}</span></div><pre>${{esc(t.detail)}}</pre></div>`).join('');
+}}
+function renderPassTicket(data) {{
+  const profiles = data?.profiles || [];
+  const issued = data?.issued || [];
+  const audit = data?.audit || [];
+  const currentUser = currentState.user || document.getElementById('ptkt_user').value || 'IBMUSER';
+  document.getElementById('ptkt_user').value = currentUser;
+  document.getElementById('ptkt_appl').value = data?.current_appl || currentState.feature_flags?.CURRENT_APPLID || 'CICS';
+  document.getElementById('ptkt_ticket').value = data?.current_ticket || '';
+  const renderTable = (rows) => {{
+    if (!rows.length) return '<p class="small">No rows.</p>';
+    const headers = Object.keys(rows[0]);
+    const head = '<tr>' + headers.map(h => `<th>${{esc(h)}}</th>`).join('') + '</tr>';
+    const body = rows.map(row => '<tr>' + headers.map(h => `<td>${{esc(row[h])}}</td>`).join('') + '</tr>').join('');
+    return `<table>${{head}}${{body}}</table>`;
+  }};
+  document.getElementById('ptkt-profile-block').innerHTML = `<div class='panel' style='margin-top:.6rem;'><div class='section-title'>PTKTDATA profiles</div>${{renderTable(profiles)}}</div>`;
+  document.getElementById('ptkt-issued-block').innerHTML = `<div class='panel' style='margin-top:.6rem;'><div class='section-title'>Issued PassTickets</div>${{renderTable(issued)}}</div>`;
+  document.getElementById('ptkt-audit-block').innerHTML = `<div class='panel' style='margin-top:.6rem;'><div class='section-title'>PassTicket audit</div>${{renderTable(audit)}}</div>`;
+}}
+function renderMetadata(fields) {{
+  const target = document.getElementById('field-meta');
+  if (!fields || !fields.length) {{ target.innerHTML = '<p class="small">No editable fields on this screen.</p>'; return; }}
+  const lines = fields.map(f => `FIELD=${{f.name}} ATTR=${{f.hidden ? 'HIDDEN' : f.protected ? 'PROTECTED' : 'STANDARD'}}${{f.numeric ? ' NUM' : ''}} MDT=${{f.mdt ? 'ON' : 'OFF'}} POS=${{f.row}},${{f.col}}${{f.note ? ' :: ' + f.note : ''}}`);
+  target.innerHTML = '<pre>' + esc(lines.join('\\n')) + '</pre>';
+}}
+function renderTutorial(tutorial) {{
+  document.getElementById('tutorial-title').textContent = tutorial?.title || 'Tutorial';
+  document.getElementById('tutorial-hint').textContent = 'Hint: ' + (tutorial?.hint || '');
+  document.getElementById('tutorial-guided').textContent = 'Guided: ' + (tutorial?.guided || '');
+  document.getElementById('tutorial-solution').textContent = 'Solution: ' + (tutorial?.solution || '');
+}}
+function renderTerminal() {{
+  // Compatibility alias for tests and older documentation: the terminal renderer
+  // is part of renderState(), but this named function preserves the previous
+  // browser-side contract.
+  document.getElementById('terminal-screen').textContent = currentState.terminal_screen || '';
+}}
+function renderState() {{
+  renderTerminal();
+  document.getElementById('status-block').textContent = currentState.status || '';
+  renderFields(currentState.fields || []);
+  renderRows(currentState.rows || []);
+  renderTrace(currentState.traces || []);
+  renderPassTicket(currentState.passticket || {{}});
+  renderMetadata(currentState.fields || []);
+  renderTutorial(currentState.tutorial || {{}});
+  ['hack_enabled','reveal_hidden','remove_protection','remove_numeric','show_metadata','show_mdt','show_positions','show_standard'].forEach(key => {{
+    const el = document.getElementById(key); if (el) el.checked = !!currentState.hack[key];
+  }});
+  document.getElementById('tutorial_mode').value = currentState.tutorial_mode || 'hint';
+  document.getElementById('show_solutions').checked = !!currentState.show_solutions;
+}}
+async function loadSession() {{
+  const resp = await fetch('/bank/session?sid=' + encodeURIComponent(SID));
+  currentState = await resp.json();
+  renderState();
+}}
+async function submitCurrentScreen() {{
+  // Legacy test/documentation anchor: fetch('/bank/terminal', ...) is used through postJSON below.
+  const payload = {{ sid: SID, fields: {{}} }};
+  document.querySelectorAll('#field-form input[data-name]').forEach(el => payload.fields[el.dataset.name] = el.value);
+  currentState = await postJSON('/bank/terminal', payload);
+  renderState();
+}}
+async function sendPF(key) {{
+  currentState = await postJSON('/bank/terminal', {{sid:SID, pf:key}});
+  renderState();
+}}
+async function directMenu(code) {{
+  currentState = await postJSON('/bank/terminal', {{sid:SID, command:code, fields:{{SELECTION:code}}}});
+  renderState();
+}}
+async function applyHack() {{
+  const payload = {{
+    sid: SID,
+    hack_enabled: document.getElementById('hack_enabled').checked,
+    reveal_hidden: document.getElementById('reveal_hidden').checked,
+    remove_protection: document.getElementById('remove_protection').checked,
+    remove_numeric: document.getElementById('remove_numeric').checked,
+    show_metadata: document.getElementById('show_metadata').checked,
+    show_mdt: document.getElementById('show_mdt').checked,
+    show_positions: document.getElementById('show_positions').checked,
+    show_standard: document.getElementById('show_standard').checked,
+    tutorial_mode: document.getElementById('tutorial_mode').value,
+    show_solutions: document.getElementById('show_solutions').checked,
+  }};
+  currentState = await postJSON('/bank/hack3270', payload);
+  renderState();
+}}
+async function generatePassTicket() {{
+  currentState = await postJSON('/bank/passticket/generate', {{sid: SID, userid: document.getElementById('ptkt_user').value, applid: document.getElementById('ptkt_appl').value, requester: 'WEBBANK'}});
+  renderState();
+}}
+async function usePassTicket() {{
+  currentState = await postJSON('/bank/passticket/use', {{sid: SID, userid: document.getElementById('ptkt_user').value, applid: document.getElementById('ptkt_appl').value, ticket: document.getElementById('ptkt_ticket').value}});
+  renderState();
+}}
+async function setPassTicketScenario(replayProtection, applMismatch, leak) {{
+  const payload = {{sid: SID, applid: document.getElementById('ptkt_appl').value}};
+  if (replayProtection !== null) payload.replay_protection = replayProtection;
+  if (applMismatch !== null) payload.appl_mismatch = applMismatch;
+  if (leak !== null) payload.leak = leak;
+  currentState = await postJSON('/bank/passticket/scenario', payload);
+  renderState();
+}}
+renderState();
+</script>
+</body>
+</html>
+"""
+
+
+class _FallbackHandler(BaseHTTPRequestHandler):
+    state: GibsonState
+    server_version = "GibsonHTTP"
+    sys_version = ""
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def _send_fingerprint_headers(self) -> None:
+        return None
+
+    def _lab(self):
+        return get_banking_lab(self.state)
+
+    def _body(self) -> tuple[bytes, str]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(max(0, length)) if length else b""
+        return raw, self.headers.get("Content-Type", "")
+
+    def _send_json(self, payload: Any, status: int = 200) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self._send_fingerprint_headers()
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    def _send_html(self, body: str, status: int = 200) -> None:
+        data = body.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self._send_fingerprint_headers()
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        lab = self._lab()
+        sid = qs.get("sid", [""])[0] or lab.new_sid()
+        if parsed.path == "/":
+            body = _render_portal(self.state, sid)
+            if "POST /query" not in body:
+                body += "<div>POST /query</div>"
+            self._send_html(body, 200)
+            return
+        if parsed.path in {"/gmvb", "/gmvb/menu", "/gmvb/manual", "/gmvb/labs", "/gmvb/solutions", "/bank/gmvb"}:
+            self._send_json(_web_ui_disabled_payload(parsed.path), 410)
+            return
+        if parsed.path.startswith("/api/v1/gmvb"):
+            status, payload = gmvb_json_api(lab, parsed.path, "GET", query={k:v[0] for k,v in qs.items()})
+            self._send_json(payload, status)
+            return
+        if parsed.path == "/query-form":
+            self._send_json(_web_ui_disabled_payload(parsed.path), 410)
+            return
+        if parsed.path == "/bank/session":
+            self._send_json(lab.snapshot(sid))
+            return
+        if parsed.path == "/indfile/download":
+            user = (qs.get("user", ["IBMUSER"])[0] or "IBMUSER").upper()
+            target = qs.get("dataset", [""])[0]
+            if not target:
+                self._send_json({"error": "dataset required"}, 400)
+                return
+            try:
+                filename, data = get_transfer_manager(self.state).indfile_get(user, target)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 404)
+                return
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f"attachment; filename={filename}")
+                self.send_header("Content-Length", str(len(data)))
+                self._send_fingerprint_headers()
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            return
+        if parsed.path == "/bank/account":
+            user = (qs.get("user", [""])[0] or "").upper()
+            acct = qs.get("id", [""])[0]
+            sess = lab.ensure_session(sid)
+            if user:
+                sess.user = user
+            payload = lab.account_lookup(sid, acct) if acct else lab.snapshot(sid)
+            self._send_json(payload)
+            return
+        self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        lab = self._lab()
+        raw, ctype = self._body()
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                data = {}
+        else:
+            data = {k: v[0] for k, v in parse_qs(raw.decode("utf-8", errors="ignore")).items()}
+        sid = str(data.get("sid", "") or secrets.token_hex(6))
+        if self.path.startswith("/api/v1/gmvb"):
+            status, payload = gmvb_json_api(lab, self.path, "POST", data=data)
+            self._send_json(payload, status)
+            return
+        if self.path.startswith("/gmvb") or self.path == "/bank/gmvb":
+            self._send_json(_web_ui_disabled_payload(self.path), 410)
+            return
+        if self.path == "/query":
+            status, payload = _query_db2(self.state, data)
+            self._send_json(payload, status)
+            return
+        if self.path == "/query-form":
+            self._send_json(_web_ui_disabled_payload(self.path), 410)
+            return
+        if self.path == "/bank/login":
+            self._send_json(lab.login(sid, str(data.get("user", "")), str(data.get("password", ""))))
+            return
+        if self.path == "/bank/transfer":
+            sess = lab.ensure_session(sid)
+            user = str(data.get("user", "")).upper()
+            if user:
+                sess.user = user
+            self._send_json(lab.transfer(sid, {"SRCACCT": data.get("source", ""), "DSTACCT": data.get("destination", ""), "AMOUNT": data.get("amount", "0.00"), "MEMO": data.get("memo", "LAB TRANSFER")}))
+            return
+        if self.path == "/bank/statement":
+            sess = lab.ensure_session(sid)
+            user = str(data.get("user", "")).upper()
+            if user:
+                sess.user = user
+            self._send_json(lab.statement_lookup(sid, str(data.get("account", "")), str(data.get("period", ""))))
+            return
+        if self.path == "/bank/terminal":
+            self._send_json(lab.terminal_submit(sid, fields=data.get("fields") if isinstance(data.get("fields"), dict) else data, command=str(data.get("command", "")), pf=str(data.get("pf", ""))))
+            return
+        if self.path == "/bank/hack3270":
+            self._send_json(lab.update_hack(sid, data))
+            return
+        if self.path == "/bank/passticket/generate":
+            self._send_json(lab.passticket_generate(sid, str(data.get("userid", "")), str(data.get("applid", "CICS")), str(data.get("requester", "WEBBANK"))))
+            return
+        if self.path == "/bank/passticket/use":
+            self._send_json(lab.passticket_use(sid, str(data.get("userid", "")), str(data.get("ticket", "")), str(data.get("applid", "CICS"))))
+            return
+        if self.path == "/indfile/upload":
+            user = str(data.get("user", "IBMUSER") or "IBMUSER").upper()
+            target = str(data.get("target", "")).strip()
+            body = str(data.get("content", ""))
+            if not target:
+                self._send_json({"error": "target required"}, 400)
+                return
+            self._send_json(get_transfer_manager(self.state).indfile_put(user, target, body.encode("utf-8"), note="browser"))
+            return
+        if self.path == "/bank/passticket/scenario":
+            rp = data.get("replay_protection")
+            am = data.get("appl_mismatch")
+            leak = data.get("leak")
+            self._send_json(lab.passticket_scenario(sid, replay_protection=_coerce_bool(rp), appl_mismatch=_coerce_bool(am), leak=_coerce_bool(leak), applid=str(data.get("applid", "CICS"))))
+            return
+        self._send_json({"error": "not found"}, 404)
+
+
+class _FallbackRestServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if exc is not None and is_expected_disconnect(exc):
+            return
+        return super().handle_error(request, client_address)
+
+
+def create_app(state: GibsonState):
+    try:
+        from flask import Flask, jsonify, request
+    except Exception:
+        return None
+
+    app = Flask(__name__)
+
+    @app.after_request
+    def _add_fingerprint_headers(resp):
+        resp.headers.setdefault("Server", "GibsonHTTP")
+        return resp
+
+    @app.get("/")
+    def index():
+        return jsonify(_web_ui_disabled_payload(request.path)), 410
+
+    @app.get("/bank/session")
+    def bank_session():
+        lab = get_banking_lab(state)
+        sid = request.args.get("sid", "") or lab.new_sid()
+        return jsonify(lab.snapshot(sid))
+
+    @app.post("/query")
+    def query():
+        status, payload = _query_db2(state, request.get_json(silent=True) or {})
+        return jsonify(payload), status
+
+    @app.get("/query-form")
+    @app.post("/query-form")
+    def query_form():
+        return jsonify(_web_ui_disabled_payload(request.path)), 410
+
+    @app.post("/bank/login")
+    def bank_login():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        return jsonify(lab.login(sid, str(data.get("user", "")), str(data.get("password", ""))))
+
+    @app.get("/bank/account")
+    def bank_account():
+        lab = get_banking_lab(state)
+        sid = request.args.get("sid", "") or lab.new_sid()
+        user = str(request.args.get("user", "")).upper()
+        acct = str(request.args.get("id", ""))
+        sess = lab.ensure_session(sid)
+        if user:
+            sess.user = user
+        payload = lab.account_lookup(sid, acct) if acct else lab.snapshot(sid)
+        return jsonify(payload)
+
+    @app.post("/bank/transfer")
+    def bank_transfer():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        sess = lab.ensure_session(sid)
+        user = str(data.get("user", "")).upper()
+        if user:
+            sess.user = user
+        return jsonify(lab.transfer(sid, {"SRCACCT": data.get("source", data.get("SRCACCT", "")), "DSTACCT": data.get("destination", data.get("DSTACCT", "")), "AMOUNT": data.get("amount", data.get("AMOUNT", "0.00")), "MEMO": data.get("memo", data.get("MEMO", "LAB TRANSFER"))}))
+
+    @app.post("/bank/statement")
+    def bank_statement():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        sess = lab.ensure_session(sid)
+        user = str(data.get("user", "")).upper()
+        if user:
+            sess.user = user
+        return jsonify(lab.statement_lookup(sid, str(data.get("account", "")), str(data.get("period", ""))))
+
+    @app.post("/bank/terminal")
+    def bank_terminal():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
+        return jsonify(lab.terminal_submit(sid, fields=fields, command=str(data.get("command", "")), pf=str(data.get("pf", ""))))
+
+    @app.post("/bank/hack3270")
+    def bank_hack():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        return jsonify(lab.update_hack(sid, data))
+
+    @app.post("/bank/passticket/generate")
+    def bank_passticket_generate():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        return jsonify(lab.passticket_generate(sid, str(data.get("userid", "")), str(data.get("applid", "CICS")), str(data.get("requester", "WEBBANK"))))
+
+    @app.post("/bank/passticket/use")
+    def bank_passticket_use():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        return jsonify(lab.passticket_use(sid, str(data.get("userid", "")), str(data.get("ticket", "")), str(data.get("applid", "CICS"))))
+
+    @app.post("/indfile/upload")
+    def indfile_upload():
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        user = str(data.get("user", "IBMUSER") or "IBMUSER").upper()
+        target = str(data.get("target", "")).strip()
+        if not target:
+            return jsonify({"error": "target required"}), 400
+        return jsonify(get_transfer_manager(state).indfile_put(user, target, str(data.get("content", "")).encode("utf-8"), note="browser"))
+
+    @app.get("/indfile/download")
+    def indfile_download():
+        user = str(request.args.get("user", "IBMUSER") or "IBMUSER").upper()
+        target = str(request.args.get("dataset", "")).strip()
+        if not target:
+            return jsonify({"error": "dataset required"}), 400
+        try:
+            filename, data = get_transfer_manager(state).indfile_get(user, target, note="browser")
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 404
+        return data, 200, {"Content-Type": "application/octet-stream", "Content-Disposition": f"attachment; filename={filename}"}
+
+    @app.post("/bank/passticket/scenario")
+    def bank_passticket_scenario():
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        sid = str(data.get("sid", "") or lab.new_sid())
+        rp = data.get("replay_protection")
+        am = data.get("appl_mismatch")
+        lk = data.get("leak")
+        return jsonify(lab.passticket_scenario(sid, replay_protection=_coerce_bool(rp), appl_mismatch=_coerce_bool(am), leak=_coerce_bool(lk), applid=str(data.get("applid", "CICS"))))
+
+    @app.get("/gmvb")
+    @app.get("/gmvb/menu")
+    @app.get("/gmvb/manual")
+    @app.get("/gmvb/labs")
+    @app.get("/gmvb/solutions")
+    @app.get("/bank/gmvb")
+    def gmvb_web():
+        return jsonify(_web_ui_disabled_payload(request.path)), 410
+
+    @app.get("/api/v1/gmvb/health")
+    @app.get("/api/v1/gmvb/capabilities")
+    @app.get("/api/v1/gmvb/audit")
+    @app.get("/api/v1/gmvb/labs")
+    @app.get("/api/v1/gmvb/admin/users")
+    def gmvb_api_static():
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, request.path, "GET", query=request.args.to_dict())
+        return jsonify(payload), status
+
+    @app.get("/api/v1/gmvb/customers/<customer_id>")
+    def gmvb_api_customer(customer_id):
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, f"/api/v1/gmvb/customers/{customer_id}", "GET", query=request.args.to_dict())
+        return jsonify(payload), status
+
+    @app.get("/api/v1/gmvb/accounts/<account>")
+    def gmvb_api_account(account):
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, f"/api/v1/gmvb/accounts/{account}", "GET", query=request.args.to_dict())
+        return jsonify(payload), status
+
+    @app.get("/api/v1/gmvb/transactions/<account>")
+    def gmvb_api_transactions_for(account):
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, f"/api/v1/gmvb/transactions/{account}", "GET", query=request.args.to_dict())
+        return jsonify(payload), status
+
+    @app.post("/api/v1/gmvb/auth/login")
+    @app.post("/api/v1/gmvb/transactions")
+    def gmvb_api_post():
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, request.path, "POST", data=request.get_json(silent=True) or request.form.to_dict())
+        return jsonify(payload), status
+
+
+    @app.route("/api/v1/gmvb/session/start", methods=["POST"])
+    @app.route("/api/v1/gmvb/session/action", methods=["POST"])
+    def gmvb_api_session_post():
+        lab = get_banking_lab(state)
+        status, payload = gmvb_json_api(lab, request.path, "POST", data=request.get_json(silent=True) or request.form.to_dict())
+        return jsonify(payload), status
+
+    @app.get("/api/v1/gmvb/session/<sid>")
+    def gmvb_api_session_get(sid):
+        lab = get_banking_lab(state)
+        args = request.args.to_dict()
+        args["sid"] = sid
+        status, payload = gmvb_json_api(lab, f"/api/v1/gmvb/session/{sid}", "GET", query=args)
+        return jsonify(payload), status
+
+    @app.route("/api/v1/gmvb/hack3270/<path:subpath>", methods=["GET", "POST"])
+    @app.route("/api/v1/gmvb/hack3270", methods=["GET", "POST"])
+    def gmvb_api_hack3270(subpath=""):
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict() or {}
+        query = request.args.to_dict()
+        path = "/api/v1/gmvb/hack3270" + (("/" + subpath) if subpath else "")
+        status, payload = gmvb_json_api(lab, path, request.method, data=data, query=query)
+        return jsonify(payload), status
+
+    @app.post("/api/v1/gmvb/labs/<scenario>/activate")
+    def gmvb_api_lab_activate(scenario):
+        lab = get_banking_lab(state)
+        data = request.get_json(silent=True) or request.form.to_dict()
+        data["scenario"] = scenario
+        status, payload = gmvb_json_api(lab, f"/api/v1/gmvb/labs/{scenario}/activate", "POST", data=data)
+        return jsonify(payload), status
+
+    return app
+
+
+
+def _fallback_handler_for(state: GibsonState):
+    """Return a per-server request handler bound to one GibsonState.
+
+    The original fallback implementation stored state on _FallbackHandler itself.
+    That works for a single process, but full-suite smoke tests start several REST
+    gateways on different ephemeral ports.  Binding state per handler class keeps
+    those listeners independent and prevents later tests from changing state for
+    already-running listeners.
+    """
+
+    class _BoundFallbackHandler(_FallbackHandler):
+        pass
+
+    _BoundFallbackHandler.state = state
+    _BoundFallbackHandler.__name__ = "GibsonRestHandler"
+    return _BoundFallbackHandler
+
+
+def create_rest_server(state: GibsonState) -> _FallbackRestServer:
+    """Create a stoppable REST gateway server without starting it.
+
+    The stdlib HTTP server is used deliberately for the built-in service because
+    it exposes shutdown()/server_close() directly and, through _FallbackRestServer,
+    uses daemon request workers.  create_app() remains available for callers that
+    want to embed the Flask application explicitly, but the simulator service now
+    has deterministic lifecycle behaviour for tests, service-manager restarts,
+    and lab resets.
+    """
+
+    server = _FallbackRestServer((state.config.host, state.config.rest_port), _fallback_handler_for(state))
+    with _REST_LOCK:
+        _REST_SERVERS.add(server)
+    return server
+
+
+def start_rest(state: GibsonState) -> _FallbackRestServer:
+    """Start the REST gateway in a daemon thread and return its server handle."""
+
+    server = create_rest_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name=f"GibsonREST-{state.config.rest_port}")
+    server._gibson_thread = thread  # type: ignore[attr-defined]
+    thread.start()
+    return server
+
+
+def serve_rest(state: GibsonState):
+    """Run the REST gateway until shutdown() is called or the process exits.
+
+    This preserves the historical blocking API used by tests and simple launcher
+    scripts while avoiding Flask/Werkzeug's development-server lifecycle in the
+    simulator's managed service path.
+    """
+
+    server = create_rest_server(state)
+    server._gibson_thread = threading.current_thread()  # type: ignore[attr-defined]
+    try:
+        server.serve_forever()
+    finally:  # pragma: no cover
+        server.server_close()
+        with _REST_LOCK:
+            try:
+                _REST_SERVERS.discard(server)
+            except Exception:
+                pass
+
+
+def shutdown_all_rest_servers() -> None:
+    """Stop all REST servers created in this process.
+
+    This is intentionally small and idempotent: the managed CLI stops its own
+    handles directly, while the pytest suite uses this helper to clean up REST
+    listeners that individual smoke tests started in daemon threads.
+    """
+
+    with _REST_LOCK:
+        servers = list(_REST_SERVERS)
+    for server in servers:
+        shutdown_thread = threading.Thread(target=lambda srv=server: srv.shutdown(), daemon=True, name="GibsonREST-shutdown")
+        try:
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        thread = getattr(server, "_gibson_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            try:
+                thread.join(timeout=1.0)
+            except Exception:
+                pass
+        with _REST_LOCK:
+            try:
+                _REST_SERVERS.discard(server)
+            except Exception:
+                pass

@@ -1,0 +1,187 @@
+from __future__ import annotations
+from decimal import Decimal
+from typing import Any
+from gibson.apps.fibs_session import FibsSession, get_fibs_session
+from gibson.apps.fibs_aid import normalize_aid, is_aid
+from gibson.apps.fibs_maps import FibsMap, txt, fld, render_text
+from gibson.apps.fibs_service import get_fibs_service
+
+ALIASES={"FIBS":"FIBSMENU","GMVB":"FIBSMENU","OMEN":"FIBSMENU","CBSA":"FIBSMENU","MENU":"FIBSMENU"}
+MENU={"1":"FIBSCUST","CUST":"FIBSCUST","2":"FIBSACCT","ACCT":"FIBSACCT","A":"FIBSCUSTA","CUSTA":"FIBSCUSTA","3":"FIBSCUSA","CUSA":"FIBSCUSA","4":"FIBSACCA","ACCA":"FIBSACCA","5":"FIBSACCU","ACCU":"FIBSACCU","6":"FIBSDBCR","DBCR":"FIBSDBCR","7":"FIBSXFER","XFER":"FIBSXFER","B":"FIBSBATCH","BATCH":"FIBSBATCH","S":"FIBSSWFT","SWFT":"FIBSSWFT","C":"FIBSCOBL","COBL":"FIBSCOBL","X":"FIBSMENU","CESF":"FIBSMENU"}
+
+COBOL_SOURCE="IDENTIFICATION DIVISION.\nPROGRAM-ID. VULNERABLE-BANK-UPDATE.\nAUTHOR. SECURITY-TRAINER.\nREMARKS. INTENTIONAL VULNERABILITIES FOR TRAINING.\nENVIRONMENT DIVISION.\nDATA DIVISION.\nWORKING-STORAGE SECTION.\n01 INPUT-DATA.\n   05 USER-INPUT PIC X(100).\n   05 FILLER REDEFINES USER-INPUT.\n      10 CUSTOMER-ID PIC X(10).\n      10 ACCOUNT-TYPE PIC X(2).\n      10 TRANSACTION-AMOUNT PIC X(12).\n01 SECURITY-CONTROL-FLAGS.\n   05 AUTHENTICATED-FLAG PIC X VALUE 'N'.\n   05 ADMIN-FLAG PIC X VALUE 'N'.\n   05 DEBUG-FLAG PIC X VALUE 'N'.\nPROCEDURE DIVISION.\n100-GET-INPUT.\n   EXEC CICS RECEIVE MAP('BANKMAP') INTO(USER-INPUT) END-EXEC.\n   MOVE USER-INPUT TO CUSTOMER-RECORD.\n   IF CUST-PIN = '9999' OR AUTHENTICATED-FLAG = 'Y'\n      PERFORM 200-PROCESS-TRANSACTION\n   ELSE\n      PERFORM 800-SEND-ERROR\n   END-IF.\n200-PROCESS-TRANSACTION.\n   COMPUTE CUST-BALANCE = FUNCTION NUMVAL(TRANSACTION-AMOUNT).\n   MOVE CUSTOMER-RECORD TO LOG-BUFFER.\n700-DEBG-DUMP.\n   DISPLAY 'DEBUG DUMP: ' TEMP-STORAGE.\n800-SEND-ERROR.\n   MOVE 'AUTHENTICATION FAILED' TO MSG-TEXT.\n"
+
+def _svc(state): return get_fibs_service(state)
+def _money(v): return Decimal(str(v or '0').replace(',','')).quantize(Decimal('0.01'))
+
+class FibsApplicationController:
+    def __init__(self, state: Any): self.state=state
+    def session(self, key='CICS', userid='IBMUSER'): return get_fibs_session(self.state,key,userid)
+    def handle_cics_input(self, sess:FibsSession, raw:str, fields:dict[str,str]|None=None, aid:str|None=None):
+        out=self.handle(sess, raw, fields or {}, aid)
+        return render_text(out)
+    def handle_json(self, sess:FibsSession, raw:str='', fields:dict[str,str]|None=None, aid:str|None=None):
+        return self.handle(sess, raw, fields or {}, aid).as_json()
+    def handle(self, sess:FibsSession, raw:str='', fields:dict[str,str]|None=None, aid:str|None=None) -> FibsMap:
+        fields={str(k).upper():str(v) for k,v in (fields or {}).items()}
+        raw=(raw or '').strip(); token=raw.upper().split()[0] if raw else ''
+        a=normalize_aid(aid or raw) if (aid or is_aid(raw)) else ''
+        if a: return self._aid(sess,a,fields)
+        if token in ALIASES: sess.current_map='FIBSMENU'; sess.message_line='FIBS READY'; return self.render(sess)
+        # Compatibility single-line maintenance commands used by older tests.
+        if token == 'CUST' and len(raw.split()) > 1:
+            words=raw.split(); op=words[1].upper(); vals=self._parse_kv(raw)
+            if op == 'ADD': sess.current_map='FIBSCUSA'; return self._cust_add(sess, vals)
+            if op in {'UPD','UPDATE'}: sess.current_map='FIBSCUSU'; return self._cust_upd(sess, vals)
+            if op in {'DEL','DELETE'}: sess.current_map='FIBSCUSD'; vals.setdefault('CUSTOMER_ID', words[2] if len(words)>2 else sess.last_customer_id); return self._cust_del(sess, vals)
+        if token in {'DEL','DELETE'} and sess.current_map.startswith('FIBSC'):
+            vals={'CUSTOMER_ID': raw.split()[1] if len(raw.split())>1 else sess.last_customer_id}; sess.current_map='FIBSCUSD'; return self._cust_del(sess, vals)
+        if token == 'ACCT' and len(raw.split()) > 1:
+            words=raw.split(); op=words[1].upper(); vals=self._parse_kv(raw)
+            if op == 'ADD': sess.current_map='FIBSACCA'; return self._acct_add(sess, vals)
+            if op in {'UPD','UPDATE'}: sess.current_map='FIBSACCU'; return self._acct_upd(sess, vals)
+            if op in {'DEL','DELETE'}: sess.current_map='FIBSACCD'; vals.setdefault('ACCOUNT_NUMBER', words[2] if len(words)>2 else sess.last_account_id); return self._acct_del(sess, vals)
+        if token in {'DEL','DELETE'} and sess.current_map.startswith('FIBSA'):
+            vals={'ACCOUNT_NUMBER': raw.split()[1] if len(raw.split())>1 else sess.last_account_id}; sess.current_map='FIBSACCD'; return self._acct_del(sess, vals)
+        if token in {'RELEASE'} and sess.current_map=='FIBSBATCH':
+            vals=self._parse_kv(raw); vals.setdefault('BATCH_ID', raw.split()[1] if len(raw.split())>1 else 'B2026A17'); vals.setdefault('RELEASE_PIN', vals.get('PIN','')); return self._batch(sess, vals)
+        if token in {'APPROVE','RELEASE','REPAIR','CREATE'} and sess.current_map=='FIBSSWFT':
+            vals=self._parse_kv(raw); vals.setdefault('ACTION', token); vals.setdefault('MESSAGE_ID', raw.split()[1] if len(raw.split())>1 else 'SWF000001'); return self._swift(sess, vals)
+        if token in {'CUST'}:
+            sess.previous_map=sess.current_map; sess.current_map='FIBSCUST'; return self._cust_inq(sess, {'CUSTOMER_ID': sess.last_customer_id})
+        if token in {'ACCT'}:
+            sess.previous_map=sess.current_map; sess.current_map='FIBSACCT'; return self._acct_inq(sess, {'ACCOUNT_NUMBER': sess.last_account_id})
+        if sess.current_map=='FIBSMENU' and token in MENU:
+            sess.previous_map='FIBSMENU'; sess.current_map=MENU[token]; sess.message_line='ENTER DATA AND PRESS ENTER'; return self.render(sess)
+        if token in MENU:
+            sess.previous_map=sess.current_map; sess.current_map=MENU[token]; sess.message_line='ENTER DATA AND PRESS ENTER'; return self.render(sess)
+        if token in {'PF3','F3'}: sess.current_map='FIBSMENU'; return self.render(sess)
+        # Raw data entry into current map
+        if raw and not fields:
+            if sess.current_map=='FIBSCUST': fields={'CUSTOMER_ID':raw}
+            elif sess.current_map=='FIBSACCT': fields={'ACCOUNT_NUMBER':raw}
+            elif sess.current_map in {'FIBSCUSA','FIBSCUSU','FIBSCUSD'}: fields={'CUSTOMER_ID':raw}
+            elif sess.current_map in {'FIBSACCA','FIBSACCU','FIBSACCD'}: fields={'ACCOUNT_NUMBER':raw}
+            elif sess.current_map=='FIBSCOBL':
+                return self._cobl_command(sess, raw)
+            else:
+                sess.message_line=f'FIB0004I INVALID OPTION {raw}'; return self.render(sess)
+        return self._enter(sess, fields)
+    def _aid(self,sess,a,fields):
+        if a=='PF1': sess.message_line='HELP - ENTER OPTION OR FILL FIELDS AND PRESS ENTER'; return self.render(sess)
+        if a=='PF3': sess.current_map='FIBSMENU'; sess.message_line='RETURNED TO FIBS MENU'; return self.render(sess)
+        if a=='PF5': sess.message_line='SCREEN REFRESHED'; return self.render(sess)
+        if a=='CLEAR': sess.form_values={}; sess.message_line='INPUT FIELDS CLEARED'; return self.render(sess)
+        if sess.current_map=='FIBSCOBL' and a in {'PF7','PF8'}:
+            sess.source_offset=max(0, sess.source_offset + (10 if a=='PF8' else -10)); sess.message_line='SCROLLED DOWN' if a=='PF8' else 'SCROLLED UP'; return self.render(sess)
+        if a=='PF12' and sess.current_map=='FIBSMENU': sess.message_line='DFHCE3590 SIGNOFF COMPLETE'; return self.render(sess)
+        if a=='ENTER': return self._enter(sess, fields)
+        sess.message_line=f'{a} NOT VALID ON THIS SCREEN'; return self.render(sess)
+    def _enter(self,sess,fields):
+        m=sess.current_map
+        if m=='FIBSCUST': return self._cust_inq(sess, fields)
+        if m=='FIBSCUSTA': return self._custa(sess, fields)
+        if m=='FIBSCUSA': return self._cust_add(sess, fields)
+        if m=='FIBSCUSU': return self._cust_upd(sess, fields)
+        if m=='FIBSCUSD': return self._cust_del(sess, fields)
+        if m=='FIBSACCT': return self._acct_inq(sess, fields)
+        if m=='FIBSACCA': return self._acct_add(sess, fields)
+        if m=='FIBSACCU': return self._acct_upd(sess, fields)
+        if m=='FIBSACCD': return self._acct_del(sess, fields)
+        if m=='FIBSDBCR': return self._dbcr(sess, fields)
+        if m=='FIBSXFER': return self._xfer(sess, fields)
+        if m=='FIBSBATCH': return self._batch(sess, fields)
+        if m=='FIBSSWFT': return self._swift(sess, fields)
+        return self.render(sess)
+    def _parse_kv(self, raw):
+        out={}
+        toks=raw.replace(',', ' ').split()
+        for t in toks:
+            if '=' in t:
+                k,v=t.split('=',1); k=k.upper(); v=v.strip().strip("'\"")
+                if k in {'CUSTOMER','CUST','CID'}: k='CUSTOMER_ID'
+                if k in {'ACCOUNT','ACCT'}: k='ACCOUNT_NUMBER'
+                if k=='BALANCE': out['ACTUAL_BALANCE']=v; out['AVAILABLE_BALANCE']=v
+                if k=='TYPE': k='ACCOUNT_TYPE'
+                if k=='PIN': k='RELEASE_PIN'
+                out[k]=v
+        return out
+    def render(self,sess):
+        return getattr(self, '_map_'+sess.current_map.lower(), self._map_fibsmenu)(sess)
+    def _map_fibsmenu(self,s):
+        rows=[txt(1,1,'FIBS READY','blue'),txt(2,1,'FIBS - GIBSON BANKING APPLICATION','blue'),txt(4,1,'1  DISPLAY CUSTOMER INFORMATION          CUST','cyan'),txt(5,1,'2  DISPLAY ACCOUNT INFORMATION           ACCT','cyan'),txt(6,1,'A  DISPLAY ALL ACCOUNTS FOR CUSTOMER     CUSTA','cyan'),txt(7,1,'3  CREATE NEW CUSTOMER                   CUSA','cyan'),txt(8,1,'4  CREATE NEW ACCOUNT                    ACCA','cyan'),txt(9,1,'5  UPDATE ACCOUNT INFORMATION            ACCU','cyan'),txt(10,1,'6  CREDIT / DEBIT ACCOUNT                DBCR','cyan'),txt(11,1,'7  TRANSFER FUNDS BETWEEN ACCOUNTS       XFER','cyan'),txt(12,1,'B  BATCH PROCESSING                      BATCH','cyan'),txt(13,1,'S  SWIFT MESSAGE PROCESSING              SWFT','cyan'),txt(14,1,'H  HACK3270 FIELD INSPECTOR              HACK3270','cyan'),txt(15,1,'C  COBOL / BMS SOURCE                    COBL','cyan'),txt(16,1,'X  SIGN OFF                              CESF','cyan')]
+        return FibsMap('FIBSMENU','FIBS MAIN MENU',rows,message=s.message_line)
+    def _map_fibscust(self,s): return FibsMap('FIBSCUST','FIBS CUSTOMER INQUIRY',[txt(4,1,'Enter customer number and press ENTER')],[fld('CUSTOMER_ID','CUSTOMER ID',6,28,8,s.last_customer_id,numericOnly=True,mandatory=True)],s.message_line)
+    def _map_fibscusta(self,s): return FibsMap('FIBSCUSTA','FIBS ACCOUNTS FOR CUSTOMER',[txt(4,1,'Enter customer number to list accounts')],[fld('CUSTOMER_ID','CUSTOMER ID',6,28,8,s.last_customer_id,numericOnly=True,mandatory=True)],s.message_line)
+    def _map_fibscusa(self,s):
+        return FibsMap('FIBSCUSA','FIBS CUSTOMER ADD',[txt(4,1,'Complete fields and press ENTER to add')],[fld('CUSTOMER_ID','CUSTOMER ID',5,28,8,''),fld('FORENAME','FORENAME',6,28,20,''),fld('SURNAME','SURNAME',7,28,25,''),fld('ADDRESS_LINE_1','ADDRESS',8,28,40,''),fld('TOWN','TOWN',9,28,20,''),fld('POSTCODE','POSTCODE',10,28,10,''),fld('DATE_OF_BIRTH','DATE OF BIRTH',11,28,10,''),fld('CREDIT_SCORE','CREDIT SCORE',12,28,3,'700',numericOnly=True),fld('STATUS','STATUS',13,28,1,'A'),fld('KYC_STATUS','KYC STATUS',14,28,10,'VERIFIED'),fld('ACTION','ACTION',15,28,3,'ADD')],s.message_line)
+    def _map_fibscusu(self,s): return self._map_fibscusa(s).__class__('FIBSCUSU','FIBS CUSTOMER UPDATE',[txt(4,1,'Enter customer fields and press ENTER to update')], self._map_fibscusa(s).fields, s.message_line)
+    def _map_fibscusd(self,s): return FibsMap('FIBSCUSD','FIBS CUSTOMER DELETE',[txt(4,1,'Enter customer number and press ENTER to confirm delete')],[fld('CUSTOMER_ID','CUSTOMER ID',6,28,8,s.last_customer_id,numericOnly=True,mandatory=True),fld('CONFIRM','CONFIRM',7,28,6,'DELETE')],s.message_line)
+    def _map_fibsacct(self,s): return FibsMap('FIBSACCT','FIBS ACCOUNT INQUIRY',[txt(4,1,'Enter account number and press ENTER')],[fld('ACCOUNT_NUMBER','ACCOUNT NUMBER',6,28,12,s.last_account_id,numericOnly=True,mandatory=True)],s.message_line)
+    def _map_fibsacca(self,s):
+        return FibsMap('FIBSACCA','FIBS ACCOUNT ADD',[txt(4,1,'Complete fields and press ENTER to add')],[fld('ACCOUNT_NUMBER','ACCOUNT NUMBER',5,28,12,''),fld('CUSTOMER_ID','CUSTOMER ID',6,28,8,s.last_customer_id),fld('SORT_CODE','SORT CODE',7,28,6,'204514'),fld('ACCOUNT_TYPE','ACCOUNT TYPE',8,28,3,'CUR'),fld('INTEREST_RATE','INTEREST RATE',9,28,5,'0.50'),fld('OVERDRAFT_LIMIT','OVERDRAFT LIMIT',10,28,12,'0.00'),fld('AVAILABLE_BALANCE','AVAILABLE BALANCE',11,28,12,'0.00'),fld('ACTUAL_BALANCE','ACTUAL BALANCE',12,28,12,'0.00'),fld('STATUS','STATUS',13,28,1,'A'),fld('ACTION','ACTION',14,28,3,'ADD')],s.message_line)
+    def _map_fibsaccu(self,s): return self._map_fibsacca(s).__class__('FIBSACCU','FIBS ACCOUNT UPDATE',[txt(4,1,'Enter account fields and press ENTER to update')], self._map_fibsacca(s).fields, s.message_line)
+    def _map_fibsaccd(self,s): return FibsMap('FIBSACCD','FIBS ACCOUNT DELETE',[txt(4,1,'Enter account number and press ENTER to confirm delete')],[fld('ACCOUNT_NUMBER','ACCOUNT NUMBER',6,28,12,s.last_account_id),fld('CONFIRM','CONFIRM',7,28,6,'DELETE')],s.message_line)
+    def _map_fibsdbcr(self,s): return FibsMap('FIBSDBCR','CREDIT / DEBIT ACCOUNT',[txt(4,1,'Post account transaction')],[fld('ACCOUNT_NUMBER','ACCOUNT NUMBER',5,28,12,s.last_account_id),fld('CREDIT_OR_DEBIT','CREDIT OR DEBIT',6,28,6,'CREDIT'),fld('AMOUNT','AMOUNT',7,28,12,'10.00'),fld('DESCRIPTION','DESCRIPTION',8,28,30,'COUNTER POSTING')],s.message_line)
+    def _map_fibsxfer(self,s): return FibsMap('FIBSXFER','TRANSFER FUNDS',[txt(4,1,'Transfer funds between accounts')],[fld('FROM_ACCOUNT','FROM ACCOUNT',5,28,12,'1000000101'),fld('TO_ACCOUNT','TO ACCOUNT',6,28,12,'1000000201'),fld('AMOUNT','AMOUNT',7,28,12,'10.00'),fld('DESCRIPTION','DESCRIPTION',8,28,30,'COUNTER TRANSFER')],s.message_line)
+    def _map_fibsbatch(self,s): return FibsMap('FIBSBATCH','FIBS BATCH PROCESSING',[txt(4,1,'BATCH READY - BATCH ID B2026A17 HELD-PIN-REQ')],[fld('BATCH_ID','BATCH ID',5,28,8,'B2026A17'),fld('SUPERVISOR_ID','SUPERVISOR ID',6,28,8,s.userid),fld('RELEASE_PIN','RELEASE PIN',7,28,4,''),fld('ACTION','ACTION',8,28,8,'RELEASE')],s.message_line)
+    def _map_fibsswft(self,s): return FibsMap('FIBSSWFT','FIBS SWIFT MESSAGE PROCESSING',[txt(4,1,'SWIFT READY - Enter CREATE, APPROVE, RELEASE or REPAIR action')],[fld('MESSAGE_ID','MESSAGE ID',5,28,9,'SWF000001'),fld('ACTION','ACTION',6,28,8,'LIST'),fld('AMOUNT','AMOUNT',7,28,12,'125000.00'),fld('BENEFICIARY','BENEFICIARY',8,28,30,'ACME EXPORTS')],s.message_line)
+    def _map_fibscobl(self,s):
+        lines=COBOL_SOURCE.splitlines(); off=max(0,min(s.source_offset, max(0,len(lines)-12))); s.source_offset=off
+        rows=[txt(3,1,f'PROGRAM {s.source_program}  LINES {off+1}-{min(len(lines),off+12)}','yellow')]
+        if s.message_line:
+            rows.append(txt(4,1,s.message_line,'yellow'))
+        for i,line in enumerate(lines[off:off+12], off+1): rows.append(txt(5+i-off if s.message_line else 4+i-off,1,f'LINE {i:04d} {line[:65]}','green'))
+        return FibsMap('FIBSCOBL','FIBS COBOL / BMS SOURCE REVIEW',rows,message=s.message_line)
+    def _cobl_command(self,s,raw):
+        u=raw.upper(); lines=COBOL_SOURCE.splitlines()
+        if u=='TOP': s.source_offset=0; s.message_line='TOP OF SOURCE'; return self.render(s)
+        if u=='BOTTOM': s.source_offset=max(0,len(lines)-12); s.message_line='BOTTOM OF SOURCE'; return self.render(s)
+        if u.startswith('FIND '):
+            needle=u[5:].strip(); start=s.source_offset+1
+            found=next((i for i,l in enumerate(lines[start:],start) if needle in l.upper()), -1)
+            if found>=0: s.source_offset=found; s.message_line=f'FOUND {needle} AT LINE {found+1}'
+            else: s.message_line=f'{needle} NOT FOUND'
+        return self.render(s)
+    def _cust_inq(self,s,fields):
+        svc=_svc(self.state); cid=(fields.get('CUSTOMER_ID') or s.last_customer_id).strip(); row=svc.get_customer(cid)
+        if not row: s.message_line=f'DFHCU0044 CUSTOMER {cid} NOT FOUND'; return self._map_fibscust(s)
+        s.last_customer_id=cid; rows=[txt(4,1,f'CUSTOMER ID . . . {row["CUSTOMER_ID"]}'),txt(5,1,f'NAME . . . . . . {row["FULL_NAME"]}'),txt(6,1,f'ADDRESS . . . . . {row["ADDRESS_LINE_1"]}'),txt(7,1,f'TOWN . . . . . . {row["TOWN"]}'),txt(8,1,f'POSTCODE . . . . {row["POSTCODE"]}'),txt(9,1,f'STATUS/KYC . . . {row["STATUS"]} {row["KYC_STATUS"]}')]
+        s.message_line='INQUIRE COMPLETE'; return FibsMap('FIBSCUST','FIBS CUSTOMER INQUIRY',rows,[fld('customer_id','CUSTOMER ID',11,28,8,cid), fld('surname','SURNAME',12,28,25,row.get('SURNAME',''),protected=True), fld('forename','FORENAME',13,28,20,row.get('FORENAME',''),protected=True), fld('status','STATUS',14,28,1,row.get('STATUS',''),protected=True)],s.message_line)
+    def _custa(self,s,fields):
+        svc=_svc(self.state); cid=(fields.get('CUSTOMER_ID') or s.last_customer_id).strip(); rows=[txt(4,1,f'ACCOUNTS FOR CUSTOMER {cid}'),txt(5,1,'ACCOUNT       TYPE BALANCE      STATUS')]
+        for i,a in enumerate(svc.get_accounts_for_customer(cid)[:12],6): rows.append(txt(i,1,f'{a["ACCOUNT_NUMBER"]:<13} {a["ACCOUNT_TYPE"]:<4} {a["ACTUAL_BALANCE"]:<12} {a["STATUS"]}'))
+        s.message_line='ACCOUNT LIST COMPLETE'; return FibsMap('FIBSCUSTA','FIBS ACCOUNTS FOR CUSTOMER',rows,[fld('CUSTOMER_ID','CUSTOMER ID',19,28,8,cid)],s.message_line)
+    def _cust_add(self,s,fields):
+        svc=_svc(self.state); row=svc.create_customer(fields, s.userid); s.last_customer_id=row['CUSTOMER_ID']; s.current_map='FIBSCUST'; msg=f'DFHCU0001 CUSTOMER RECORD CREATED {row["CUSTOMER_ID"]}'; out=self._cust_inq(s, {'CUSTOMER_ID':row['CUSTOMER_ID']}); out.message=msg; return out
+    def _cust_upd(self,s,fields):
+        cid=(fields.get('CUSTOMER_ID') or s.last_customer_id).strip(); row=_svc(self.state).update_customer(cid, fields, s.userid); s.message_line=f'DFHCU0002 CUSTOMER RECORD UPDATED {cid}'; return self._cust_inq(s, {'CUSTOMER_ID':cid})
+    def _cust_del(self,s,fields):
+        cid=(fields.get('CUSTOMER_ID') or s.last_customer_id).strip(); _svc(self.state).delete_customer(cid, s.userid); s.message_line=f'DFHCU0003 CUSTOMER RECORD DELETED {cid}'; return self._map_fibsmenu(s)
+    def _acct_inq(self,s,fields):
+        acct=(fields.get('ACCOUNT_NUMBER') or fields.get('ACCOUNT') or s.last_account_id).strip(); row=_svc(self.state).get_account(acct)
+        if not row: s.message_line=f'DFHAC0044 ACCOUNT {acct} NOT FOUND'; return self._map_fibsacct(s)
+        s.last_account_id=acct; rows=[txt(4,1,f'ACCOUNT . . . . {row["ACCOUNT_NUMBER"]}'),txt(5,1,f'CUSTOMER . . . . {row["CUSTOMER_ID"]}'),txt(6,1,f'TYPE . . . . . . {row["ACCOUNT_TYPE"]}'),txt(7,1,f'BALANCE . . . . {row["ACTUAL_BALANCE"]}'),txt(8,1,f'AVAILABLE . . . {row["AVAILABLE_BALANCE"]}'),txt(9,1,f'STATUS . . . . . {row["STATUS"]}')]
+        s.message_line='INQUIRE COMPLETE'; return FibsMap('FIBSACCT','FIBS ACCOUNT INQUIRY',rows,[fld('account','ACCOUNT NUMBER',11,28,12,acct), fld('balance','BALANCE',12,28,12,row.get('ACTUAL_BALANCE',''),protected=True,numericOnly=True), fld('customer_id','CUSTOMER ID',13,28,8,row.get('CUSTOMER_ID',''),protected=True), fld('account_type','ACCOUNT TYPE',14,28,3,row.get('ACCOUNT_TYPE',''),protected=True)],s.message_line)
+    def _acct_add(self,s,fields):
+        row=_svc(self.state).create_account(fields, s.userid); s.last_account_id=row['ACCOUNT_NUMBER']; s.current_map='FIBSACCT'; msg=f'DFHAC0001 ACCOUNT RECORD CREATED {row["ACCOUNT_NUMBER"]}'; out=self._acct_inq(s, {'ACCOUNT_NUMBER':row['ACCOUNT_NUMBER']}); out.message=msg; return out
+    def _acct_upd(self,s,fields):
+        acct=(fields.get('ACCOUNT_NUMBER') or s.last_account_id).strip(); _svc(self.state).update_account(acct, fields, s.userid); s.message_line=f'DFHAC0002 ACCOUNT RECORD UPDATED {acct}'; return self._acct_inq(s, {'ACCOUNT_NUMBER':acct})
+    def _acct_del(self,s,fields):
+        acct=(fields.get('ACCOUNT_NUMBER') or s.last_account_id).strip(); _svc(self.state).delete_account(acct, s.userid); s.message_line=f'DFHAC0003 ACCOUNT RECORD DELETED {acct}'; return self._map_fibsmenu(s)
+    def _dbcr(self,s,fields):
+        svc=_svc(self.state); acct=fields.get('ACCOUNT_NUMBER') or s.last_account_id; amt=fields.get('AMOUNT') or '0'; typ=(fields.get('CREDIT_OR_DEBIT') or 'CREDIT').upper(); desc=fields.get('DESCRIPTION') or 'COUNTER POSTING'
+        row=svc.debit_account(acct,amt,desc,s.userid) if typ.startswith('D') else svc.credit_account(acct,amt,desc,s.userid); s.message_line=f'DFHTR0001 {typ} POSTED ACCOUNT {acct} BALANCE {row["account"]["ACTUAL_BALANCE"]}'; return self._acct_inq(s, {'ACCOUNT_NUMBER':acct})
+    def _xfer(self,s,fields):
+        fr=fields.get('FROM_ACCOUNT') or '1000000101'; to=fields.get('TO_ACCOUNT') or '1000000201'; amt=fields.get('AMOUNT') or '0'; _svc(self.state).transfer_funds(fr,to,amt,fields.get('DESCRIPTION') or 'COUNTER TRANSFER',s.userid); s.message_line=f'DFHTR0002 TRANSFER POSTED FROM {fr} TO {to} AMOUNT {amt}'; return self._map_fibsmenu(s)
+    def _batch(self,s,fields):
+        bid=fields.get('BATCH_ID') or 'B2026A17'; pin=fields.get('RELEASE_PIN') or ''; svc=_svc(self.state); res=svc.release_batch(bid, fields.get('SUPERVISOR_ID') or s.userid, pin, s.userid); s.message_line = 'DFHBA0001 BATCH RELEASED' if res.get('released') else 'DFHBA0047 BATCH RELEASE REJECTED - PIN REQUIRED 0032'; return self._map_fibsbatch(s)
+    def _swift(self,s,fields):
+        svc=_svc(self.state); act=(fields.get('ACTION') or 'LIST').upper(); mid=fields.get('MESSAGE_ID') or 'SWF000001'
+        if act.startswith('APP'): svc.approve_swift_message(mid,s.userid); s.message_line=f'DFHSW0002 SWIFT {mid} APPROVED'
+        elif act.startswith('REL'): svc.release_swift_message(mid,s.userid); s.message_line=f'DFHSW0003 SWIFT {mid} RELEASED'
+        elif act.startswith('REP'): svc.repair_swift_message(mid,fields,s.userid); s.message_line=f'DFHSW0004 SWIFT {mid} REPAIRED'
+        elif act.startswith('CRE'): row=svc.create_swift_message(fields,s.userid); s.message_line=f'DFHSW0001 SWIFT {row["MESSAGE_ID"]} CREATED'
+        rows=[txt(4,1,'MESSAGE   TYPE CURRENCY AMOUNT       STATUS')]
+        for i,r in enumerate(svc.list_swift_messages()[:10],5): rows.append(txt(i,1,f'{r["MESSAGE_ID"]:<9} {r["MESSAGE_TYPE"]:<4} {r["CURRENCY"]:<8} {r["AMOUNT"]:<12} {r["STATUS"]}'))
+        return FibsMap('FIBSSWFT','FIBS SWIFT MESSAGE PROCESSING',rows,self._map_fibsswft(s).fields,s.message_line)

@@ -1,0 +1,920 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+import html
+
+from gibson.apps.db2_sim import Db2Simulator
+
+
+def _today() -> str:
+    return datetime.now().strftime('%d/%m/%y')
+
+
+def _now() -> str:
+    return datetime.now().strftime('%H:%M:%S')
+
+
+@dataclass
+class FibsCicsSession:
+    sid: str
+    userid: str = ''
+    authenticated: bool = False
+    screen: str = 'LOGON'
+    message: str = 'ENTER OPERATOR ID AND PASSWORD THEN PRESS ENTER'
+    terminal: str = 'LT0042'
+    region: str = 'CICSREG1'
+    fields: dict[str, str] = field(default_factory=dict)
+    audit: list[dict[str, Any]] = field(default_factory=list)
+
+
+_SESSIONS: dict[str, FibsCicsSession] = {}
+
+
+def get_fibs_cics_session(sid: str = 'UI8999') -> FibsCicsSession:
+    sid = str(sid or 'UI8999')
+    sess = _SESSIONS.get(sid)
+    if sess is None:
+        sess = FibsCicsSession(sid=sid)
+        _SESSIONS[sid] = sess
+    return sess
+
+
+def reset_fibs_cics_session(sid: str = 'UI8999') -> FibsCicsSession:
+    sid = str(sid or 'UI8999')
+    sess = FibsCicsSession(sid=sid)
+    _SESSIONS[sid] = sess
+    return sess
+
+
+def _field(name: str, label: str, row: int, col: int, length: int,
+           value: str = '', *, protected: bool = False,
+           hidden: bool = False, numeric: bool = False) -> dict[str, Any]:
+    return {
+        'id': name,
+        'name': name,
+        'label': label,
+        'row': row,
+        'col': col,
+        'length': length,
+        'value': '' if value is None else str(value),
+        'protected': protected,
+        'hidden': hidden,
+        'numeric': numeric,
+    }
+
+
+def _text(row: int, col: int, text: str, color: str = 'green') -> dict[str, Any]:
+    return {'row': row, 'col': col, 'text': str(text), 'color': color}
+
+
+def _screen(name: str, title: str, lines: list[str], fields: list[dict[str, Any]],
+            message: str = '') -> dict[str, Any]:
+    return {
+        'name': name,
+        'title': title,
+        'lines': lines,
+        'texts': [_text(i + 1, 1, line) for i, line in enumerate(lines[:24])],
+        'fields': fields,
+        'message': message,
+        'date': _today(),
+    }
+
+
+def _pad(line: str = '') -> str:
+    return line[:132]
+
+
+def _header(trans: str = 'BKGMENU') -> list[str]:
+    return [
+        _pad(f'BANKMASTER/VS {trans:<8} DATE: {_today()}'),
+        _pad('-' * 79),
+    ]
+
+
+def logon_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    lines = [
+        _pad('                         BANKMASTER/VS - IBM CICS/VS 2.1.1 - SYSID: PROD'),
+        _pad('                         ----------------------------------------------------'),
+        _pad(''), _pad(''), _pad(''),
+        _pad('                                   S I G H B E R B A N K   P L C'),
+        _pad('                              CUSTOMER INFORMATION CONTROL SYSTEM'),
+        _pad(f'                           MAINFRAME BANKING APPLICATION - TERMINAL: {sess.terminal}'),
+        _pad('                           ------------------------------------------------'),
+        _pad(''), _pad(''),
+        _pad('                                  OPERATOR ID :       ________'),
+        _pad(''),
+        _pad('                                  PASSWORD :       ________'),
+        _pad(''), _pad(''),
+        _pad('                           ENTER OPERATOR ID AND PASSWORD THEN PRESS ENTER'),
+        _pad(''), _pad(''),
+        _pad('                        AUTHORISED ACCESS ONLY - ALL SESSIONS ARE LOGGED AND MONITORED'),
+        _pad('                  UNAUTHORISED ACCESS IS A CRIMINAL OFFENCE UNDER THE COMPUTER MISUSE ACT 1984'),
+        _pad('                         SYSTEM TRANSACTIONS: CECI CEMT CEDA - NO AUTH REQUIRED'),
+        _pad(f'                              DATE: {_today()} SYSTEM: BANKMASTER/VS 3.4 IBM 3083-EX4'),
+        _pad(sess.message),
+    ]
+    return _screen('LOGON', 'BANKMASTER/VS LOGON', lines, [
+        _field('userid', 'OPERATOR ID', 12, 54, 8, sess.userid),
+        _field('password', 'PASSWORD', 14, 54, 8, '', protected=False),
+    ], sess.message)
+
+
+def menu_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    u = sess.userid or 'UNKNOWN'
+    lines = _header('BKGMENU') + [
+        _pad(''),
+        _pad('                                                   S I G H B E R B A N K  P L C'),
+        _pad('                                             BANKMASTER/VS - MAIN TRANSACTION MENU'),
+        _pad('                                             ----------------------------------------'),
+        _pad(''),
+        _pad('          1 CUST - CUSTOMER MASTER MAINTENANCE'),
+        _pad('          2 ACCT - ACCOUNT INQUIRY & MAINTENANCE'),
+        _pad('          3 TRAN - TRANSACTION POSTING'),
+        _pad('          4 BULK - BULK PROCESSING CENTRE  (MORTGAGE / PAYMENTS / CARD APPROVALS)'),
+        _pad('          ----------------------------------------------------------------'),
+        _pad('          6 REST - REST API SECURITY TESTER [SECURITY LAB]'),
+        _pad('          7 TN32 - TN3270 PACKET ANALYSER (PLAINTEXT STREAM)'),
+        _pad('          ----------------------------------------------------------------'),
+        _pad('          CECI - COMMAND INTERPRETER ⚠ NO AUTH (VULN #6)'),
+        _pad('          CEMT - MASTER TERMINAL ⚠ NO AUTH (VULN #5)'),
+        _pad('          8 CICS - CICS TRANSACTION SERVICES (CEDA/CEDF/BMS/SECURITY LAB)'),
+        _pad('          9 BLAB - BANKING LAB (INTERACTIVE VULNERABILITY SIMULATION)'),
+        _pad('          DVCA - DAMN VULNERABLE CICS APPLICATION ⚠ FIBS/HACK3270 TRAINING'),
+        _pad('          5 LOGO - SIGN OFF TERMINAL'),
+        _pad('          ----------------------------------------------------------------'),
+        _pad('          TYPE LOGON APPLID(CICS) TO ACCESS CICS APPLID DIRECTLY'),
+        _pad(f'OPERATOR: {u:<8} TERMINAL: {sess.terminal} REGION: {sess.region} DATE: {_today()}'),
+        _pad(f'SELECTION ==>                                      OR TYPE TRANSACTION CODE DIRECTLY'),
+        _pad(f'TRANS: MENU     OPER: {u:<8}                         SIGNON OK - {u}'),
+        _pad('PF1=HELP PF3=SIGNOFF PF12=CODE'),
+    ]
+    return _screen('MENU', 'BANKMASTER/VS MAIN TRANSACTION MENU', lines, [
+        _field('selection', 'SELECTION', 25, 16, 16, ''),
+    ], sess.message)
+
+
+def _sql_rows(state: Any, sql: str, userid: str = 'IBMUSER') -> list[dict[str, Any]]:
+    try:
+        return [dict(r) for r in Db2Simulator(state).run_sql(sql, userid)]
+    except Exception:
+        return []
+
+
+def _db2_audit(state: Any, sess: FibsCicsSession, action: str, details: str) -> None:
+    user = sess.userid or 'ANON'
+    esc_details = str(details).replace("'", "''")[:180]
+    esc_action = str(action).replace("'", "''")[:40]
+    sql = ("INSERT INTO FIBS.AUDITLOG "
+           "(EVENT_TYPE,ACTION,RESULT,RESOURCE,DETAILS,SOURCE) "
+           f"VALUES ('CICS','{esc_action}','OK','FIBS','{esc_details}','cics')")
+    try:
+        Db2Simulator(state).run_sql(sql, user)
+    except Exception:
+        pass
+
+
+def _customer_screen(state: Any, sess: FibsCicsSession, q: str = '') -> dict[str, Any]:
+    rows = _sql_rows(state, "SELECT * FROM FIBS.CUSTOMER", sess.userid or 'IBMUSER')
+    q = q or sess.fields.get('customer_id') or (rows[0].get('CUSTOMER_ID') if rows else '10000001')
+    rec = next((r for r in rows if str(r.get('CUSTOMER_ID')) == str(q)), rows[0] if rows else {})
+    lines = _header('CUST') + [
+        _pad('                         CUSTOMER MASTER MAINTENANCE'),
+        _pad(''),
+        _pad(f' CUSTOMER ID . . . . {q}'),
+        _pad(f' FORENAME . . . . . . {rec.get("FORENAME", rec.get("FIRST_NAME", "JANE"))}'),
+        _pad(f' SURNAME . . . . . . . {rec.get("SURNAME", rec.get("LAST_NAME", "CUSTOMER"))}'),
+        _pad(f' ADDRESS . . . . . . . {rec.get("ADDRESS_LINE_1", rec.get("ADDRESS", "1 HIGH STREET"))}'),
+        _pad(f' TOWN . . . . . . . . . {rec.get("TOWN", "LONDON")}'),
+        _pad(f' STATUS . . . . . . . . {rec.get("STATUS", "ACTIVE")}'),
+        _pad(''),
+        _pad(' ACTIONS: INQ ADD UPD DEL   PF3=MENU PF5=ADD PF8=INQUIRE'),
+        _pad(' DB2 TABLE: FIBS.CUSTOMER / CICS PROGRAM: FIBSCUST'),
+    ]
+    return _screen('CUST', 'CUSTOMER MASTER MAINTENANCE', lines, [
+        _field('customer_id', 'CUSTOMER ID', 5, 24, 12, q),
+        _field('forename', 'FORENAME', 6, 24, 20, rec.get('FORENAME', '')),
+        _field('surname', 'SURNAME', 7, 24, 20, rec.get('SURNAME', '')),
+        _field('cust_action', 'ACTION', 15, 10, 6, 'INQ'),
+    ], sess.message)
+
+
+def _account_screen(state: Any, sess: FibsCicsSession, q: str = '') -> dict[str, Any]:
+    rows = _sql_rows(state, "SELECT * FROM FIBS.ACCOUNT", sess.userid or 'IBMUSER')
+    q = q or sess.fields.get('account') or (rows[0].get('ACCOUNT_NUMBER') if rows else '1000000101')
+    rec = next((r for r in rows if str(r.get('ACCOUNT_NUMBER')) == str(q)), rows[0] if rows else {})
+    lines = _header('ACCT') + [
+        _pad('                         ACCOUNT INQUIRY & MAINTENANCE'),
+        _pad(''),
+        _pad(f' ACCOUNT NUMBER . . {q}'),
+        _pad(f' CUSTOMER ID . . . . {rec.get("CUSTOMER_ID", "10000001")}'),
+        _pad(f' ACCOUNT TYPE . . . {rec.get("ACCOUNT_TYPE", rec.get("TYPE", "DDA"))}'),
+        _pad(f' ACTUAL BALANCE . . {rec.get("ACTUAL_BALANCE", rec.get("BALANCE", "0.00"))}'),
+        _pad(f' AVAILABLE BAL . . . {rec.get("AVAILABLE_BALANCE", rec.get("BALANCE", "0.00"))}'),
+        _pad(f' STATUS . . . . . . . {rec.get("STATUS", "ACTIVE")}'),
+        _pad(''),
+        _pad(' ACTIONS: INQ ADD UPD DEL CREDIT DEBIT TRANSFER'),
+        _pad(' DB2 TABLE: FIBS.ACCOUNT / CICS PROGRAM: FIBSACCT'),
+    ]
+    return _screen('ACCT', 'ACCOUNT INQUIRY & MAINTENANCE', lines, [
+        _field('account', 'ACCOUNT NUMBER', 5, 24, 14, q, numeric=True),
+        _field('acct_customer', 'CUSTOMER ID', 6, 24, 12, rec.get('CUSTOMER_ID', '')),
+        _field('balance', 'BALANCE', 8, 24, 14, rec.get('ACTUAL_BALANCE', rec.get('BALANCE', '0.00')), numeric=True),
+        _field('acct_action', 'ACTION', 15, 10, 8, 'INQ'),
+    ], sess.message)
+
+
+def _transaction_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    tx_rows = _sql_rows(state, "SELECT * FROM FIBS.PROCTRAN", sess.userid or 'IBMUSER')
+    last_tx = tx_rows[-1] if tx_rows else {}
+    lines = _header('TRAN') + [
+        _pad('                         TRANSACTION POSTING'), '',
+        _pad(' FROM ACCOUNT . . . 1000000101'),
+        _pad(' TO ACCOUNT . . . . 1000000201'),
+        _pad(' AMOUNT . . . . . . 00000100.00'),
+        _pad(' REFERENCE . . . . . TRAINING TRANSFER'),
+        _pad(' APPROVAL FLAG . . . N'), '',
+        _pad(' CICS PROGRAM: FIBSTRAN  DB2 TABLE: FIBS.TRANSACTION'),
+        _pad(' TRAINING: HIDDEN AUTHFLAG / APPROVAL-FLAG CAN BE INSPECTED BY HACK3270'),
+    ]
+    return _screen('TRAN', 'TRANSACTION POSTING', lines, [
+        _field('from_account', 'FROM ACCOUNT', 5, 24, 14, '1000000101', numeric=True),
+        _field('to_account', 'TO ACCOUNT', 6, 24, 14, '1000000201', numeric=True),
+        _field('amount', 'AMOUNT', 7, 24, 14, '00000100.00', numeric=True),
+        _field('AUTHFLAG', 'AUTHFLAG', 18, 2, 1, 'N', protected=True, hidden=True),
+    ], sess.message)
+
+
+def _bulk_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    batch_rows = _sql_rows(state, "SELECT * FROM FIBS.BATCH_TRANSFER", sess.userid or 'IBMUSER')
+    batch = batch_rows[0] if batch_rows else {}
+    lines = _header('BULK') + [
+        _pad('                         BULK PROCESSING CENTRE'), '',
+        _pad(f' BATCH ID . . . . . {batch.get("BATCH_ID", "B2026A17")}'),
+        _pad(f' ITEM COUNT . . . . {batch.get("ITEM_COUNT", "00012")}'),
+        _pad(f' TOTAL VALUE . . .  {batch.get("TOTAL_VALUE", "000245000.00")}'),
+        _pad(f' STATUS . . . . . . {batch.get("STATUS", "HELD-PIN-REQ")}'),
+        _pad(' SUPERVISOR ID . . SUPR01'),
+        _pad(' RELEASE PIN . . . ____'), '',
+        _pad(' CICS PROGRAM: FIBSBULK  DB2 TABLE: FIBS.PAYMENT_BATCH'),
+        _pad(' TRAINING PIN FOR CONTROLLED LAB: 0032'),
+    ]
+    return _screen('BULK', 'BULK PROCESSING CENTRE', lines, [
+        _field('batch_id', 'BATCH ID', 5, 24, 12, 'B2026A17'),
+        _field('release_pin', 'RELEASE PIN', 10, 24, 4, '', numeric=True),
+        _field('PIN_HASH', 'PIN_HASH', 18, 2, 16, 'SIMULATED', protected=True, hidden=True),
+    ], sess.message)
+
+
+def _rest_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    _db2_audit(state, sess, 'REST', 'REST security tester opened')
+    Db2Simulator(state).run_sql("INSERT INTO FIBS.API_AUDIT (ACTION,RESULT,RESOURCE,DETAILS) VALUES ('OPEN','OK','FIBS.REST','REST tester opened')", sess.userid or 'IBMUSER')
+    _sql_rows(state, "SELECT * FROM FIBS.API_AUDIT", sess.userid or 'IBMUSER')
+    lines = _header('REST') + [
+        _pad('                         REST API SECURITY TESTER'), '',
+        _pad(' 1 CUSTOMER API LOOKUP        /api/v1/fibs/customers/{id}'),
+        _pad(' 2 ACCOUNT API LOOKUP         /api/v1/fibs/accounts/{id}'),
+        _pad(' 3 UNSAFE QUERY TEST          /api/v1/ui8999/api-menu/unsafe-query'),
+        _pad(' 4 DB2 RAW QUERY LAB          /api/v1/ui8999/db2/query'), '',
+        _pad(" SAMPLE SQLI INPUT: ' OR '1'='1"),
+        _pad(' TRAINING MODE ONLY - RESULTS ARE AUDITED'),
+    ]
+    return _screen('REST', 'REST API SECURITY TESTER', lines, [
+        _field('api_option', 'OPTION', 5, 24, 1, '3', numeric=True),
+        _field('api_input', 'API INPUT', 12, 24, 30, "' OR '1'='1"),
+    ], sess.message)
+
+
+def _tn32_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    _db2_audit(state, sess, 'TN32', 'TN3270 capture opened')
+    _sql_rows(state, "SELECT * FROM FIBS.TN3270_CAPTURE", sess.userid or 'IBMUSER')
+    lines = _header('TN32') + [
+        _pad('                         TN3270 PACKET ANALYSER'), '',
+        _pad(f' CAPTURE ID . . . CAP000042'),
+        _pad(f' USERID . . . . . {sess.userid}'),
+        _pad(f' TRANSACTION . . . {sess.screen}'), '',
+        _pad(' BUFFER: USERID=<operator> PASSWORD=<masked> TRAN=FIBS'),
+        _pad(' FIELD=AUTHFLAG ATTR=HID PROT=Y VALUE=N'),
+        _pad(' FIELD=RELEASE-PIN ATTR=NUM PROT=Y VALUE=****'),
+    ]
+    return _screen('TN32', 'TN3270 PACKET ANALYSER', lines, [], sess.message)
+
+
+def _cics_services_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    lines = _header('CICS') + [
+        _pad('                         CICS TRANSACTION SERVICES'), '',
+        _pad(' CEDA DEF/INSTALL/VIEW RESOURCES'),
+        _pad(' CEDF DEBUG FACILITY'),
+        _pad(' BMS MAP REVIEW'),
+        _pad(' RACF/GACF TRANSACTION CHECKS'),
+        _pad(' CEMT INQUIRE FILE / TRAN / PROGRAM'),
+    ]
+    return _screen('CICS', 'CICS TRANSACTION SERVICES', lines, [], sess.message)
+
+
+def _blab_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    lines = _header('BLAB') + [
+        _pad('                         BANKING LAB'), '',
+        _pad(' LABS: SQLI, IDOR/BOLA, HIDDEN FIELD TAMPERING, STATIC PIN,'),
+        _pad('       CEMT/CECI ABUSE, COBOL SOURCE REVIEW, TN3270 CAPTURE'),
+        _pad(' USE HACK3270 INSPECTOR IN THE 8999 UI TO REVEAL FIELDS'),
+    ]
+    return _screen('BLAB', 'BANKING LAB', lines, [], sess.message)
+
+
+def _dvca_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    _db2_audit(state, sess, 'DVCA', 'Hack3270/DVCA lab opened')
+    Db2Simulator(state).run_sql("INSERT INTO FIBS.HACK3270_EVENT (EVENT_TYPE,ACTION,RESULT,DETAILS) VALUES ('HACK3270','OPEN','OK','DVCA opened')", sess.userid or 'IBMUSER')
+    lines = _header('DVCA') + [
+        _pad('                         DAMN VULNERABLE CICS APPLICATION'), '',
+        _pad(' DVCA MCGM  - MAIN MENU'),
+        _pad(' DVCA CUST  - CUSTOMER SECURITY LAB'),
+        _pad(' DVCA ACCT  - ACCOUNT SECURITY LAB'),
+        _pad(' DVCA XFER  - TRANSFER SECURITY LAB'),
+        _pad(' DVCA SCRT  - SCREEN/TN3270 FIELD TAMPERING LAB'),
+    ]
+    return _screen('DVCA', 'DAMN VULNERABLE CICS APPLICATION', lines, [], sess.message)
+
+
+def _ceci_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    lines = _header('CECI') + [
+        _pad('                         CECI COMMAND INTERPRETER'), '',
+        _pad(' EXEC CICS READ FILE(GACFDB) INTO(WS-REC)'),
+        _pad(' EXEC CICS LINK PROGRAM(FIBSTRAN) COMMAREA(WS-COMMAREA)'),
+        _pad(' WARNING: NO AUTH REQUIRED IN TRAINING MODE'),
+    ]
+    return _screen('CECI', 'CECI COMMAND INTERPRETER', lines, [], sess.message)
+
+
+def _cemt_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    lines = _header('CEMT') + [
+        _pad('                         CEMT MASTER TERMINAL'), '',
+        _pad(' I TRAN(FIBS)   STATUS ENABLED PROGRAM FIBSMENU'),
+        _pad(' I FILE(GACFDB) OPEN ENABLED DSN SYS1.RACFDS'),
+        _pad(' I PROG(FIBS*)  ENABLED USECOUNT 000001'),
+        _pad(' WARNING: NO AUTH REQUIRED IN TRAINING MODE'),
+    ]
+    return _screen('CEMT', 'CEMT MASTER TERMINAL', lines, [], sess.message)
+
+
+def route_screen(state: Any, sess: FibsCicsSession, command: str = '',
+                 fields: dict[str, Any] | None = None) -> dict[str, Any]:
+    fields = {str(k): '' if v is None else str(v) for k, v in (fields or {}).items()}
+    sess.fields.update(fields)
+    cmd = (command or fields.get('selection') or '').strip().upper()
+    if not sess.authenticated:
+        return logon_screen(sess)
+    aliases = {
+        '': sess.screen or 'MENU', 'MENU': 'MENU', 'FIBS': 'MENU', 'GMVB': 'MENU',
+        '1': 'CUST', 'CUST': 'CUST',
+        '2': 'ACCT', 'ACCT': 'ACCT',
+        '3': 'TRAN', 'TRAN': 'TRAN',
+        '4': 'BULK', 'BULK': 'BULK', 'BATCH': 'BULK',
+        '5': 'LOGO', 'LOGO': 'LOGO', 'CESF': 'LOGO',
+        '6': 'REST', 'REST': 'REST', 'APIM': 'REST',
+        '7': 'TN32', 'TN32': 'TN32',
+        '8': 'CICS', 'CICS': 'CICS',
+        '9': 'BLAB', 'BLAB': 'BLAB',
+        'DVCA': 'DVCA', 'CECI': 'CECI', 'CEMT': 'CEMT',
+        'PF3': 'MENU', 'F3': 'MENU', 'PF12': 'MENU', 'F12': 'MENU',
+    }
+    target = aliases.get(cmd.split()[0] if cmd else '', cmd.split()[0] if cmd else sess.screen)
+    # Db2-backed actions.  These mutate FIBS tables through Db2Simulator so
+    # CICS, port 8999, DB2 RUN SQL and SPUFI see the same state.
+    if target == 'TRAN' and fields.get('amount'):
+        amt = fields.get('amount', '0.00')
+        acct = fields.get('from_account') or fields.get('account') or '1000000101'
+        to_acct = fields.get('to_account') or ''
+        Db2Simulator(state).run_sql(
+            "INSERT INTO FIBS.PROCTRAN "
+            "(ACCOUNT_NUMBER,RELATED_ACCOUNT,TRANSACTION_TYPE,AMOUNT,DESCRIPTION,SOURCE,STATUS) "
+            f"VALUES ('{acct}','{to_acct}','DEB','{amt}','CICS FIBS POST','CICS','POSTED')",
+            sess.userid or 'IBMUSER')
+        _db2_audit(state, sess, 'TRAN', f'Transaction posted for {acct}')
+        sess.message = 'DFHAC0001 TRANSACTION POSTED THROUGH DB2'
+    if target == 'BULK' and fields.get('release_pin'):
+        bid = fields.get('batch_id') or 'B2026A17'
+        status = 'RELEASED' if fields.get('release_pin') == '0032' else 'HELD-PIN-REQ'
+        Db2Simulator(state).run_sql(
+            f"UPDATE FIBS.BATCH_TRANSFER SET STATUS='{status}' WHERE BATCH_ID='{bid}'",
+            sess.userid or 'IBMUSER')
+        _db2_audit(state, sess, 'BULK', f'Batch {bid} status {status}')
+        sess.message = f'DFHBA7701 BATCH {bid} {status}'
+
+    if target == 'LOGO':
+        sess.authenticated = False
+        sess.message = f'SIGNOFF COMPLETE - {sess.userid}'
+        sess.userid = ''
+        sess.screen = 'LOGON'
+        return logon_screen(sess)
+    sess.screen = target
+    sess.audit.append({'ts': datetime.now().isoformat(), 'userid': sess.userid, 'command': cmd, 'target': target})
+    _db2_audit(state, sess, target, f'Command {cmd or target} routed to {target}')
+    if target == 'MENU': return menu_screen(sess)
+    if target == 'CUST': return _customer_screen(state, sess, fields.get('customer_id') or (cmd.split()[1] if len(cmd.split()) > 1 else ''))
+    if target == 'ACCT': return _account_screen(state, sess, fields.get('account') or (cmd.split()[1] if len(cmd.split()) > 1 else ''))
+    if target == 'TRAN': return _transaction_screen(state, sess)
+    if target == 'BULK': return _bulk_screen(state, sess)
+    if target == 'REST': return _rest_screen(state, sess)
+    if target == 'TN32': return _tn32_screen(state, sess)
+    if target == 'CICS': return _cics_services_screen(sess)
+    if target == 'BLAB': return _blab_screen(sess)
+    if target == 'DVCA': return _dvca_screen(state, sess)
+    if target == 'CECI': return _ceci_screen(sess)
+    if target == 'CEMT': return _cemt_screen(sess)
+    sess.message = f'TRANSACTION {target} NOT IMPLEMENTED'
+    return menu_screen(sess)
+
+
+def authenticate(state: Any, sess: FibsCicsSession, userid: str, password: str) -> tuple[bool, str]:
+    userid_u = (userid or '').strip().upper()
+    password_s = password or ''
+    ok = False
+    try:
+        ok = bool(state.racf.verify_password(userid_u, password_s))
+    except Exception:
+        ok = False
+    if ok:
+        sess.userid = userid_u
+        sess.authenticated = True
+        sess.screen = 'MENU'
+        sess.message = f'SIGNON OK - {userid_u}'
+        try:
+            state.audit.record(userid_u, 'FIBS SIGNON', 'ENTER', 'CICS')
+        except Exception:
+            pass
+        _db2_audit(state, sess, 'SIGNON', f'FIBS signon for {userid_u}')
+        return True, sess.message
+    sess.userid = userid_u
+    sess.authenticated = False
+    sess.screen = 'LOGON'
+    sess.message = 'SIGNON FAILED - GACF USERID/PASSWORD NOT ACCEPTED'
+    return False, sess.message
+
+
+def to_response(state: Any, sess: FibsCicsSession, screen: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'sid': sess.sid,
+        'userid': sess.userid,
+        'authenticated': sess.authenticated,
+        'operator': sess.userid,
+        'terminal': sess.terminal,
+        'region': sess.region,
+        'application': 'FIBS CICS App - BANKMASTER/VS',
+        'screen': screen,
+        'screen_name': screen.get('name'),
+        'fields': screen.get('fields', []),
+        'lines': screen.get('lines', []),
+        'messages': [screen.get('message')] if screen.get('message') else [],
+        'backend': {
+            'cics_transaction': 'FIBS',
+            'cobol_program': f'FIBS{screen.get("name", "MENU")}',
+            'db2_schema': 'FIBS',
+            'gacf': True,
+            'port': 8999,
+        },
+    }
+
+
+def screen_to_text(screen: dict[str, Any]) -> str:
+    return '\n'.join(str(x) for x in screen.get('lines', []))
+
+
+def html_escape_screen(screen: dict[str, Any]) -> str:
+    return html.escape(screen_to_text(screen))
+
+# ---------------------------------------------------------------------------
+# DVCA / CICSLAB1 full training implementation for port 8999 and L CICS FIBS.
+# Appended deliberately so the current package keeps earlier BANKMASTER paths
+# while these richer screens override placeholder DVCA/BLAB behaviour.
+# ---------------------------------------------------------------------------
+
+_DVCA_SCREENS = {'MCGM', 'MCMM', 'MCOR', 'MCAD', 'MCHI', 'SCRT'}
+
+
+def _sql_quote(value: Any) -> str:
+    return str(value if value is not None else '').replace("'", "''")
+
+
+def _insert_audit(state: Any, userid: str, event_type: str, action: str,
+                  details: str, *, resource: str = 'DVCA', source: str = 'dvca') -> None:
+    sql = (
+        "INSERT INTO FIBS.AUDITLOG "
+        "(EVENT_TYPE,ACTION,RESULT,RESOURCE,DETAILS,SOURCE) VALUES "
+        f"('{_sql_quote(event_type)}','{_sql_quote(action)}','OK',"
+        f"'{_sql_quote(resource)}','{_sql_quote(details)}','{_sql_quote(source)}')"
+    )
+    try:
+        Db2Simulator(state).run_sql(sql, userid or 'IBMUSER')
+    except Exception:
+        pass
+
+
+def _insert_hack_event(state: Any, sess: FibsCicsSession, action: str,
+                       details: str, *, result: str = 'OK') -> None:
+    sql = (
+        "INSERT INTO FIBS.HACK3270_EVENT "
+        "(EVENT_TYPE,ACTION,RESULT,DETAILS) VALUES "
+        f"('HACK3270','{_sql_quote(action)}','{_sql_quote(result)}',"
+        f"'{_sql_quote(details)}')"
+    )
+    try:
+        Db2Simulator(state).run_sql(sql, sess.userid or 'IBMUSER')
+    except Exception:
+        pass
+    _insert_audit(state, sess.userid or 'IBMUSER', 'DVCA', action, details,
+                  resource='FIBS.HACK3270_EVENT', source='dvca')
+
+
+def _insert_api_audit(state: Any, sess: FibsCicsSession, action: str,
+                      details: str, *, resource: str = 'FIBS.API_AUDIT') -> None:
+    sql = (
+        "INSERT INTO FIBS.API_AUDIT "
+        "(ACTION,RESULT,RESOURCE,DETAILS) VALUES "
+        f"('{_sql_quote(action)}','OK','{_sql_quote(resource)}',"
+        f"'{_sql_quote(details)}')"
+    )
+    try:
+        Db2Simulator(state).run_sql(sql, sess.userid or 'IBMUSER')
+    except Exception:
+        pass
+    _insert_audit(state, sess.userid or 'IBMUSER', 'API', action, details,
+                  resource=resource, source='api')
+
+
+def _insert_tn3270_capture(state: Any, sess: FibsCicsSession, excerpt: str) -> None:
+    sql = (
+        "INSERT INTO FIBS.TN3270_CAPTURE "
+        "(CAPTURE_ID,SESSION,USERID,TRANSID,BUFFER_EXCERPT) VALUES "
+        f"('CAP-DVCA','{_sql_quote(sess.sid)}','{_sql_quote(sess.userid)}',"
+        f"'{_sql_quote(sess.screen)}','{_sql_quote(excerpt)}')"
+    )
+    try:
+        Db2Simulator(state).run_sql(sql, sess.userid or 'IBMUSER')
+    except Exception:
+        pass
+
+
+def _hack_state(sess: FibsCicsSession) -> dict[str, Any]:
+    state = sess.fields.setdefault('_hack3270', {})
+    if not isinstance(state, dict):
+        state = {}
+        sess.fields['_hack3270'] = state
+    defaults = {
+        'master': False,
+        'disable_field_protection': False,
+        'enable_hidden_fields': False,
+        'remove_numeric_only': False,
+        'start_field': False,
+        'start_field_extended': False,
+        'modify_field': False,
+        'inject_cust_id': False,
+        'inject_acct_no': False,
+        'inject_pin': False,
+        'inject_enter': False,
+        'inject_pf3': False,
+        'inject_clear': False,
+        'batch_pin_enabled': False,
+        'pins_attempted': 0,
+        'pins_found': 0,
+        'hidden_exposed': 0,
+        'protected_overtyped': 0,
+        'api_intercepted': 0,
+        'fields_injected': 0,
+        'screens': 0,
+    }
+    for k, v in defaults.items():
+        state.setdefault(k, v)
+    return state
+
+
+def _dvca_toolbar_lines(sess: FibsCicsSession) -> list[str]:
+    h = _hack_state(sess)
+    on = 'ON ' if h.get('master') else 'OFF'
+    return [
+        _pad('hack3270-glbson v1.0'),
+        _pad('Hack Field Attributes | Inject Info Fields | Inject Key Presses | BATCH PIN | API Leakage | Logs | Statistics | Help'),
+        _pad(f'Hack Fields: {on}  [ ] Disable Field Protection  [ ] Enable Hidden Fields  [ ] Remove Numeric Only Restrictions'),
+        _pad(' [ ] Start Field   [ ] Start Field Extended   [ ] Modify Field'),
+        _pad(f'x3270-gibson 127.0.0.1:9999 — {sess.screen or "MCGM"}'),
+    ]
+
+
+def _dvca_status_line(sess: FibsCicsSession, trans: str) -> str:
+    h = _hack_state(sess)
+    suffix = '  HACK3270 ON' if h.get('master') else ''
+    return _pad(f'TRANS: {trans:<8} OPER: {sess.userid or "DVCA":<8} REGION: CICSREG1  DVCA - DAMN VULNERABLE CICS APPLICATION - PIB{suffix}')
+
+
+def _dvca_mcgm_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'MCGM'
+    _insert_hack_event(state, sess, 'OPEN', 'DVCA MCGM opened')
+    _insert_tn3270_capture(state, sess, 'TRAN=MCGM FIELD=PA3 ATTR=AID PROT=N')
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('MCGM'),
+        _pad(''),
+        _pad('         __  __      _     ____'),
+        _pad('        |  \/  | ___| |   / ___|__ _ _ __ __ _  ___'),
+        _pad("        | |\/| |/ _ \\ |  | |   / _` | '__/ _` |/ _ \\"),
+        _pad('        | |  | |  __/ |  | |__| (_| | | | (_| | (_) |'),
+        _pad('        |_|  |_|\\___|_|   \\____\\__,_|_|  \\__, |\\___/'),
+        _pad('                                          |___/'),
+        _pad('         ================================================'),
+        _pad('         |   DAMN VULNERABLE CICS APPLICATION (DVCA)   |'),
+        _pad("         |      Mel's Cargo - Office Supply Store       |"),
+        _pad('         ================================================'),
+        _pad(''),
+        _pad('                   Transaction: MCGM'),
+        _pad(''),
+        _pad('         PF1  - Help         PF3  - Quit'),
+        _pad('         PF5  - Main Menu    PA3  - Secret'),
+        _pad("         PRESS PF5 TO ENTER MEL'S CARGO MAIN MENU"),
+        _pad(''),
+        _pad('PF5 - MAIN MENU     PF1 - HELP     PF3 - QUIT'),
+        _pad('PA3 IS NOT A STANDARD KEYBOARD KEY — USE HACK3270 TO INJECT AID'),
+        _dvca_status_line(sess, 'DVCA'),
+    ]
+    return _screen('MCGM', "Mel's Cargo DVCA", lines, [], sess.message)
+
+
+def _dvca_mcmm_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'MCMM'
+    _insert_hack_event(state, sess, 'NAVIGATE', 'DVCA MCMM main menu opened')
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('MCMM'), _pad(''),
+        _pad("                  MEL'S CARGO - MAIN MENU"),
+        _pad('                  ------------------------'), _pad(''),
+        _pad(' 1  MCOR - OFFICE SUPPLIES PRICE LIST / ORDER ENTRY'),
+        _pad(' 2  MCAD - SHIPPING ADDRESS AND SUPERVISOR PIN'),
+        _pad(' 3  MCHI - ORDER HISTORY'),
+        _pad('99  HIDDEN DELETE HISTORY OPTION (TRAINING VULN)'),
+        _pad(''),
+        _pad('Protected and hidden BMS fields can be inspected with hack3270.'),
+        _dvca_status_line(sess, 'MCMM'),
+    ]
+    return _screen('MCMM', "Mel's Cargo Main Menu", lines, [_field('selection', 'OPTION', 10, 20, 2, '1')], sess.message)
+
+
+def _dvca_mcor_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'MCOR'
+    _insert_hack_event(state, sess, 'NAVIGATE', 'DVCA MCOR order screen opened')
+    h = _hack_state(sess)
+    hidden = 'Y' if h.get('enable_hidden_fields') else 'N'
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('MCOR'), _pad(''),
+        _pad("                  MEL'S CARGO - OFFICE SUPPLY ORDER"),
+        _pad(' ITEM     DESCRIPTION             PRICE     PURCHASABLE'),
+        _pad(' P001     TONER CARTRIDGE          89.95     Y'),
+        _pad(' P002     MAINFRAME GREEN BAR      19.95     Y'),
+        _pad(' P999     RESTRICTED COURIER KEY   00.01     N  <hidden if HACK OFF>'),
+        _pad(''),
+        _pad(f'HIDDEN FIELD VISIBILITY: {hidden}'),
+        _pad('VULN: FSET/protected PRICE and PURCHASABLE fields can be modified in training mode.'),
+        _dvca_status_line(sess, 'MCOR'),
+    ]
+    return _screen('MCOR', 'MCOR Order Entry', lines, [
+        _field('item', 'ITEM', 4, 2, 4, 'P001'),
+        _field('price', 'PRICE', 4, 38, 8, '89.95', protected=True, numeric=True),
+        _field('purchasable', 'PURCHASABLE', 4, 50, 1, 'Y', hidden=True),
+    ], sess.message)
+
+
+def _dvca_mcad_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'MCAD'
+    _insert_hack_event(state, sess, 'NAVIGATE', 'DVCA MCAD address/PIN screen opened')
+    h = _hack_state(sess)
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('MCAD'), _pad(''),
+        _pad("                  MEL'S CARGO - SHIPPING ADDRESS"),
+        _pad(' CUSTOMER . . . IBMUSER'),
+        _pad(' ADDRESS  . . . 1 MAINFRAME WAY'),
+        _pad(' POSTCODE . . . CICS 001'),
+        _pad(''),
+        _pad(' SUPERVISOR PIN REQUIRED FOR RESTRICTED ITEMS: ____'),
+        _pad(' VULN: 4 digit PIN has no lockout. BATCH PIN lab expects 1337.'),
+        _pad(f' PIN ATTEMPTS: {h.get("pins_attempted", 0)}   PINS FOUND: {h.get("pins_found", 0)}'),
+        _dvca_status_line(sess, 'MCAD'),
+    ]
+    return _screen('MCAD', 'MCAD Shipping Address', lines, [_field('pin', 'PIN', 8, 48, 4, '', numeric=True)], sess.message)
+
+
+def _dvca_mchi_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'MCHI'
+    _insert_hack_event(state, sess, 'NAVIGATE', 'DVCA MCHI history screen opened')
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('MCHI'), _pad(''),
+        _pad("                  MEL'S CARGO - ORDER HISTORY"),
+        _pad(' ORD0001  TONER CARTRIDGE          APPROVED'),
+        _pad(' ORD0002  GREEN BAR PAPER          SHIPPED'),
+        _pad(' ORD0003  RESTRICTED COURIER KEY   HELD-PIN'),
+        _pad(''),
+        _pad(' Hidden option 99 deletes all order records (training only).'),
+        _dvca_status_line(sess, 'MCHI'),
+    ]
+    return _screen('MCHI', 'MCHI Order History', lines, [], sess.message)
+
+
+def _dvca_scrt_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    sess.screen = 'SCRT'
+    _insert_hack_event(state, sess, 'SECRET_SCREEN', 'DVCA SCRT reached through PA3/AID injection')
+    lines = _dvca_toolbar_lines(sess) + [
+        _pad('SCRT'), _pad(''),
+        _pad('             *** SECRET CICS SCREEN ***'),
+        _pad(' Accessed through PA3 AID injection in hack3270 training mode.'),
+        _pad(' AUTHFLAG=Y  HIDDEN-ADMIN=ENABLED  SUPERVISOR-PIN=1337'),
+        _dvca_status_line(sess, 'SCRT'),
+    ]
+    return _screen('SCRT', 'DVCA Secret Screen', lines, [], sess.message)
+
+
+def _dvca_screen(state: Any, sess: FibsCicsSession) -> dict[str, Any]:
+    return _dvca_mcgm_screen(state, sess)
+
+
+def _blab_screen(sess: FibsCicsSession) -> dict[str, Any]:
+    # Backend state/audit is written in route_screen where state is available.
+    lines = _header('CICSLAB1') + [
+        _pad('                         BANKING LAB - CICSLAB1'),
+        _pad(''),
+        _pad('                 S I G H B E R B A N K   P L C'),
+        _pad('            BANKING LAB - CICS/VS APPLID: CICSLAB1'),
+        _pad(f' DATE: {_today()}  · TN3270 PORT: 23 · TERMINAL: {sess.terminal}'),
+        _pad(''),
+        _pad('  ⚠ AUTHORISED USE ONLY · ALL SESSIONS ARE MONITORED AND LOGGED · DFHCE3520'),
+        _pad(''),
+        _pad(' USERID  ==> ________'),
+        _pad(' PASSWORD ==> ________'),
+        _pad(' [ ENTER - LOGON ]'),
+        _pad(''),
+        _pad(' DEFAULT CREDENTIALS (VULN #2 HARDCODED): IBMUSER / SYS1'),
+        _pad(' OTHER ACCOUNTS: CICSUSER / CICS · ADMIN / ADMIN · TEST / TEST'),
+        _pad(''),
+        _pad(' LAB GUIDE | HACK PANEL ⚠ | TN3270 PACKETS | TN3270 EXPLOIT'),
+        _pad(' LAB OVERVIEW | VULNERABILITY INDEX | LAB EXERCISES | REMEDIATION GUIDE'),
+        _pad(''),
+        _pad(' WHAT IS THIS LAB?'),
+        _pad(' This Banking Lab simulates a 1980s-era IBM CICS/VS mainframe banking system running BankMaster/VS.'),
+        _pad(' Objectives: auth weaknesses, unauthenticated admin panel, TN3270 packet streams, CECI/CEMT, SQL injection.'),
+        _pad(''),
+        _pad(' REST API VULNERABILITY TESTER: endpoint selector | method selector | request body | SEND | response viewer'),
+        _pad(" Default SQLi payload: ' OR '1'='1   writes FIBS.API_AUDIT and FIBS.AUDITLOG"),
+        _pad(''),
+        _pad('PF3 MAIN MENU   PF12 LAB EXIT              HACK3270 ON'),
+        _pad('TRANS: BLAB     OPER: DVCA                 BANKING LAB - CICSLAB1 - INTERACTIVE VULNERABILITY SIMULATION'),
+    ]
+    return _screen('BLAB', 'BANKING LAB - CICSLAB1', lines, [
+        _field('lab_userid', 'USERID', 9, 14, 8, 'IBMUSER'),
+        _field('lab_password', 'PASSWORD', 10, 14, 8, ''),
+        _field('rest_endpoint', 'ENDPOINT', 23, 3, 42, '/api/v1/ui8999/api-menu/unsafe-query'),
+        _field('rest_method', 'METHOD', 23, 48, 6, 'POST'),
+        _field('rest_body', 'REQUEST BODY', 24, 3, 70, "{\"query\":\"' OR '1'='1\"}"),
+    ], sess.message)
+
+
+def _route_dvca_action(state: Any, sess: FibsCicsSession, target: str, fields: dict[str, str]) -> dict[str, Any] | None:
+    h = _hack_state(sess)
+    t = target.upper()
+    if t in {'HACK', 'HACKON', 'HACK3270', 'HACK_ON'}:
+        h['master'] = True
+        _insert_hack_event(state, sess, 'HACK3270_ON', 'hack3270 master enabled')
+        sess.message = 'HACK3270 ON - FIELD ATTRIBUTE OVERRIDE ENABLED'
+        return _dvca_mcgm_screen(state, sess) if sess.screen not in _DVCA_SCREENS else _dvca_screen_by_name(state, sess, sess.screen)
+    if t in {'HACKOFF', 'HACK_OFF'}:
+        h['master'] = False
+        _insert_hack_event(state, sess, 'HACK3270_OFF', 'hack3270 master disabled')
+        sess.message = 'HACK3270 OFF - NORMAL BMS ATTRIBUTES RESTORED'
+        return _dvca_screen_by_name(state, sess, sess.screen if sess.screen in _DVCA_SCREENS else 'MCGM')
+    if t in {'HIDDEN', 'ENABLE_HIDDEN'}:
+        h['enable_hidden_fields'] = True
+        h['hidden_exposed'] = int(h.get('hidden_exposed', 0)) + 1
+        _insert_hack_event(state, sess, 'HIDDEN_FIELDS_ENABLED', 'hidden fields exposed')
+        sess.message = 'HIDDEN FIELDS ENABLED'
+        return _dvca_screen_by_name(state, sess, sess.screen if sess.screen in _DVCA_SCREENS else 'MCOR')
+    if t in {'DISABLE_PROTECTION', 'PROTECT_OFF', 'FSET'}:
+        h['disable_field_protection'] = True
+        _insert_hack_event(state, sess, 'FIELD_PROTECTION_DISABLED', 'field protection disabled')
+        sess.message = 'FIELD PROTECTION DISABLED'
+        return _dvca_screen_by_name(state, sess, sess.screen if sess.screen in _DVCA_SCREENS else 'MCOR')
+    if t in {'NUMERIC_OFF', 'REMOVE_NUMERIC_ONLY'}:
+        h['remove_numeric_only'] = True
+        _insert_hack_event(state, sess, 'NUMERIC_ONLY_REMOVED', 'numeric-only restriction removed')
+        sess.message = 'NUMERIC-ONLY RESTRICTION REMOVED'
+        return _dvca_screen_by_name(state, sess, sess.screen if sess.screen in _DVCA_SCREENS else 'MCAD')
+    if t in {'INJECT_PRICE', 'INJECT_PURCHASABLE', 'MODIFY_FIELD'}:
+        h['fields_injected'] = int(h.get('fields_injected', 0)) + 1
+        h['protected_overtyped'] = int(h.get('protected_overtyped', 0)) + 1
+        _insert_hack_event(state, sess, 'PROTECTED_FIELD_MODIFIED', 'protected price/purchasable field modified')
+        sess.message = 'PROTECTED FIELD MODIFIED IN TRAINING MODE'
+        return _dvca_mcor_screen(state, sess)
+    if t in {'PINBRUTE', 'BATCHPIN', 'BATCH_PIN'}:
+        h['batch_pin_enabled'] = True
+        h['pins_attempted'] = 1338
+        h['pins_found'] = 1
+        _insert_hack_event(state, sess, 'PIN_BRUTE_FORCE_STARTED', 'batch PIN brute force started')
+        _insert_hack_event(state, sess, 'PIN_FOUND', 'supervisor PIN 1337 found')
+        sess.message = 'BATCH PIN COMPLETE - SUPERVISOR PIN 1337 FOUND'
+        return _dvca_mcad_screen(state, sess)
+    if t in {'PA3', 'AID_PA3', 'SECRET'}:
+        if h.get('master'):
+            _insert_hack_event(state, sess, 'PA3_INJECTED', 'PA3 AID injected')
+            sess.message = 'PA3 INJECTED - SECRET SCREEN REACHED'
+            return _dvca_scrt_screen(state, sess)
+        sess.message = 'PA3 REJECTED - ENABLE HACK3270 MASTER FIRST'
+        _insert_hack_event(state, sess, 'PA3_REJECTED', 'PA3 rejected because hack3270 master is off', result='REJECTED')
+        return _dvca_mcgm_screen(state, sess)
+    if t in {'APILEAK', 'API_LEAK', 'RESTTEST', 'SQLI'}:
+        h['api_intercepted'] = int(h.get('api_intercepted', 0)) + 1
+        _insert_api_audit(state, sess, 'REST_VULN_TEST', "unsafe-query payload ' OR '1'='1 executed from lab panel")
+        _insert_hack_event(state, sess, 'API_LEAK_OBSERVED', 'API leak/intercept observed in DVCA toolbar')
+        sess.message = "API LEAK OBSERVED - ROWS RETURNED=8 ENDPOINT=/api/v1/ui8999/api-menu/unsafe-query"
+        return _blab_screen(sess) if sess.screen == 'BLAB' else _dvca_screen_by_name(state, sess, sess.screen if sess.screen in _DVCA_SCREENS else 'MCGM')
+    return None
+
+
+def _dvca_screen_by_name(state: Any, sess: FibsCicsSession, name: str) -> dict[str, Any]:
+    n = (name or 'MCGM').upper()
+    _hack_state(sess)['screens'] = int(_hack_state(sess).get('screens', 0)) + 1
+    if n == 'MCMM': return _dvca_mcmm_screen(state, sess)
+    if n == 'MCOR': return _dvca_mcor_screen(state, sess)
+    if n == 'MCAD': return _dvca_mcad_screen(state, sess)
+    if n == 'MCHI': return _dvca_mchi_screen(state, sess)
+    if n == 'SCRT': return _dvca_scrt_screen(state, sess)
+    return _dvca_mcgm_screen(state, sess)
+
+
+_OLD_RICH_ROUTE_SCREEN = route_screen
+
+
+def route_screen(state: Any, sess: FibsCicsSession, command: str = '',
+                 fields: dict[str, Any] | None = None) -> dict[str, Any]:
+    fields = {str(k): '' if v is None else str(v) for k, v in (fields or {}).items()}
+    sess.fields.update(fields)
+    cmd = (command or fields.get('selection') or '').strip().upper()
+    if not sess.authenticated:
+        return logon_screen(sess)
+    verb = cmd.split()[0] if cmd else ''
+    # DVCA navigation/toolbar actions are real backend events and not static UI.
+    action_screen = _route_dvca_action(state, sess, verb, fields) if verb else None
+    if action_screen is not None:
+        return action_screen
+    aliases = {
+        'DVCA': 'MCGM', 'MCGM': 'MCGM', 'PF5': 'MCMM', 'F5': 'MCMM', 'MCMM': 'MCMM',
+        '1': 'MCOR' if sess.screen == 'MCMM' else 'CUST', 'MCOR': 'MCOR',
+        '2': 'MCAD' if sess.screen == 'MCMM' else 'ACCT', 'MCAD': 'MCAD',
+        '3': 'MCHI' if sess.screen == 'MCMM' else 'TRAN', 'MCHI': 'MCHI',
+        'SCRT': 'SCRT', 'BLAB': 'BLAB', 'RESTTEST': 'RESTTEST', 'SQLI': 'SQLI',
+    }
+    if verb in aliases and aliases[verb] in _DVCA_SCREENS:
+        return _dvca_screen_by_name(state, sess, aliases[verb])
+    if verb == 'BLAB':
+        sess.screen = 'BLAB'
+        _insert_audit(state, sess.userid or 'IBMUSER', 'BLAB', 'OPEN', 'CICSLAB1 Banking Lab opened', resource='CICSLAB1', source='blab')
+        _insert_api_audit(state, sess, 'LAB_OPEN', 'CICSLAB1 REST tester initialized')
+        return _blab_screen(sess)
+    if verb in {'RESTTEST', 'SQLI'}:
+        return _route_dvca_action(state, sess, 'RESTTEST', fields) or _blab_screen(sess)
+    # While inside DVCA, PF3/F3 returns to Mel's menu and PF12 returns to BANKMASTER menu.
+    if verb in {'PF3', 'F3'} and sess.screen in _DVCA_SCREENS:
+        return _dvca_mcmm_screen(state, sess)
+    if verb in {'PF12', 'F12'}:
+        sess.screen = 'MENU'
+        return menu_screen(sess)
+    return _OLD_RICH_ROUTE_SCREEN(state, sess, command, fields)
+
+
+_OLD_RICH_TO_RESPONSE = to_response
+
+
+def to_response(state: Any, sess: FibsCicsSession, screen: dict[str, Any]) -> dict[str, Any]:
+    base = _OLD_RICH_TO_RESPONSE(state, sess, screen)
+    h = _hack_state(sess)
+    base['hack3270'] = {
+        'toolbar': True,
+        'master': bool(h.get('master')),
+        'disable_field_protection': bool(h.get('disable_field_protection')),
+        'enable_hidden_fields': bool(h.get('enable_hidden_fields')),
+        'remove_numeric_only': bool(h.get('remove_numeric_only')),
+        'batch_pin_enabled': bool(h.get('batch_pin_enabled')),
+        'stats': {k: h.get(k, 0) for k in ['screens','hidden_exposed','protected_overtyped','pins_attempted','pins_found','api_intercepted','fields_injected']},
+        'tabs': ['Hack Field Attributes','Inject Info Fields','Inject Key Presses','BATCH PIN','API Leakage','Logs','Statistics','Help'],
+        'training_only': True,
+    }
+    name = str(screen.get('name') or '')
+    if name in _DVCA_SCREENS:
+        base['dvca'] = {'active': True, 'transaction': name, 'application': "Mel's Cargo", 'x3270': 'x3270-gibson 127.0.0.1:9999'}
+    if name == 'BLAB':
+        base['cicslab1'] = {'active': True, 'applid': 'CICSLAB1', 'rest_tester': True, 'hack_panel': True, 'tn3270_packets': True, 'tn3270_exploit': True}
+        base['rest_tester'] = {
+            'active': True,
+            'endpoints': [
+                '/api/v1/ui8999/api-menu/unsafe-query',
+                '/api/v1/fibs/customers/10000002',
+                '/api/v1/fibs/accounts/1000000201',
+                '/api/v1/ui8999/cobol/programs/VULNERABLE-BANK-UPDATE',
+                '/api/v1/ui8999/cics/command',
+            ],
+            'default_payload': "' OR '1'='1",
+            'audits_to': 'FIBS.API_AUDIT',
+        }
+    return base

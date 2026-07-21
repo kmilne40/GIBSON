@@ -1,0 +1,75 @@
+{
+  "name": "Customer",
+  "type": "object",
+  "properties": {
+    "customer_id": {
+      "type": "string",
+      "description": "8-digit customer identifier"
+    },
+    "surname": {
+      "type": "string",
+      "description": "Customer surname (max 30 chars)"
+    },
+    "forename": {
+      "type": "string",
+      "description": "Customer forename (max 20 chars)"
+    },
+    "dob": {
+      "type": "string",
+      "description": "Date of birth DD/MM/YY"
+    },
+    "sort_code": {
+      "type": "string",
+      "description": "6-digit sort code"
+    },
+    "ni_number": {
+      "type": "string",
+      "description": "National Insurance number"
+    },
+    "address1": {
+      "type": "string"
+    },
+    "address2": {
+      "type": "string"
+    },
+    "address3": {
+      "type": "string"
+    },
+    "postcode": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "A",
+        "I",
+        "D"
+      ],
+      "default": "A",
+      "description": "A=Active I=Inactive D=Deleted"
+    },
+    "customer_type": {
+      "type": "string",
+      "enum": [
+        "P",
+        "C"
+      ],
+      "default": "P",
+      "description": "P=Personal C=Corporate"
+    },
+    "open_date": {
+      "type": "string"
+    },
+    "operator_id": {
+      "type": "string"
+    },
+    "last_update_date": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "customer_id",
+    "surname",
+    "forename"
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "name": "AuditLog",
+  "type": "object",
+  "properties": {
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "SQL_QUERY",
+        "TRANSACTION",
+        "LOGIN",
+        "NAVIGATION"
+      ],
+      "description": "Type of audit event"
+    },
+    "operator_id": {
+      "type": "string",
+      "description": "Operator who performed the action"
+    },
+    "details": {
+      "type": "string",
+      "description": "Full details of the action (SQL, transaction data, etc.)"
+    },
+    "result": {
+      "type": "string",
+      "description": "Outcome: SUCCESS, ERROR, rows returned, etc."
+    },
+    "affected_entity": {
+      "type": "string",
+      "description": "Table / account number affected"
+    },
+    "row_count": {
+      "type": "number",
+      "description": "Number of rows returned or affected"
+    },
+    "duration_ms": {
+      "type": "number",
+      "description": "Execution time in milliseconds"
+    },
+    "terminal_id": {
+      "type": "string",
+      "default": "LT0042"
+    }
+  },
+  "required": [
+    "event_type",
+    "operator_id",
+    "details"
+  ]
+}
